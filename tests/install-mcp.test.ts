@@ -90,7 +90,9 @@ describe("install-mcp / preuninstall", () => {
 
     const codexToml = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
     expect(codexToml).toContain("[mcp_servers.multiagents]");
-    expect(codexToml).toContain('default_approval_mode = "approve"');
+    // Codex 0.156 (--strict-config) rejects `default_approval_mode`; the real key is below.
+    expect(codexToml).toContain('default_tools_approval_mode = "approve"');
+    expect(codexToml).not.toContain("default_approval_mode");
     // Args now include server.ts path + agent type (self-resolving paths)
     expect(codexToml).toContain('"--agent-type", "codex"');
     expect(codexToml).toContain("server.ts");

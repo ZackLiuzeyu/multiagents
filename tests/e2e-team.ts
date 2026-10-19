@@ -25,8 +25,8 @@ for (const p of extraPaths) {
 import { BrokerClient } from "../shared/broker-client.ts";
 import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME } from "../shared/constants.ts";
 import { launchAgent, detectAgent } from "../orchestrator/launcher.ts";
-import { monitorProcess, monitorCodexDriver, clearAllTracking } from "../orchestrator/monitor.ts";
-import type { CodexDriver } from "../orchestrator/codex-driver.ts";
+import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearAllTracking } from "../orchestrator/monitor.ts";
+import { deliverPendingMessages, type DriverSlot } from "../orchestrator/delivery.ts";
 import type { AgentLaunchConfig, Slot } from "../shared/types.ts";
 import type { Subprocess } from "bun";
 import * as fs from "node:fs";
@@ -91,7 +91,7 @@ async function checkAgents(): Promise<{ claude: boolean; codex: boolean }> {
 }
 
 // --- Cleanup helper ---
-async function cleanup(sessionId: string, procs: Map<number, Subprocess>, drivers: Map<number, CodexDriver>) {
+async function cleanup(sessionId: string, procs: Map<number, Subprocess>, drivers: Map<number, { kill(): Promise<void> }>) {
   info("Cleaning up...");
   for (const [slotId, driver] of drivers) {
     try { await driver.kill(); } catch { /* ok */ }
@@ -143,7 +143,8 @@ async function main() {
   const sessionId = `e2e-test-${Date.now()}`;
   const projectDir = path.join(process.cwd(), ".e2e-test-workspace");
   const procs = new Map<number, Subprocess>();
-  const drivers = new Map<number, CodexDriver>();
+  const drivers = new Map<number, { kill(): Promise<void> }>();
+  const driverStates = new Map<number, DriverSlot>();
 
   // Track events
   const events: Array<{ time: number; type: string; slotId: number; message: string }> = [];
@@ -245,7 +246,13 @@ async function main() {
     info("Launching Claude-Engineer...");
     const claudeResult = await launchAgent(sessionId, projectDir, claudeConfig, brokerClient);
     procs.set(claudeResult.slotId, claudeResult.process);
-    monitorProcess(claudeResult.process, claudeResult.slotId, sessionId, brokerClient, handleEvent);
+    if (claudeResult.claudeDriver) {
+      drivers.set(claudeResult.slotId, claudeResult.claudeDriver);
+      driverStates.set(claudeResult.slotId, { kind: "claude", driver: claudeResult.claudeDriver, busy: false, lastNudge: 0 });
+      monitorClaudeDriver(claudeResult.claudeDriver, claudeResult.slotId, sessionId, brokerClient, handleEvent);
+    } else {
+      monitorProcess(claudeResult.process, claudeResult.slotId, sessionId, brokerClient, handleEvent);
+    }
     ok(`Claude-Engineer launched: slot=${claudeResult.slotId}, pid=${claudeResult.pid}`);
 
     // Stagger to avoid race conditions
@@ -257,6 +264,7 @@ async function main() {
     procs.set(codexResult.slotId, codexResult.process);
     if (codexResult.codexDriver) {
       drivers.set(codexResult.slotId, codexResult.codexDriver);
+      driverStates.set(codexResult.slotId, { kind: "codex", driver: codexResult.codexDriver, threadId: codexResult.codexDriver.threadId, busy: false, lastNudge: 0 });
       monitorCodexDriver(codexResult.codexDriver, codexResult.slotId, sessionId, brokerClient, handleEvent);
     } else {
       monitorProcess(codexResult.process, codexResult.slotId, sessionId, brokerClient, handleEvent);
@@ -292,103 +300,20 @@ async function main() {
       }
     }
 
-    // --- Codex message forwarding loop (mirrors orchestrator-server.ts logic) ---
-    // The orchestrator's forwarding loop polls the broker for undelivered messages
-    // and pushes them to Codex via steer (mid-turn) or reply (new turn).
-    // Since we're not running the full orchestrator, replicate this here.
-    interface CodexSlotState { driver: import("../orchestrator/codex-driver.ts").CodexDriver; threadId: string | null; busy: boolean; lastNudge: number }
-    const codexStates = new Map<number, CodexSlotState>();
-    if (codexResult.codexDriver) {
-      codexStates.set(codexResult.slotId, {
-        driver: codexResult.codexDriver,
-        threadId: codexResult.codexDriver.threadId,
-        busy: false,
-        lastNudge: 0,
-      });
-    }
-
-    function buildForwardingPrompt(formatted: string): string {
-      return `[Teammate message] ${formatted}\nAcknowledge briefly and continue your current task.`;
-    }
-
+    // --- Driver delivery loop (the orchestrator runs the same module) ---
+    // Hands unacked broker messages to each driver: Claude over stream-json
+    // stdin, Codex via steer (mid-turn) or a new turn. Acked only on success.
     const forwardingInterval = setInterval(async () => {
-      for (const [slotId, state] of codexStates) {
-        if (!state.driver.alive) continue;
-        const threadId = state.threadId ?? state.driver.threadId;
-        if (!threadId) continue;
-
-        // --- Interrupt + signal_done turn: if Codex turn is active but idle for >60s ---
-        // The Codex LLM can get stuck in a single long inference call after completing work.
-        // turn/steer only works between loop iterations — it can't interrupt mid-generation.
-        // Instead: interrupt the stuck turn, then start a new focused turn for signal_done.
-        const INTERRUPT_IDLE_MS = 60_000;
-        const now = Date.now();
-        if (
-          state.driver.activeTurnId &&
-          now - state.driver.lastNotificationActivity > INTERRUPT_IDLE_MS &&
-          now - state.lastNudge > INTERRUPT_IDLE_MS
-        ) {
-          state.lastNudge = now;
-          info(`Codex slot ${slotId} stuck for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s — interrupting turn and requesting signal_done`);
-          try {
-            await state.driver.interrupt(threadId);
-          } catch {
-            // Interrupt can fail if turn already completed
-          }
-          // Wait a moment for the turn to fully complete after interrupt
-          await new Promise(r => setTimeout(r, 2000));
-          // Start a new focused turn asking only for signal_done
-          if (!state.driver.activeTurnId && !state.busy) {
-            state.busy = true;
-            state.driver.reply(threadId, "Your previous task is complete. Call signal_done NOW with a summary of what you accomplished. This is the ONLY thing you need to do.")
-              .then(async (result) => {
-                state.threadId = result.threadId;
-                state.busy = false;
-                info(`Codex slot ${slotId} signal_done turn completed`);
-              })
-              .catch((err) => {
-                state.busy = false;
-                warn(`Codex slot ${slotId} signal_done turn failed: ${err}`);
-              });
-          }
-        }
-
-        if (state.busy) continue;
-
+      for (const [slotId, state] of driverStates) {
         try {
-          const pollResult = await brokerClient.pollBySlot(slotId);
-          if (!pollResult.messages || pollResult.messages.length === 0) continue;
-
-          const formatted = pollResult.messages.map((m: any) => {
-            const from = m.from_slot_id !== null ? `slot ${m.from_slot_id}` : m.from_id;
-            return `[${m.msg_type}] From ${from}: ${m.text}`;
-          }).join("\n\n---\n\n");
-
-          info(`Forwarding ${pollResult.messages.length} message(s) to Codex slot ${slotId}`);
-
-          if (state.driver.activeTurnId) {
-            try {
-              await state.driver.steer(threadId, buildForwardingPrompt(formatted));
-              info(`Steered messages into active turn for slot ${slotId}`);
-            } catch (err) {
-              info(`Steer failed (will retry as new turn): ${err}`);
-            }
-            continue;
+          const outcome = await deliverPendingMessages(sessionId, slotId, state, brokerClient);
+          if (outcome === "sent" || outcome === "steered" || outcome === "replied") {
+            info(`Delivered messages to ${state.kind} slot ${slotId} (${outcome})`);
+          } else if (outcome === "failed") {
+            warn(`Delivery to slot ${slotId} failed — messages stay queued`);
           }
-
-          state.busy = true;
-          state.driver.reply(threadId, buildForwardingPrompt(formatted))
-            .then(async (result) => {
-              state.threadId = result.threadId;
-              state.busy = false;
-              info(`Codex slot ${slotId} processed forwarded messages`);
-            })
-            .catch((err) => {
-              state.busy = false;
-              warn(`Codex forwarding error for slot ${slotId}: ${err}`);
-            });
         } catch (err) {
-          // Poll error — skip this cycle
+          warn(`Delivery error for slot ${slotId}: ${err}`);
         }
       }
     }, 3_000);

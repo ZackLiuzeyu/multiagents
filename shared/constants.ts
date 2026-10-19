@@ -12,8 +12,10 @@ export const BROKER_HOSTNAME = "127.0.0.1";
 
 // --- Polling intervals (ms) ---
 
+// How often a standalone adapter picks up new messages for the next tool result
+// (driver-managed agents do not poll; the orchestrator delivers to them).
 export const POLL_INTERVALS: Record<AgentType, number> = {
-  claude: 1000, // Claude uses channel push — polling is fallback only
+  claude: 1000, // Also pushes a channel notification; headless sessions drop those
   codex: 300, // Aggressive: piggyback delivery depends on fast buffering
   gemini: 300, // Same as Codex — no push capability
   custom: 500, // Reasonable default for unknown agents

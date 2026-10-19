@@ -6,7 +6,8 @@
 
 import { BrokerClient } from "../shared/broker-client.ts";
 import { launchAgent, ensureMcpConfigs, announceNewMember } from "../orchestrator/launcher.ts";
-import { monitorProcess, type AgentEvent } from "../orchestrator/monitor.ts";
+import { monitorProcess, monitorClaudeDriver, monitorCodexDriver, type AgentEvent } from "../orchestrator/monitor.ts";
+import { deliverPendingMessages, type DriverSlot } from "../orchestrator/delivery.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "../orchestrator/progress.ts";
 import { BROKER_HOSTNAME, DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import { slugify, log } from "../shared/utils.ts";
@@ -185,6 +186,7 @@ WORKFLOW:
   const launchedSlots: number[] = [];
   const launchedTypes = new Set<string>();
   const procs = new Map<number, any>();
+  const driverStates = new Map<number, DriverSlot>();
 
   for (const agentCfg of agents) {
     if (launchedTypes.has(agentCfg.agent_type)) {
@@ -197,8 +199,16 @@ WORKFLOW:
     procs.set(result.slotId, result.process);
     launchedSlots.push(result.slotId);
 
-    // Monitor
-    monitorProcess(result.process, result.slotId, sessionId, client, handleEvent);
+    // Monitor (drivers own their process' stdout; only plain processes are read here)
+    if (result.claudeDriver) {
+      driverStates.set(result.slotId, { kind: "claude", driver: result.claudeDriver, busy: false, lastNudge: 0 });
+      monitorClaudeDriver(result.claudeDriver, result.slotId, sessionId, client, handleEvent);
+    } else if (result.codexDriver) {
+      driverStates.set(result.slotId, { kind: "codex", driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
+      monitorCodexDriver(result.codexDriver, result.slotId, sessionId, client, handleEvent);
+    } else {
+      monitorProcess(result.process, result.slotId, sessionId, client, handleEvent);
+    }
 
     // Announce
     const slot = await client.getSlot(result.slotId);
@@ -252,6 +262,17 @@ WORKFLOW:
   console.log(`  Monitor: bun cli.ts dashboard ${sessionId}`);
   console.log(`  Status:  bun cli.ts status`);
   console.log("\nThis script will now monitor events. Press Ctrl+C to stop monitoring.\n");
+
+  // Driver-managed agents only receive messages through this loop
+  setInterval(async () => {
+    for (const [slotId, state] of driverStates) {
+      try {
+        await deliverPendingMessages(sessionId, slotId, state, client);
+      } catch (err) {
+        log(LOG_PREFIX, `Delivery error for slot ${slotId}: ${err}`);
+      }
+    }
+  }, 3000);
 
   // Keep alive and print events
   while (true) {

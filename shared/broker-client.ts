@@ -102,8 +102,8 @@ export class BrokerClient {
     return this.post("/send-message", req);
   }
 
-  pollMessages(id: PeerId): Promise<PollMessagesResponse> {
-    return this.post("/poll-messages", { id });
+  pollMessages(id: PeerId, opts?: { unclaimedOnly?: boolean }): Promise<PollMessagesResponse> {
+    return this.post("/poll-messages", { id, unclaimed_only: opts?.unclaimedOnly === true });
   }
 
   /** Poll undelivered messages by slot_id (for driver-managed agents without peer_id). */
@@ -111,9 +111,15 @@ export class BrokerClient {
     return this.post("/poll-by-slot", { slot_id: slotId });
   }
 
-  /** Non-consuming peek at undelivered messages for a slot. */
+  /** Non-consuming peek at unacked messages for a slot. */
   peekUndelivered(slotId: number): Promise<{ count: number; msg_types: string[]; oldest_at: number }> {
     return this.post("/peek-undelivered", { slot_id: slotId });
+  }
+
+  /** Mark messages as acked (reached the model); they stop being returned by polls. */
+  ackMessages(ids: number[]): Promise<{ ok: boolean; acked: number }> {
+    if (ids.length === 0) return Promise.resolve({ ok: true, acked: 0 });
+    return this.post("/ack-messages", { ids });
   }
 
   unregister(id: PeerId): Promise<UnregisterResult> {

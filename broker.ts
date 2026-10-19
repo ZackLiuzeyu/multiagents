@@ -124,6 +124,7 @@ const alterStatements = [
   "ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'",
   "ALTER TABLE messages ADD COLUMN delivered_at TEXT",
   "ALTER TABLE messages ADD COLUMN held INTEGER DEFAULT 0",
+  "ALTER TABLE messages ADD COLUMN acked_at TEXT",
   "ALTER TABLE slots ADD COLUMN task_state TEXT DEFAULT 'idle'",
   "ALTER TABLE slots ADD COLUMN input_tokens INTEGER DEFAULT 0",
   "ALTER TABLE slots ADD COLUMN output_tokens INTEGER DEFAULT 0",
@@ -310,9 +311,9 @@ function cleanStalePeers() {
         );
       }
 
-      // Process dead — clean up peer (after snapshot capture)
+      // Process dead — clean up peer (after snapshot capture). Messages are kept:
+      // they are addressed to the slot as well and must reach the respawned agent.
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
 
       // Release file locks held by this peer
       db.run("DELETE FROM file_locks WHERE held_by_peer = ?", [peer.id]);
@@ -350,8 +351,9 @@ function cleanStalePeers() {
   }
 }
 
+const CLEANUP_MS = parseInt(process.env.MULTIAGENTS_CLEANUP_INTERVAL_MS ?? String(CLEANUP_INTERVAL), 10);
 cleanStalePeers();
-setInterval(cleanStalePeers, CLEANUP_INTERVAL);
+setInterval(cleanStalePeers, CLEANUP_MS);
 
 // --- Prepared statements ---
 
@@ -389,12 +391,24 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
 `);
 
-const selectUndelivered = db.prepare(
+const selectUnacked = db.prepare(
+  "SELECT * FROM messages WHERE to_id = ? AND acked_at IS NULL AND held = 0 ORDER BY sent_at ASC"
+);
+
+const selectUnclaimed = db.prepare(
   "SELECT * FROM messages WHERE to_id = ? AND delivered = 0 AND held = 0 ORDER BY sent_at ASC"
 );
 
+const selectUnackedBySlot = db.prepare(
+  "SELECT * FROM messages WHERE to_slot_id = ? AND acked_at IS NULL AND held = 0 ORDER BY sent_at ASC"
+);
+
 const markDelivered = db.prepare(
-  "UPDATE messages SET delivered = 1, delivered_at = ? WHERE id = ?"
+  "UPDATE messages SET delivered = 1, delivered_at = COALESCE(delivered_at, ?) WHERE id = ?"
+);
+
+const markAcked = db.prepare(
+  "UPDATE messages SET acked_at = ? WHERE id = ? AND acked_at IS NULL"
 );
 
 // --- Request handlers ---
@@ -623,30 +637,39 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
     }
   }
 
-  const messages = selectUndelivered.all(body.id) as Message[];
-  const now = new Date().toISOString();
-  for (const msg of messages) {
-    markDelivered.run(now, msg.id);
-  }
-
-  return { messages };
+  const rows = (body.unclaimed_only ? selectUnclaimed : selectUnacked).all(body.id) as Message[];
+  return { messages: handOff(rows) };
 }
 
-/** Poll undelivered messages by slot_id (for driver-managed agents without peer_id). */
+/** Poll unacked messages by slot_id (for driver-managed agents without peer_id). */
 function handlePollBySlot(body: { slot_id: number; session_id?: string }): PollMessagesResponse {
   const slot = db.query("SELECT paused FROM slots WHERE id = ?").get(body.slot_id) as { paused: number } | null;
   if (slot?.paused) return { messages: [], paused: true };
 
-  const messages = db.query(
-    "SELECT * FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY sent_at ASC"
-  ).all(body.slot_id) as Message[];
+  return { messages: handOff(selectUnackedBySlot.all(body.slot_id) as Message[]) };
+}
 
+/** Mark messages as handed to a delivery mechanism; they stay pollable until acked. */
+function handOff(messages: Message[]): Message[] {
   const now = new Date().toISOString();
   for (const msg of messages) {
-    markDelivered.run(now, msg.id);
+    if (!msg.delivered) {
+      markDelivered.run(now, msg.id);
+      msg.delivered = 1 as unknown as boolean;
+      msg.delivered_at = now;
+    }
   }
+  return messages;
+}
 
-  return { messages };
+/** Mark messages as acked: they reached the model and will not be polled again. */
+function handleAckMessages(body: { ids: number[] }): { ok: boolean; acked: number } {
+  const now = new Date().toISOString();
+  let acked = 0;
+  for (const id of body.ids ?? []) {
+    acked += markAcked.run(now, id).changes;
+  }
+  return { ok: true, acked };
 }
 
 function handleUnregister(body: { id: string }): { ok: boolean; denied?: boolean; reason?: string; task_state?: string } {
@@ -1316,14 +1339,16 @@ Bun.serve({
         case "/poll-by-slot":
           return Response.json(handlePollBySlot(body as { slot_id: number; session_id?: string }));
         case "/peek-undelivered": {
-          // Non-consuming: returns count, msg_types, and oldest_at (epoch ms) of undelivered messages
+          // Non-consuming: returns count, msg_types, and oldest_at (epoch ms) of unacked messages
           const { slot_id } = body as { slot_id: number };
           const rows = db.query(
-            "SELECT msg_type, sent_at FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY id ASC"
+            "SELECT msg_type, sent_at FROM messages WHERE to_slot_id = ? AND acked_at IS NULL AND held = 0 ORDER BY id ASC"
           ).all(slot_id) as { msg_type: string; sent_at: string }[];
-          const oldest_at = rows.length > 0 ? new Date(rows[0].sent_at).getTime() : 0;
+          const oldest_at = rows[0] ? new Date(rows[0].sent_at).getTime() : 0;
           return Response.json({ count: rows.length, msg_types: rows.map(r => r.msg_type), oldest_at });
         }
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as { ids: number[] }));
         case "/unregister":
           return Response.json(handleUnregister(body as { id: string }));
 

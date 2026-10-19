@@ -10,10 +10,14 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. A message is `delivered` once a delivery mechanism picked it up and `acked` once it reached the model; polls return unacked messages so failed deliveries retry.
+- `server.ts` — MCP stdio server, one per agent CLI instance (`adapters/*`). Prepends unread messages to every tool result (`[PENDING MESSAGES]`) and acks them; Claude also gets a best-effort channel notification.
+- `adapters/protocol-text.ts` — Team protocol: short form for MCP `instructions` (Claude Code caps them at 4096 chars, Codex reads 512), full form for orchestrator prompts.
+- `orchestrator/claude-driver.ts` — Long-lived `claude -p --input-format stream-json` session; teammate messages are written to stdin and read mid-turn. `system/init` only arrives after the first message; closing stdin ends the session.
+- `orchestrator/codex-driver.ts` — `codex app-server` JSON-RPC client (shapes verified against the 0.156.1 schema).
+- `orchestrator/delivery.ts` — Hands unacked messages to a driver and acks them on confirmed hand-off.
 - `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Git-based summary of what an agent is working on (no API calls).
 - `cli.ts` — CLI utility for inspecting broker state.
 
 ## Running
@@ -24,6 +28,14 @@ claude --dangerously-load-development-channels server:multiagents
 
 # Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
 # { "multiagents": { "command": "bun", "args": ["./server.ts"] } }
+# Channel push only renders in interactive sessions started with the flag; headless
+# `-p` sessions drop it. Messages still arrive inside the next tool result.
+
+# Env knobs: MULTIAGENTS_PORT (broker port, forwarded to spawned agents),
+# MULTIAGENTS_CLAUDE_MODEL (model for driver-launched Claude agents),
+# MULTIAGENTS_CLAUDE_COMMAND / MULTIAGENTS_CODEX_COMMAND (override the CLI binaries),
+# MULTIAGENTS_CLEANUP_INTERVAL_MS (broker stale-peer sweep), MULTIAGENTS_LIVE_TESTS=1
+# (run tests/live-claude.test.ts against the real `claude`, costs API usage).
 
 # CLI:
 bun cli.ts status
@@ -56,7 +68,10 @@ Default to using Bun instead of Node.js.
 
 ## Testing
 
-Use `bun test` to run tests.
+Use `bun test` to run tests. `tests/launcher.test.ts` writes the global `~/.codex/config.toml` /
+`~/.gemini/settings.json` (it saves and restores them); run the suite with a throwaway
+`HOME=$(mktemp -d) bun test` to keep your real configs untouched. Driver tests run against
+`tests/fakes/fake-claude.ts` and `tests/fakes/fake-codex-app-server.ts`.
 
 ```ts#index.test.ts
 import { test, expect } from "bun:test";

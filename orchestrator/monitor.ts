@@ -8,6 +8,7 @@
 import type { Subprocess } from "bun";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { CodexDriver, CodexNotification } from "./codex-driver.ts";
+import type { ClaudeDriver, ClaudeEvent } from "./claude-driver.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "monitor";
@@ -160,23 +161,36 @@ async function processLine(
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
 ): Promise<void> {
-  // Try parsing as JSON (Claude stream-json format)
+  let parsed: any;
   try {
-    const parsed = JSON.parse(line);
+    parsed = JSON.parse(line);
+  } catch {
+    return; // Not JSON — plain text output, ignore
+  }
+  await processEvent(parsed, slotId, sessionId, brokerClient, onEvent);
+}
 
-    // Claude stream-json result message (includes final token usage)
-    if (parsed.type === "result" && parsed.result) {
+/** Handle one structured stdout event (Claude stream-json or Codex JSONL). */
+export async function processEvent(
+  parsed: any,
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+  onEvent: (event: AgentEvent) => void,
+): Promise<void> {
+  try {
+    // Claude stream-json result event: `result` is the final text, `usage` sits at the top level
+    if (parsed.type === "result") {
       onEvent({
         type: "agent_output",
         severity: "info",
         slotId,
         sessionId,
         message: `Agent produced result`,
-        data: { result: parsed.result },
+        data: { result: parsed.result, subtype: parsed.subtype },
       });
 
-      // Extract token usage from Claude result
-      const usage = parsed.result?.usage;
+      const usage = parsed.usage ?? parsed.result?.usage;
       if (usage) {
         await updateTokenUsage(slotId, {
           input: usage.input_tokens ?? 0,
@@ -327,11 +341,25 @@ async function processLine(
         message: "Agent is using tools",
       });
     }
-
-    return;
-  } catch {
-    // Not JSON — treat as plain text output, ignore
+  } catch (err) {
+    log(LOG_PREFIX, `event handling error for slot ${slotId}: ${err}`);
   }
+}
+
+/**
+ * Monitor a ClaudeDriver: its stream-json events feed the same slot tracking
+ * as a plain Claude process (summaries, token usage, working transition).
+ */
+export function monitorClaudeDriver(
+  driver: ClaudeDriver,
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+  onEvent: (event: AgentEvent) => void,
+): void {
+  driver.onEvent((event: ClaudeEvent) => {
+    void processEvent(event, slotId, sessionId, brokerClient, onEvent);
+  });
 }
 
 /** Read stderr for error messages. */
@@ -461,25 +489,27 @@ async function handleCodexNotification(
   }
 
   if (method === "turn/completed") {
-    // Extract token usage from turn completion
-    const turn = params.turn as Record<string, unknown> | undefined;
-    const usage = (params.usage ?? turn?.usage) as Record<string, number> | undefined;
-    if (usage) {
-      await updateTokenUsage(slotId, {
-        input: usage.input_tokens ?? 0,
-        output: usage.output_tokens ?? 0,
-        cacheRead: usage.cached_input_tokens ?? 0,
-      }, brokerClient);
-    }
-
+    const turn = params.turn as { status?: string } | undefined;
     onEvent({
       type: "agent_output",
       severity: "info",
       slotId,
       sessionId,
-      message: `Codex turn completed in slot ${slotId}`,
-      data: usage ? { usage } : undefined,
+      message: `Codex turn ${turn?.status ?? "completed"} in slot ${slotId}`,
     });
+    return;
+  }
+
+  // Token usage arrives on its own notification; `total` is cumulative for the thread.
+  if (method === "thread/tokenUsage/updated") {
+    const total = (params.tokenUsage as { total?: Record<string, number> } | undefined)?.total;
+    if (total) {
+      await updateTokenUsage(slotId, {
+        input: total.inputTokens ?? 0,
+        output: total.outputTokens ?? 0,
+        cacheRead: total.cachedInputTokens ?? 0,
+      }, brokerClient);
+    }
     return;
   }
 

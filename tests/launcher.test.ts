@@ -12,8 +12,12 @@ import {
   ensureMcpConfigs,
   detectAgent,
   buildTeamContext,
+  claudeMcpConfig,
+  claudeSystemPromptAppend,
+  codexDeveloperInstructions,
 } from "../orchestrator/launcher.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
+import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 
 // Temp directory for file-system tests
 let tmpDir: string;
@@ -89,132 +93,89 @@ describe("mcpServerCommand", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildCliArgs — Claude
+// Claude — driver launch contract
 // ---------------------------------------------------------------------------
-describe("buildCliArgs — claude", () => {
-  const task = "Do something";
+describe("claudeMcpConfig", () => {
+  const identity = { sessionId: "sess-1", projectDir: "/tmp/p", slotId: 7, name: "Alice", role: "Software Engineer", roleDescription: "builds things" };
 
-  test("starts with --print for headless mode", () => {
-    const args = buildCliArgs("claude", task);
-    expect(args[0]).toBe("--print");
+  test("points at the per-agent MCP server with slot identity baked into the args", () => {
+    const cfg = claudeMcpConfig(identity, { driverMode: true }) as any;
+    const server = cfg.mcpServers["multiagents-peer"];
+    expect(server.command).toBe("bun");
+    expect(server.args).toContain("mcp-server");
+    expect(getFlagValue(server.args, "--agent-type")).toBe("claude");
+    expect(getFlagValue(server.args, "--session")).toBe("sess-1");
+    expect(getFlagValue(server.args, "--slot")).toBe("7");
+    expect(getFlagValue(server.args, "--role")).toBe("Software Engineer");
+    expect(getFlagValue(server.args, "--name")).toBe("Alice");
   });
 
-  test("includes --verbose (required for stream-json)", () => {
-    const args = buildCliArgs("claude", task);
-    expect(args).toContain("--verbose");
+  test("keeps the team tools out of tool-search deferral", () => {
+    const cfg = claudeMcpConfig(identity, { driverMode: true }) as any;
+    expect(cfg.mcpServers["multiagents-peer"].alwaysLoad).toBe(true);
   });
 
-  test("includes --output-format stream-json", () => {
-    const args = buildCliArgs("claude", task);
-    const idx = args.indexOf("--output-format");
-    expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("stream-json");
+  test("forwards a non-default broker port to the adapter through args and env", () => {
+    const previous = process.env.MULTIAGENTS_PORT;
+    process.env.MULTIAGENTS_PORT = "17999";
+    try {
+      const server = (claudeMcpConfig(identity, { driverMode: true }) as any).mcpServers["multiagents-peer"];
+      expect(getFlagValue(server.args, "--port")).toBe("17999");
+      expect(server.env).toEqual({ MULTIAGENTS_PORT: "17999" });
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_PORT; else process.env.MULTIAGENTS_PORT = previous;
+    }
   });
 
-  test("includes --max-turns 200", () => {
-    const args = buildCliArgs("claude", task);
-    const idx = args.indexOf("--max-turns");
-    expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("200");
+  test("omits the port when the broker runs on the default port", () => {
+    const previous = process.env.MULTIAGENTS_PORT;
+    delete process.env.MULTIAGENTS_PORT;
+    try {
+      const server = (claudeMcpConfig(identity, { driverMode: true }) as any).mcpServers["multiagents-peer"];
+      expect(server.args).not.toContain("--port");
+      expect(server.env).toBeUndefined();
+    } finally {
+      if (previous !== undefined) process.env.MULTIAGENTS_PORT = previous;
+    }
   });
 
-  test("includes --dangerously-skip-permissions", () => {
-    const args = buildCliArgs("claude", task);
-    expect(args).toContain("--dangerously-skip-permissions");
+  test("marks the adapter as driver-managed only when a driver owns delivery", () => {
+    const driven = claudeMcpConfig(identity, { driverMode: true }) as any;
+    expect(driven.mcpServers["multiagents-peer"].args).toContain("--driver-mode");
+    const standalone = claudeMcpConfig(identity, { driverMode: false }) as any;
+    expect(standalone.mcpServers["multiagents-peer"].args).not.toContain("--driver-mode");
   });
+});
 
-  test("includes --mcp-config with valid JSON containing multiagents", () => {
-    const args = buildCliArgs("claude", task);
-    const mcpJson = getFlagValue(args, "--mcp-config");
-    const parsed = JSON.parse(mcpJson);
-    expect(parsed.mcpServers).toBeDefined();
-    expect(parsed.mcpServers["multiagents-peer"]).toBeDefined();
-    expect(parsed.mcpServers["multiagents-peer"].command).toBe("bun");
-    expect(parsed.mcpServers["multiagents-peer"].args).toBeArray();
-    expect(parsed.mcpServers["multiagents-peer"].args).toContain("mcp-server");
+describe("claudeSystemPromptAppend", () => {
+  test("carries the full protocol and the role practices (which MCP instructions cannot fit)", () => {
+    const text = claudeSystemPromptAppend("QA Engineer", "tests web apps");
+    expect(text).toContain(FULL_PROTOCOL.trim().slice(0, 40));
+    expect(text).toContain("ROLE-SPECIFIC PRACTICES");
+    expect(text).toContain("COMPLETION CRITERIA");
   });
+});
 
-  test("--mcp-config JSON points to correct agent type", () => {
-    const args = buildCliArgs("claude", task);
-    const mcpJson = JSON.parse(getFlagValue(args, "--mcp-config"));
-    expect(mcpJson.mcpServers["multiagents-peer"].args).toContain("claude");
-  });
-
-  test("ends with -p and the task", () => {
-    const args = buildCliArgs("claude", task);
-    const pIdx = args.lastIndexOf("-p");
-    expect(pIdx).toBeGreaterThan(-1);
-    expect(args[pIdx + 1]).toBe(task);
-  });
-
-  test("task with special characters is preserved", () => {
-    const specialTask = 'You are "Agent-A". Use \'quotes\' and $variables & pipes | etc.';
-    const args = buildCliArgs("claude", specialTask);
-    expect(args[args.length - 1]).toBe(specialTask);
+describe("codexDeveloperInstructions", () => {
+  test("names the agent, its tools and the short protocol", () => {
+    const text = codexDeveloperInstructions({ sessionId: "s", projectDir: "/tmp/p", slotId: 1, name: "Bob", role: "Code Reviewer", roleDescription: "reviews" });
+    expect(text).toContain('You are "Bob", role: Code Reviewer.');
+    expect(text).toContain("signal_done");
+    expect(text).toContain(SHORT_PROTOCOL.trim().slice(0, 30));
+    expect(text).not.toContain(FULL_PROTOCOL.trim().slice(0, 40));
   });
 });
 
 // ---------------------------------------------------------------------------
-// buildCliArgs — Codex
+// buildCliArgs — driver-managed types are rejected
 // ---------------------------------------------------------------------------
-describe("buildCliArgs — codex", () => {
-  const task = "Do something";
-
-  test("starts with exec subcommand", () => {
-    const args = buildCliArgs("codex", task);
-    expect(args[0]).toBe("exec");
+describe("buildCliArgs — claude and codex", () => {
+  test("claude is driven over stream-json, not launched with CLI args", () => {
+    expect(() => buildCliArgs("claude", "task")).toThrow(/session protocol/);
   });
 
-  test("includes --sandbox workspace-write", () => {
-    const args = buildCliArgs("codex", task);
-    const idx = args.indexOf("--sandbox");
-    expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("workspace-write");
-  });
-
-  test("includes --full-auto", () => {
-    const args = buildCliArgs("codex", task);
-    expect(args).toContain("--full-auto");
-  });
-
-  test("includes --json for structured output", () => {
-    const args = buildCliArgs("codex", task);
-    expect(args).toContain("--json");
-  });
-
-  test("does NOT inject MCP servers via -c (Codex ignores -c for mcp_servers)", () => {
-    const args = buildCliArgs("codex", task);
-    const cFlags = collectFlagValues(args, "-c");
-
-    // Codex -c flag silently drops mcp_servers overrides.
-    // MCP injection is handled by ensureMcpConfigs writing to ~/.codex/config.toml.
-    const mcpFlags = cFlags.filter((f) => f.startsWith("mcp_servers"));
-    expect(mcpFlags).toEqual([]);
-  });
-
-  test("only overrides model_reasoning_effort via -c", () => {
-    const args = buildCliArgs("codex", task);
-    const cFlags = collectFlagValues(args, "-c");
-
-    // Should only have model_reasoning_effort — no MCP overrides
-    expect(cFlags).toEqual(['model_reasoning_effort="high"']);
-  });
-
-  test("overrides model_reasoning_effort to high", () => {
-    const args = buildCliArgs("codex", task);
-    const cFlags = collectFlagValues(args, "-c");
-
-    expect(cFlags).toContain('model_reasoning_effort="high"');
-  });
-
-  test("task is the last argument", () => {
-    const args = buildCliArgs("codex", task);
-    expect(args[args.length - 1]).toBe(task);
-  });
-
-  test("does NOT include --quiet (deprecated flag)", () => {
-    const args = buildCliArgs("codex", task);
-    expect(args).not.toContain("--quiet");
+  test("codex is driven over app-server, not `codex exec` (whose --full-auto flag no longer exists)", () => {
+    expect(() => buildCliArgs("codex", "task")).toThrow(/session protocol/);
   });
 });
 
@@ -375,6 +336,41 @@ describe("ensureMcpConfigs — Codex ~/.codex/config.toml (global)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ensureMcpConfigs — scoped by agent type
+// ---------------------------------------------------------------------------
+describe("ensureMcpConfigs — scoped to the launched agent type", () => {
+  const globalCodexPath = path.join(process.env.HOME ?? "", ".codex", "config.toml");
+  const globalGeminiPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
+  let origCodex: string | null = null;
+  let origGemini: string | null = null;
+  beforeEach(() => {
+    try { origCodex = fs.readFileSync(globalCodexPath, "utf-8"); } catch { origCodex = null; }
+    try { origGemini = fs.readFileSync(globalGeminiPath, "utf-8"); } catch { origGemini = null; }
+  });
+  afterEach(() => {
+    if (origCodex !== null) fs.writeFileSync(globalCodexPath, origCodex);
+    if (origGemini !== null) fs.writeFileSync(globalGeminiPath, origGemini);
+  });
+
+  test("launching a Claude agent writes the project .mcp.json but leaves the global Codex and Gemini configs alone", async () => {
+    // beforeEach saved the originals and afterEach restores them.
+    fs.rmSync(globalCodexPath, { force: true });
+    fs.rmSync(globalGeminiPath, { force: true });
+
+    await ensureMcpConfigs(tmpDir, "claude-only", "claude");
+
+    expect(fs.existsSync(path.join(tmpDir, ".mcp.json"))).toBe(true);
+    expect(fs.existsSync(globalCodexPath)).toBe(false);
+    expect(fs.existsSync(globalGeminiPath)).toBe(false);
+  });
+
+  test("launching a Codex agent writes the global Codex config", async () => {
+    await ensureMcpConfigs(tmpDir, "codex-only", "codex");
+    expect(fs.readFileSync(globalCodexPath, "utf-8")).toContain('[mcp_servers."multiagents-peer"]');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ensureMcpConfigs — .multiagents/session.json
 // ---------------------------------------------------------------------------
 describe("ensureMcpConfigs — session file", () => {
@@ -518,12 +514,9 @@ describe("MCP config consistency across agent types", () => {
     expect(getAgentType(geminiArgs)).toBe("gemini");
   });
 
-  test("claude --mcp-config JSON and codex mcpServerCommand reference same binary", () => {
-    const claudeCliArgs = buildCliArgs("claude", "test");
-
-    // Extract Claude's MCP config from --mcp-config inline JSON
-    const claudeMcpJson = JSON.parse(getFlagValue(claudeCliArgs, "--mcp-config"));
-    const claudeMcpArgs = claudeMcpJson.mcpServers["multiagents-peer"].args;
+  test("claude inline MCP config and codex mcpServerCommand reference the same binary", () => {
+    const cfg = claudeMcpConfig({ sessionId: "s", projectDir: "/tmp/p", slotId: 1, name: "A", role: "r", roleDescription: "" }, { driverMode: true }) as any;
+    const claudeMcpArgs = cfg.mcpServers["multiagents-peer"].args;
 
     // Codex no longer injects MCP via -c flags (Codex CLI ignores them).
     // Instead, mcpServerCommand("codex") returns the same binary path that

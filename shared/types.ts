@@ -90,6 +90,8 @@ export interface Message {
   sent_at: string; // ISO timestamp
   delivered: boolean;
   delivered_at: string | null;
+  /** Set once the message reached the model (piggybacked into a tool result or injected into a turn). */
+  acked_at: string | null;
   held: boolean;
 }
 
@@ -237,6 +239,8 @@ export interface SendMessageResult {
 
 export interface PollMessagesRequest {
   id: PeerId;
+  /** Only messages no delivery mechanism has handed off yet (driver-managed agents use this). */
+  unclaimed_only?: boolean;
 }
 
 export interface PollMessagesResponse {

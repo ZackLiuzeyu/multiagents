@@ -29,7 +29,7 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 ```
 
 - **Peer discovery**: agents find each other via `list_peers`
-- **Real-time messaging**: instant for Claude (channel push), <3s for Codex (mid-turn steer), 1-3s for Gemini (piggyback)
+- **Real-time messaging**: orchestrator-launched Claude and Codex agents receive teammate messages mid-turn (stream-json stdin / `turn/steer`); every agent also gets unread messages prepended to its next tool result, and a message is only marked read once it reached the model
 - **Role assignment**: `assign_role`, `rename_peer` at runtime
 - **File coordination**: exclusive locks + ownership zones prevent conflicts
 - **Task lifecycle**: `idle → working → done_pending_review → addressing_feedback → approved → released`
@@ -68,9 +68,11 @@ The orchestrator handles everything: spawning agents, assigning roles, creating 
 
 | Agent | Delivery Mechanism | Latency | Config |
 |-------|-------------------|---------|--------|
-| Claude Code | Channel push notifications | Instant | `~/.claude/settings.json` |
-| Codex CLI | CodexDriver (`codex app-server`) | <3s mid-turn, 3-9s between turns | `~/.codex/config.toml` |
-| Gemini CLI | Piggyback on MCP tool responses | 1-3s | `~/.gemini/settings.json` |
+| Claude Code | ClaudeDriver (`claude -p --input-format stream-json`): messages injected as user messages, read mid-turn. Interactive sessions additionally get channel notifications. | ≤3s | `~/.claude/settings.json` |
+| Codex CLI | CodexDriver (`codex app-server`): `turn/steer` mid-turn, new turn when idle | <3s mid-turn, 3-9s between turns | `~/.codex/config.toml` |
+| Gemini CLI | Prepended to MCP tool results + file inbox | next tool call | `~/.gemini/settings.json` |
+
+All three also receive unread messages under `[PENDING MESSAGES]` at the top of their next MCP tool result; a message counts as delivered only once it was surfaced to the model (acked), so a dropped delivery is retried instead of lost.
 
 ### Codex Integration (CodexDriver)
 
@@ -258,19 +260,23 @@ multiagents/
 │   ├── types.ts            Type definitions (Peer, Slot, Session, Message, TaskState...)
 │   ├── broker-client.ts    HTTP client for broker API
 │   ├── constants.ts        Ports, intervals, thresholds
-│   ├── summarize.ts        Auto-summary generation
+│   ├── summarize.ts        Git-based activity summary (no API calls)
 │   └── utils.ts            Shared utilities
 ├── adapters/
-│   ├── base-adapter.ts     Abstract MCP adapter (tools, registration, polling)
-│   ├── claude-adapter.ts   Claude Code adapter (channel push delivery)
-│   ├── codex-adapter.ts    Codex adapter (piggyback + file inbox delivery)
-│   ├── gemini-adapter.ts   Gemini adapter (piggyback + file inbox delivery)
+│   ├── base-adapter.ts     Abstract MCP adapter (tools, registration, pending-message delivery + ack)
+│   ├── protocol-text.ts    Team protocol text (short form for MCP instructions, full form for prompts)
+│   ├── inbox.ts            File-based inbox for hosts without push (Codex, Gemini)
+│   ├── claude-adapter.ts   Claude Code adapter (tool-result delivery + best-effort channel push)
+│   ├── codex-adapter.ts    Codex adapter (tool-result delivery + file inbox)
+│   ├── gemini-adapter.ts   Gemini adapter (tool-result delivery + file inbox)
 │   └── role-practices.ts   Role-specific best practices injection
 ├── orchestrator/
-│   ├── orchestrator-server.ts  Orchestrator MCP server (team management)
+│   ├── orchestrator-server.ts  Orchestrator MCP server (team management, driver delivery loop)
+│   ├── claude-driver.ts    ClaudeDriver: long-lived `claude -p --input-format stream-json` session
 │   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
-│   ├── launcher.ts         Agent spawning (CLI args, MCP configs, CodexDriver)
-│   ├── monitor.ts          Process monitoring (stdout parsing, token tracking)
+│   ├── delivery.ts         Hands unacked messages to drivers, acks on confirmed hand-off
+│   ├── launcher.ts         Agent spawning (drivers, MCP configs, prompts)
+│   ├── monitor.ts          Process/driver monitoring (event parsing, token tracking)
 │   ├── recovery.ts         Crash recovery (flap detection, respawn with context)
 │   ├── progress.ts         Team status aggregation
 │   ├── session-control.ts  Pause/resume/broadcast
