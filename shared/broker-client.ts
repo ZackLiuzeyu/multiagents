@@ -9,6 +9,7 @@ import type {
   SendMessageResult,
   PollMessagesRequest,
   PollMessagesResponse,
+  PeekResult,
   SetRoleRequest,
   RenamePeerRequest,
   CreateSessionRequest,
@@ -102,17 +103,18 @@ export class BrokerClient {
     return this.post("/send-message", req);
   }
 
-  pollMessages(id: PeerId, opts?: { unclaimedOnly?: boolean }): Promise<PollMessagesResponse> {
-    return this.post("/poll-messages", { id, unclaimed_only: opts?.unclaimedOnly === true });
+  /** A poll consumes what it returns unless `retain` is set, in which case the caller acks via `ackMessages`. */
+  pollMessages(id: PeerId, opts?: { unclaimedOnly?: boolean; retain?: boolean }): Promise<PollMessagesResponse> {
+    return this.post("/poll-messages", { id, unclaimed_only: opts?.unclaimedOnly === true, retain: opts?.retain === true });
   }
 
-  /** Poll undelivered messages by slot_id (for driver-managed agents without peer_id). */
-  pollBySlot(slotId: number): Promise<PollMessagesResponse> {
-    return this.post("/poll-by-slot", { slot_id: slotId });
+  /** Poll a slot's messages (driver-managed agents have no peer id); same `retain` semantics as `pollMessages`. */
+  pollBySlot(slotId: number, opts?: { retain?: boolean }): Promise<PollMessagesResponse> {
+    return this.post("/poll-by-slot", { slot_id: slotId, retain: opts?.retain === true });
   }
 
-  /** Non-consuming peek at unacked messages for a slot. */
-  peekUndelivered(slotId: number): Promise<{ count: number; msg_types: string[]; oldest_at: number }> {
+  /** Non-consuming peek at a slot's unacked and unclaimed messages. */
+  peekUndelivered(slotId: number): Promise<PeekResult> {
     return this.post("/peek-undelivered", { slot_id: slotId });
   }
 

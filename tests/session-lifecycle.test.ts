@@ -234,18 +234,14 @@ describe("peek-undelivered", () => {
     const peek2 = await post("/peek-undelivered", { slot_id: engineer.slot.id });
     expect(peek2.count).toBe(2);
 
-    // Polling hands the messages to a delivery mechanism but does not consume
-    // them: until acked they still count as pending so a failed delivery is retried.
+    // A plain poll consumes the messages (clients that ack explicitly pass retain: true)
     const poll = await post("/poll-by-slot", { slot_id: engineer.slot.id });
     expect(poll.messages.length).toBe(2);
-    const peek3 = await post("/peek-undelivered", { slot_id: engineer.slot.id });
-    expect(peek3.count).toBe(2);
 
-    // Acking (the message reached the model) clears them
-    await post("/ack-messages", { ids: poll.messages.map((m: any) => m.id) });
-    const peek4 = await post("/peek-undelivered", { slot_id: engineer.slot.id });
-    expect(peek4.count).toBe(0);
-    expect(peek4.oldest_at).toBe(0);
+    // Peek should now show 0 and oldest_at = 0
+    const peek3 = await post("/peek-undelivered", { slot_id: engineer.slot.id });
+    expect(peek3.count).toBe(0);
+    expect(peek3.oldest_at).toBe(0);
   });
 });
 

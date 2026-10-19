@@ -15,8 +15,8 @@ import { log } from "../shared/utils.ts";
 const LOG_PREFIX = "delivery";
 
 export type DriverSlot =
-  | { kind: "codex"; driver: CodexDriver; threadId: string | null; busy: boolean; lastNudge: number }
-  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number };
+  | { kind: "codex"; driver: CodexDriver; threadId: string | null; busy: boolean; lastNudge: number; releasedAt?: number }
+  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number };
 
 export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "steered" | "replied" | "sent" | "failed";
 
@@ -53,7 +53,7 @@ export async function deliverPendingMessages(
   if (state.kind === "codex" && !threadId) return "not_ready";
   if (state.busy) return "busy";
 
-  const poll = await brokerClient.pollBySlot(slotId);
+  const poll = await brokerClient.pollBySlot(slotId, { retain: true });
   const messages = poll.messages ?? [];
   if (messages.length === 0) return "none";
 
@@ -62,12 +62,11 @@ export async function deliverPendingMessages(
   log(LOG_PREFIX, `Forwarding ${messages.length} message(s) to ${state.kind} slot ${slotId}`);
 
   if (state.kind === "claude") {
+    // Claude Code queues stdin messages and reads them at the next tool-call
+    // boundary; it echoes a message only then, so the echo is not awaited here —
+    // waiting for it would re-send messages during long tool calls.
     try {
-      const echoed = await state.driver.send(prompt);
-      if (!echoed) {
-        log(LOG_PREFIX, `Claude slot ${slotId} did not echo the message — leaving it unacked for retry`);
-        return "failed";
-      }
+      await state.driver.send(prompt, { awaitEcho: false });
     } catch (err) {
       log(LOG_PREFIX, `Claude slot ${slotId} send failed: ${err instanceof Error ? err.message : String(err)}`);
       return "failed";
@@ -94,12 +93,12 @@ export async function deliverPendingMessages(
       await ack(brokerClient, ids);
       await brokerClient.updateSlot({
         id: slotId,
-        context_snapshot: JSON.stringify({
+        context_patch: {
           codex_thread_id: result.threadId,
           last_summary: result.content.slice(0, 200),
           last_status: "working",
           updated_at: Date.now(),
-        }),
+        },
       }).catch(() => {});
     })
     .catch((err) => {

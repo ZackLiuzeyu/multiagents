@@ -10,12 +10,14 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. A message is `delivered` once a delivery mechanism picked it up and `acked` once it reached the model; polls return unacked messages so failed deliveries retry.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. A message is `delivered` once a delivery mechanism picked it up and `acked` once it reached the model. A plain poll consumes what it returns; clients that confirm delivery themselves poll with `retain: true` and call `/ack-messages`, so a failed delivery is retried. Messages match by peer id or slot id, so an agent respawned into a slot inherits its predecessor's inbox. `/peek-undelivered` reports unacked and unclaimed counts; `/slots/update` takes `context_patch` to merge into the slot snapshot without clobbering other writers' keys (driver session ids).
 - `server.ts` — MCP stdio server, one per agent CLI instance (`adapters/*`). Prepends unread messages to every tool result (`[PENDING MESSAGES]`) and acks them; Claude also gets a best-effort channel notification.
 - `adapters/protocol-text.ts` — Team protocol: short form for MCP `instructions` (Claude Code caps them at 4096 chars, Codex reads 512), full form for orchestrator prompts.
 - `orchestrator/claude-driver.ts` — Long-lived `claude -p --input-format stream-json` session; teammate messages are written to stdin and read mid-turn. `system/init` only arrives after the first message; closing stdin ends the session.
 - `orchestrator/codex-driver.ts` — `codex app-server` JSON-RPC client (shapes verified against the 0.156.1 schema).
-- `orchestrator/delivery.ts` — Hands unacked messages to a driver and acks them on confirmed hand-off.
+- `orchestrator/delivery.ts` — Hands unacked messages to a driver (`retain` poll) and acks them on confirmed hand-off.
+- `orchestrator/supervision.ts` — Driver registry (one driver per slot), non-overlapping loop ticks, release and watchdog verdicts; pure enough to unit-test.
+- `orchestrator/monitor.ts` — Slot summaries and token accounting. Claude's `result.usage` is per turn (added as is); Codex's `thread/tokenUsage/updated.total` is cumulative (diffed).
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Git-based summary of what an agent is working on (no API calls).
 - `cli.ts` — CLI utility for inspecting broker state.

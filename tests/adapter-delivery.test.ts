@@ -147,13 +147,22 @@ describe("tool-result delivery", () => {
     const quiet = await agent.client.callTool("set_summary", { summary: "working" });
     expect(quiet.text).not.toContain("handled by the driver");
 
-    // The driver claims the message (poll-by-slot) before injecting it; the adapter must not double-deliver it.
-    await post("/poll-by-slot", { slot_id: agent.slot.id });
+    // The driver claims the message (poll-by-slot, retained until acked) before injecting it; the adapter must not double-deliver it.
+    await post("/poll-by-slot", { slot_id: agent.slot.id, retain: true });
     await agent.send("fresh one");
     const check = await agent.client.callTool("check_messages");
     expect(check.text).toContain("fresh one");
     expect(check.text).not.toContain("handled by the driver");
     expect(await agent.unacked()).toBe(1);
+  }, 30_000);
+});
+
+describe("team status", () => {
+  test("check_team_status names each teammate's peer id so send_message can address them", async () => {
+    const agent = await spawnAgent("claude");
+    const status = await agent.client.callTool("check_team_status");
+    expect(status.text).toMatch(/Reviewer \| codex \| Code Reviewer \| ONLINE \| task: idle \| id: cx-[a-z0-9]+/);
+    expect(status.text).toMatch(/Agent \| claude \| Software Engineer \| ONLINE \| task: idle \| id: cl-[a-z0-9]+ \(you\)/);
   }, 30_000);
 });
 

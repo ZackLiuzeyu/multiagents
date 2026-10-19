@@ -424,8 +424,14 @@ export abstract class BaseAdapter {
   // --- Inbound delivery ---
   /** Messages handed to this adapter but not yet surfaced to the model. */
   private pending = new Map<number, BufferedMessage>();
-  /** Recently acked ids — a poll issued before the ack landed must not re-deliver them. */
+  /** Ids the model has seen — a poll issued before the ack landed must not re-deliver them. */
   private acked = new Set<number>();
+  /** Seen ids whose broker ack has not succeeded yet; retried before every poll. */
+  private pendingAck = new Set<number>();
+  /** The poll in flight; the loop and check_messages share it so one message is never staged twice. */
+  private inflightPoll: Promise<BufferedMessage[]> | null = null;
+  /** check_messages calls currently waiting on a poll; the loop leaves their messages to them. */
+  private checkMessagesWaiting = 0;
   /** Set when an orchestrator driver owns delivery for this agent (no polling, no piggyback). */
   protected driverMode = false;
   /** Subclasses whose host rarely reads instructions inject team context into the first tool result. */
@@ -967,16 +973,57 @@ export abstract class BaseAdapter {
     return msgs;
   }
 
-  private async ack(ids: number[]): Promise<void> {
+  private markSeen(ids: number[]): void {
     for (const id of ids) this.acked.add(id);
     if (this.acked.size > ACKED_MEMORY) {
       for (const id of [...this.acked].slice(0, this.acked.size - ACKED_MEMORY)) this.acked.delete(id);
     }
+  }
+
+  /** The model saw these messages: never show them again, and tell the broker (retried until it succeeds). */
+  private async ack(ids: number[]): Promise<void> {
+    this.markSeen(ids);
+    for (const id of ids) this.pendingAck.add(id);
+    await this.flushAcks();
+  }
+
+  private async flushAcks(): Promise<void> {
+    if (this.pendingAck.size === 0) return;
+    const ids = [...this.pendingAck];
     try {
       await this.broker.ackMessages(ids);
+      for (const id of ids) this.pendingAck.delete(id);
     } catch (e) {
-      this.log(`Ack failed for ${ids.length} message(s): ${e instanceof Error ? e.message : String(e)}`);
+      this.log(`Ack failed for ${ids.length} message(s), will retry: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /** Poll once and stage what is new as pending; callers that overlap share the one poll. */
+  private stagePending(): Promise<BufferedMessage[]> {
+    if (!this.inflightPoll) {
+      this.inflightPoll = this.pollAndStage().finally(() => { this.inflightPoll = null; });
+    }
+    return this.inflightPoll;
+  }
+
+  private async pollAndStage(): Promise<BufferedMessage[]> {
+    await this.flushAcks();
+    // Under a driver the orchestrator injects messages itself; only unclaimed ones
+    // may surface here, consumed at poll time so the driver cannot claim them too.
+    const result = this.driverMode
+      ? await this.broker.pollMessages(this.myId!, { unclaimedOnly: true })
+      : await this.broker.pollMessages(this.myId!, { retain: true });
+    const fresh = result.messages.filter((m) => !this.pending.has(m.id) && !this.acked.has(m.id));
+    if (fresh.length === 0) return [];
+    const cache = await this.lookupCache();
+    const staged: BufferedMessage[] = [];
+    for (const msg of fresh) {
+      const enriched = await this.enrichMessage(msg, cache);
+      if (this.pending.has(msg.id) || this.acked.has(msg.id)) continue;
+      this.pending.set(msg.id, enriched);
+      staged.push(enriched);
+    }
+    return staged;
   }
 
   /** Team context injected into the first tool result (hosts that do not read MCP instructions). */
@@ -1130,22 +1177,17 @@ export abstract class BaseAdapter {
     if (!this.myId) {
       return this.errorResult("Not registered with broker yet");
     }
+    this.checkMessagesWaiting++;
     try {
-      // Under a driver, the orchestrator claims and injects messages itself; only
-      // unclaimed ones may be surfaced here, or the model would see them twice.
-      const result = await this.broker.pollMessages(this.myId, { unclaimedOnly: this.driverMode });
-      const fresh = result.messages.filter((m) => !this.pending.has(m.id) && !this.acked.has(m.id));
-      if (fresh.length > 0) {
-        const cache = await this.lookupCache();
-        for (const msg of fresh) {
-          this.pending.set(msg.id, await this.enrichMessage(msg, cache));
-        }
-      }
+      await this.stagePending();
       if (this.pending.size === 0) {
         return this.textResult("No new messages.");
       }
       const msgs = this.takePending();
-      await this.ack(msgs.map((m) => m.id));
+      const ids = msgs.map((m) => m.id);
+      // Under a driver the poll already consumed them; otherwise they are acked now that this result carries them.
+      if (this.driverMode) this.markSeen(ids);
+      else await this.ack(ids);
       const formatted = msgs.map((m) => this.formatMessage(m));
       return this.textResult(
         `${msgs.length} new message(s):\n\n${formatted.join("\n\n---\n\n")}`,
@@ -1154,6 +1196,8 @@ export abstract class BaseAdapter {
       return this.errorResult(
         `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
       );
+    } finally {
+      this.checkMessagesWaiting--;
     }
   }
 
@@ -1443,10 +1487,11 @@ export abstract class BaseAdapter {
       const task = s.task_state || "idle";
       const paused = (s.paused === true || (s.paused as unknown as number) === 1) ? " [PAUSED]" : "";
       const isMe = s.peer_id === this.myId ? " (you)" : "";
-      return `  ${name} | ${s.agent_type} | ${role} | ${conn}${paused} | task: ${task}${isMe}`;
+      const id = s.peer_id ? ` | id: ${s.peer_id}` : "";
+      return `  ${name} | ${s.agent_type} | ${role} | ${conn}${paused} | task: ${task}${id}${isMe}`;
     });
 
-    const header = `Team Status (${slots.filter(s => s.status === "connected").length}/${slots.length} online):`;
+    const header = `Team Status (${slots.filter(s => s.status === "connected").length}/${slots.length} online) — message a teammate with send_message(to_id=<id>):`;
     const needsReview = slots.filter(s => s.task_state === "done_pending_review");
     const addressingFb = slots.filter(s => s.task_state === "addressing_feedback");
     const approved = slots.filter(s => s.task_state === "approved");
@@ -1641,28 +1686,25 @@ export abstract class BaseAdapter {
   // --- Poll loop ---
 
   /**
-   * Pick up unacked messages, remember them as pending (they are surfaced in
-   * the next tool result) and notify the host out-of-band once per message.
+   * Pick up new messages, remember them as pending (they are surfaced in the
+   * next tool result) and notify the host out-of-band once per message.
    */
   protected async pollLoop(): Promise<void> {
     if (!this.myId || this.driverMode) return;
 
     try {
-      const result = await this.broker.pollMessages(this.myId);
-      const fresh = result.messages.filter((m) => !this.pending.has(m.id) && !this.acked.has(m.id));
-      if (fresh.length === 0) return;
-
-      const cache = await this.lookupCache();
-      for (const msg of fresh) {
-        const enriched = await this.enrichMessage(msg, cache);
-        this.pending.set(msg.id, enriched);
+      const staged = await this.stagePending();
+      // A check_messages call waiting on the same poll returns them itself.
+      if (this.checkMessagesWaiting > 0) return;
+      for (const msg of staged) {
+        if (!this.pending.has(msg.id)) continue;
         try {
-          await this.deliverMessage(enriched);
+          await this.deliverMessage(msg);
         } catch (e) {
           this.log(`Out-of-band delivery failed (message stays pending): ${e instanceof Error ? e.message : String(e)}`);
         }
         this.log(
-          `Received message from ${enriched.from_display_name ?? enriched.from_id}: ${msg.text.slice(0, 80)}`,
+          `Received message from ${msg.from_display_name ?? msg.from_id}: ${msg.text.slice(0, 80)}`,
         );
       }
     } catch (e) {

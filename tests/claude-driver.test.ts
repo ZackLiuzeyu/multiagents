@@ -102,9 +102,12 @@ describe("ClaudeDriver turns", () => {
   test("send() resolves once the host echoes the message back", async () => {
     const { driver } = await spawnFake();
     await driver.prompt("warm up");
+    // Register the turn waiter before sending: the echo and the result can arrive in one chunk.
+    const turn = driver.waitForTurn();
     const acked = await driver.send("ping");
     expect(acked).toBe(true);
-    await driver.waitForTurn();
+    const result = await turn;
+    expect(result.content).toBe("done: ping");
   });
 });
 
@@ -118,6 +121,23 @@ describe("ClaudeDriver lifecycle", () => {
     expect(code).toBe(0);
     expect(seen).toEqual([0]);
     expect(driver.alive).toBe(false);
+  });
+
+  test("a host that dies before echoing makes send() resolve false, not true", async () => {
+    const { driver } = await spawnFake({}, { FAKE_CLAUDE_CRASH: "after-init" });
+    const echoed = await driver.send("never read");
+    expect(echoed).toBe(false);
+    expect(driver.alive).toBe(false);
+  });
+
+  test("onExit registered after the process already exited fires with the exit code", async () => {
+    const { driver } = await spawnFake();
+    await driver.prompt("warm up");
+    await driver.close();
+    const seen: number[] = [];
+    driver.onExit((code) => { seen.push(code); });
+    await Bun.sleep(50);
+    expect(seen).toEqual([0]);
   });
 
   test("a host crash rejects the pending turn and reports the exit code", async () => {

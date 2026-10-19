@@ -24,18 +24,21 @@ import {
   GUARDRAIL_CHECK_INTERVAL,
   CONFLICT_CHECK_INTERVAL,
   FLAP_WINDOW_MS,
+  STUCK_THRESHOLD_MS,
 } from "../shared/constants.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { deliverPendingMessages, type DriverSlot } from "./delivery.ts";
+import { RespawnGuard } from "./respawn-guard.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import type { ClaudeDriver } from "./claude-driver.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
+import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox } from "./supervision.ts";
 
 const LOG_PREFIX = "orchestrator";
 const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
@@ -44,23 +47,16 @@ const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
 // Track pending events to push as notifications
 const pendingEvents: AgentEvent[] = [];
-// Driver-managed agents (Claude over stream-json, Codex over app-server): Map<sessionId, Map<slotId, state>>
-const activeDrivers: Map<string, Map<number, DriverSlot>> = new Map();
+// Driver-managed agents (Claude over stream-json, Codex over app-server), one driver per slot
+const activeDrivers = new DriverRegistry();
+// One respawn per slot at a time, whichever path (crash, code-0 exit, watchdog, resume) triggers it
+const respawnGuard = new RespawnGuard();
 
 interface LaunchedAgent {
   pid: number;
   process: Subprocess;
   codexDriver?: CodexDriver;
   claudeDriver?: ClaudeDriver;
-}
-
-function driversOf(sessionId: string): Map<number, DriverSlot> {
-  let drivers = activeDrivers.get(sessionId);
-  if (!drivers) {
-    drivers = new Map();
-    activeDrivers.set(sessionId, drivers);
-  }
-  return drivers;
 }
 
 async function slotIsReleased(slotId: number, brokerClient: BrokerClient): Promise<boolean> {
@@ -77,16 +73,30 @@ async function closeDriver(state: DriverSlot): Promise<void> {
   else await state.driver.kill();
 }
 
-/** Stop every driver of a session (fast path for end/delete/shutdown). */
-function killSessionDrivers(sessionId: string): void {
-  const drivers = activeDrivers.get(sessionId);
-  if (!drivers) return;
-  for (const [slotId, state] of drivers) {
+/**
+ * Stop every agent of a session. The session is forgotten BEFORE anything is
+ * killed, so the exit handlers that fire while processes die find no session
+ * to respawn into.
+ */
+function stopSession(sessionId: string): { stopped: number } {
+  activeSessions.delete(sessionId);
+  const procs = activeProcesses.get(sessionId);
+  activeProcesses.delete(sessionId);
+  const drivers = activeDrivers.dropSession(sessionId);
+
+  let stopped = 0;
+  for (const [slotId, state] of drivers ?? []) {
     log(LOG_PREFIX, `Stopping ${state.kind} driver in slot ${slotId}`);
     state.driver.kill().catch(() => { /* already dead */ });
+    stopped++;
   }
-  drivers.clear();
-  activeDrivers.delete(sessionId);
+  for (const [slotId, proc] of procs ?? []) {
+    if (drivers?.has(slotId)) continue; // a driver's process was killed above
+    log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
+    try { proc.kill(); } catch { /* already dead */ }
+    stopped++;
+  }
+  return { stopped };
 }
 
 /**
@@ -102,27 +112,38 @@ function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, b
   }
   procs.set(slotId, result.process);
 
-  if (result.claudeDriver) {
-    const state: DriverSlot = { kind: "claude", driver: result.claudeDriver, busy: false, lastNudge: 0 };
-    driversOf(sessionId).set(slotId, state);
-    monitorClaudeDriver(result.claudeDriver, slotId, sessionId, brokerClient, handleEvent);
-    result.claudeDriver.onExit((code) => onDriverExit(sessionId, slotId, state, code, brokerClient));
-  } else if (result.codexDriver) {
-    const state: DriverSlot = { kind: "codex", driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 };
-    driversOf(sessionId).set(slotId, state);
-    monitorCodexDriver(result.codexDriver, slotId, sessionId, brokerClient, handleEvent);
-    result.codexDriver.onExit((code) => onDriverExit(sessionId, slotId, state, code, brokerClient));
-  } else {
+  const state: DriverSlot | null = result.claudeDriver
+    ? { kind: "claude", driver: result.claudeDriver, busy: false, lastNudge: 0 }
+    : result.codexDriver
+      ? { kind: "codex", driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 }
+      : null;
+  if (!state) {
     monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
+    return;
   }
+
+  const displaced = activeDrivers.track(sessionId, slotId, state);
+  if (displaced) {
+    log(LOG_PREFIX, `Slot ${slotId} already had a live ${displaced.kind} driver (pid ${displaced.driver.pid}) — stopping it in favour of the new one`);
+    displaced.driver.kill().catch(() => { /* already dead */ });
+  }
+  if (state.kind === "claude") {
+    monitorClaudeDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
+  } else {
+    monitorCodexDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
+  }
+  state.driver.onExit((code) => onDriverExit(sessionId, slotId, state, code, brokerClient));
 }
 
 /** A driver process ended: detach it, mark the slot disconnected, and respawn only if it was not released. */
 function onDriverExit(sessionId: string, slotId: number, state: DriverSlot, code: number, brokerClient: BrokerClient): void {
-  const drivers = activeDrivers.get(sessionId);
-  if (drivers?.get(slotId) === state) drivers.delete(slotId);
+  const replaced = !activeDrivers.detach(sessionId, slotId, state) && activeDrivers.has(sessionId, slotId);
   const procs = activeProcesses.get(sessionId);
   if (procs?.get(slotId) === state.driver.process) procs.delete(slotId);
+  if (replaced) {
+    log(LOG_PREFIX, `${state.kind} driver for slot ${slotId} exited (code ${code}) after being replaced — its slot is live`);
+    return;
+  }
 
   void (async () => {
     try {
@@ -272,9 +293,16 @@ async function respawnAfterCrash(event: AgentEvent): Promise<void> {
   if (crashEvent.data?.is_flapping) return;
 
   try {
-    const { respawnAgent } = await import("./recovery.ts");
-    const result = await respawnAgent(event.sessionId, event.slotId, brokerClient, sessionMeta.projectDir);
-    trackLaunch(event.sessionId, event.slotId, result, brokerClient);
+    const result = await respawnGuard.run(event.slotId, async () => {
+      const { respawnAgent } = await import("./recovery.ts");
+      const launched = await respawnAgent(event.sessionId, event.slotId, brokerClient, sessionMeta.projectDir);
+      trackLaunch(event.sessionId, event.slotId, launched, brokerClient);
+      return launched;
+    });
+    if (!result) {
+      log(LOG_PREFIX, `Slot ${event.slotId} is already being respawned — skipping crash respawn`);
+      return;
+    }
     log(LOG_PREFIX, `Auto-respawned slot ${event.slotId} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : result.claudeDriver ? ", ClaudeDriver" : ""})`);
     pendingEvents.push({
       type: "agent_restarted",
@@ -333,9 +361,16 @@ async function autoRestartIfIncomplete(
         return false;
       }
 
-      const { respawnAgent } = await import("./recovery.ts");
-      const result = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
-      trackLaunch(sessionId, slotId, result, brokerClient);
+      const result = await respawnGuard.run(slotId, async () => {
+        const { respawnAgent } = await import("./recovery.ts");
+        const launched = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
+        trackLaunch(sessionId, slotId, launched, brokerClient);
+        return launched;
+      });
+      if (!result) {
+        log(LOG_PREFIX, `${name} is already being respawned — skipping code-0 restart`);
+        return true;
+      }
       log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : result.claudeDriver ? ", ClaudeDriver" : ""})`);
 
       pendingEvents.push({
@@ -946,9 +981,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Release BEFORE stopping, so the exit handlers see "released" and skip auto-respawn
         await brokerClient.updateSlot({ id: slot.id, status: "disconnected", task_state: "released" });
 
-        const driverState = activeDrivers.get(session_id)?.get(slot.id);
+        const driverState = activeDrivers.delete(session_id, slot.id);
         if (driverState) {
-          activeDrivers.get(session_id)!.delete(slot.id);
           await closeDriver(driverState);
         }
         const sessionProcs = activeProcesses.get(session_id);
@@ -1154,18 +1188,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "end_session": {
         const { session_id, create_pr } = args as { session_id: string; create_pr?: boolean };
 
-        // Kill all active processes
-        const sessionProcs = activeProcesses.get(session_id);
-        if (sessionProcs) {
-          for (const [slotId, proc] of sessionProcs) {
-            log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
-            try { proc.kill(); } catch { /* already dead */ }
-          }
-          sessionProcs.clear();
-          activeProcesses.delete(session_id);
-        }
-
-        killSessionDrivers(session_id);
+        stopSession(session_id);
 
         // Clean driver-mode sentinel file
         try {
@@ -1194,7 +1217,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           completionRestartHistory.delete(slot.id);
         }
         clearAllCrashHistory();
-        activeSessions.delete(session_id);
 
         let prMessage = "";
         if (create_pr) {
@@ -1213,16 +1235,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "delete_session": {
         const { session_id } = args as { session_id: string };
 
-        // Kill any running agent processes first
-        const sessionProcs = activeProcesses.get(session_id);
-        if (sessionProcs) {
-          for (const [slotId, proc] of sessionProcs) {
-            try { proc.kill(); } catch { /* already dead */ }
-          }
-          activeProcesses.delete(session_id);
-        }
-        killSessionDrivers(session_id);
-        activeSessions.delete(session_id);
+        stopSession(session_id);
 
         // Clean up per-slot tracking state (memory leak prevention)
         clearAllTracking();
@@ -1310,9 +1323,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Get all slots
         const slots = await brokerClient.listSlots(session_id);
+        // A slot whose driver this orchestrator still runs is not respawned on top of it,
+        // even if the broker lost track of its peer.
         const disconnected = slots.filter((s: any) =>
           s.status === "disconnected" &&
           s.task_state !== "released" &&
+          !activeDrivers.isLive(session_id, s.id) &&
           !skipSet.has((s.display_name ?? "").toLowerCase()) &&
           !skipSet.has((s.role ?? "").toLowerCase())
         );
@@ -1408,8 +1424,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resumeLaunchedTypes.add(slot.agent_type);
 
             // Relaunch into existing slot
-            const result = await relaunchIntoSlot(session_id, session.project_dir, slot, handoffTask, brokerClient);
-            trackLaunch(session_id, result.slotId, result, brokerClient);
+            const result = await respawnGuard.run(slot.id, async () => {
+              const launched = await relaunchIntoSlot(session_id, session.project_dir, slot, handoffTask, brokerClient);
+              trackLaunch(session_id, launched.slotId, launched, brokerClient);
+              return launched;
+            });
+            if (!result) {
+              failed.push(`${slot.display_name || slot.role || slot.id}: respawn already in progress`);
+              continue;
+            }
 
             // Release held messages for this slot
             try {
@@ -1505,7 +1528,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
 
           // Skip driver-managed slots — orchestrator controls their lifecycle
-          if (activeDrivers.get(sessionId)?.has(slot.id)) continue;
+          if (activeDrivers.has(sessionId, slot.id)) continue;
 
           // Auto-cleanup: delete the dead slot
           try {
@@ -1551,25 +1574,31 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
       .finally(() => { state.busy = false; });
   }
 
-  // An agent told to keep polling may never end its turn, so "idle" also means
-  // no output for a while after the release message was delivered.
-  const RELEASE_IDLE_MS = 60_000;
-
+  // A released driver is closed once idle (releaseVerdict). Codex heartbeat
+  // replies keep lastActivity fresh, so only its notifications count as output.
   async function closeIfReleased(sessionId: string, slotId: number, state: DriverSlot): Promise<void> {
-    if (state.busy) return;
-    const turnActive = state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null;
-    const quietFor = Date.now() - state.driver.lastActivity;
-    if (turnActive && quietFor < RELEASE_IDLE_MS) return;
     if (!(await slotIsReleased(slotId, brokerClient))) return;
+    const now = Date.now();
+    state.releasedAt ??= now;
     const peek = await brokerClient.peekUndelivered(slotId).catch(() => ({ count: 0 }));
-    if (peek.count > 0) return; // the release message itself has not been delivered yet
-    activeDrivers.get(sessionId)?.delete(slotId);
-    log(LOG_PREFIX, `Slot ${slotId} released and ${turnActive ? `quiet for ${Math.round(quietFor / 1000)}s` : "idle"} — closing ${state.kind} driver`);
-    await closeDriver(state);
+    const verdict = releaseVerdict({
+      busy: state.busy,
+      turnActive: state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null,
+      lastOutputAt: state.kind === "claude" ? state.driver.lastActivity : state.driver.lastNotificationActivity,
+      releasedAt: state.releasedAt,
+      pendingCount: peek.count,
+      now,
+    });
+    if (verdict === "keep") return;
+    activeDrivers.delete(sessionId, slotId);
+    log(LOG_PREFIX, `Slot ${slotId} released ${Math.round((now - state.releasedAt) / 1000)}s ago and idle — closing ${state.kind} driver`);
+    // Not awaited: a Claude close waits for the turn to end and must not stall other slots.
+    closeDriver(state).catch((err) => log(LOG_PREFIX, `Closing driver for slot ${slotId} failed: ${err}`));
   }
 
-  setInterval(async () => {
-    for (const [sessionId, drivers] of activeDrivers) {
+  // One tick at a time: a slow driver call must not let the next tick hand out the same messages again.
+  setInterval(nonOverlapping(async () => {
+    for (const [sessionId, drivers] of activeDrivers.sessions()) {
       for (const [slotId, state] of drivers) {
         if (!state.driver.alive) continue;
 
@@ -1587,7 +1616,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         try { await closeIfReleased(sessionId, slotId, state); } catch (err) { log(LOG_PREFIX, `Release check failed for slot ${slotId}: ${err}`); }
       }
     }
-  }, 3_000);
+  }), 3_000);
 
   // Stuck agent nudge loop — every 45s, nudge agents silent for >1 min
   setInterval(async () => {
@@ -1784,16 +1813,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             // Grace period elapsed — auto-end the session
             log(LOG_PREFIX, `Session ${sessionId}: auto-ending (all agents approved for 30s)`);
 
-            // Kill all processes
-            const sessionProcs = activeProcesses.get(sessionId);
-            if (sessionProcs) {
-              for (const [slotId, proc] of sessionProcs) {
-                try { proc.kill(); } catch { /* already dead */ }
-              }
-              sessionProcs.clear();
-              activeProcesses.delete(sessionId);
-            }
-            killSessionDrivers(sessionId);
+            stopSession(sessionId);
 
             // Mark all connected slots as disconnected
             for (const slot of slots) {
@@ -1810,7 +1830,6 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
               clearSlotTracking(slot.id);
               completionRestartHistory.delete(slot.id);
             }
-            activeSessions.delete(sessionId);
             sessionCompletionTimers.delete(sessionId);
 
             pendingEvents.push({
@@ -1831,23 +1850,18 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Smart non-driver agent respawn ---
   //
-  // Problem: Gemini (and disconnected Claude) agents have no push/steer mechanism.
-  // After signal_done or when idle, the LLM stops calling MCP tools and messages
-  // pile up undelivered. Teammates are blocked waiting.
+  // Problem: process-launched agents (Gemini) only see teammate messages in
+  // their next MCP tool result. After signal_done or when idle, the LLM stops
+  // calling tools and messages pile up unacked. Teammates are blocked waiting.
   //
   // Solution: measure actual message staleness, not agent idle time.
-  //   - peek-undelivered returns `oldest_at` — the timestamp of the oldest unread message
-  //   - If actionable messages (review_request, feedback, task_complete) have been
-  //     sitting undelivered for >15s, the agent isn't polling → kill + respawn
-  //   - Disconnected agents with any actionable messages → respawn immediately
-  //   - Claude with channel push (connected) → skip, push handles delivery
-  //   - Codex with driver → skip, forwarding loop handles delivery
+  //   - A connected agent is judged by messages its adapter never claimed: a
+  //     claimed one is merely waiting for the agent's next tool call
+  //   - Disconnected agents with any actionable unacked messages → respawn immediately
+  //   - Driver-managed agents (Claude, Codex) → skip, the delivery loop handles them
+  //   - Paused agents are left alone
   //
-  // This means: teammate sends review_request → 15s for Gemini to self-poll →
-  // if not picked up, orchestrator kills idle process and spawns a fresh one
-  // that gets recap + pending messages on startup.
-  //
-  const MESSAGE_STALE_MS = 15_000; // 15s — enough for ~50 poll cycles at 300ms
+  const CONNECTED_STALE_MS = STUCK_THRESHOLD_MS;
   const lastRespawnAttempt: Map<number, number> = new Map();
 
   setInterval(async () => {
@@ -1859,30 +1873,28 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           if (taskState === "released") continue;
 
           // Skip driver-managed slots — the delivery loop handles them
-          if (activeDrivers.get(sessionId)?.has(slot.id)) continue;
+          if (activeDrivers.has(sessionId, slot.id)) continue;
 
           // Only act on processes this orchestrator launched; a connected slot it
           // does not own may be a human's interactive session.
           const owned = activeProcesses.get(sessionId)?.has(slot.id) === true;
           if (slot.status === "connected" && !owned) continue;
 
-          // Peek at unacked messages
-          const peek = await brokerClient.peekUndelivered(slot.id);
-          if (!peek || peek.count === 0) continue;
+          const inbox = watchdogInbox(slot, await brokerClient.peekUndelivered(slot.id));
+          if (!inbox || inbox.count === 0) continue;
 
           // Only act on actionable message types
-          const hasActionable = peek.msg_types.some(
+          const hasActionable = inbox.msg_types.some(
             (t) => t === "review_request" || t === "task_complete" || t === "feedback" || t === "system"
           );
           if (!hasActionable) continue;
 
           const now = Date.now();
 
-          // For connected agents: check if messages are stale (agent not polling)
-          // For disconnected agents: always eligible for respawn
+          // A connected agent is stuck only when messages stay unclaimed past the threshold
           if (slot.status === "connected") {
-            const messageAge = peek.oldest_at ? now - peek.oldest_at : 0;
-            if (messageAge < MESSAGE_STALE_MS) continue; // Give agent time to self-poll
+            const messageAge = inbox.oldest_at ? now - inbox.oldest_at : 0;
+            if (messageAge < CONNECTED_STALE_MS) continue;
           }
 
           // Throttle respawns (at most once per 45s per slot)
@@ -1896,8 +1908,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
           // If connected but not polling — kill the stale process first
           if (slot.status === "connected") {
-            const messageAgeSec = peek.oldest_at ? Math.round((now - peek.oldest_at) / 1000) : 0;
-            log(LOG_PREFIX, `${agentName} (${slot.agent_type}) has ${peek.count} undelivered message(s) for ${messageAgeSec}s — not polling, killing process`);
+            const messageAgeSec = inbox.oldest_at ? Math.round((now - inbox.oldest_at) / 1000) : 0;
+            log(LOG_PREFIX, `${agentName} (${slot.agent_type}) has ${inbox.count} unclaimed message(s) for ${messageAgeSec}s — not polling, killing process`);
             const sessionProcs = activeProcesses.get(sessionId);
             const proc = sessionProcs?.get(slot.id);
             if (proc) {
@@ -1908,19 +1920,23 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             await new Promise((r) => setTimeout(r, 1000));
           }
 
-          log(LOG_PREFIX, `Respawning ${agentName} (${slot.agent_type}) — ${peek.count} unread messages`);
+          log(LOG_PREFIX, `Respawning ${agentName} (${slot.agent_type}) — ${inbox.count} unread messages`);
 
           try {
-            const { respawnAgent } = await import("./recovery.ts");
-            const result = await respawnAgent(sessionId, slot.id, brokerClient, sessionMeta.projectDir);
-            trackLaunch(sessionId, slot.id, result, brokerClient);
+            const result = await respawnGuard.run(slot.id, async () => {
+              const { respawnAgent } = await import("./recovery.ts");
+              const launched = await respawnAgent(sessionId, slot.id, brokerClient, sessionMeta.projectDir);
+              trackLaunch(sessionId, slot.id, launched, brokerClient);
+              return launched;
+            });
+            if (!result) continue; // another path is already respawning this slot
 
             pendingEvents.push({
               type: "agent_restarted",
               severity: "info",
               slotId: slot.id,
               sessionId,
-              message: `${agentName} auto-respawned: ${peek.count} unread messages waiting ${peek.oldest_at ? Math.round((now - peek.oldest_at) / 1000) : "?"}s`,
+              message: `${agentName} auto-respawned: ${inbox.count} unread messages waiting ${inbox.oldest_at ? Math.round((now - inbox.oldest_at) / 1000) : "?"}s`,
             });
           } catch (err) {
             log(LOG_PREFIX, `Failed to respawn ${agentName}: ${err}`);
@@ -1957,13 +1973,9 @@ main().catch((err) => {
 // --- Graceful shutdown: kill all managed agent processes ---
 function shutdownOrchestrator() {
   log(LOG_PREFIX, "Shutting down — killing all managed agent processes");
-  for (const [sessionId, procs] of activeProcesses) {
-    for (const [slotId, proc] of procs) {
-      try { proc.kill(); } catch { /* already dead */ }
-    }
-  }
-  for (const sessionId of [...activeDrivers.keys()]) {
-    killSessionDrivers(sessionId);
+  const sessions = new Set([...activeSessions.keys(), ...activeProcesses.keys(), ...activeDrivers.sessionIds()]);
+  for (const sessionId of sessions) {
+    stopSession(sessionId);
   }
   process.exit(0);
 }

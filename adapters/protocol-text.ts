@@ -17,7 +17,7 @@ export const ALL_TOOLS = [
 export const SHORT_PROTOCOL = `
 === TEAM PROTOCOL ===
 1. You cannot disconnect until released (the broker denies it). While waiting: check_messages every 10s, check_team_status every 30s.
-2. Before implementing, resolve every unknown: ask the right teammate with send_message and wait for the answer. Answer teammates' questions immediately.
+2. Before implementing, resolve every unknown: ask the right teammate with send_message(to_id=<id shown by check_team_status>) and wait for the answer. Answer teammates' questions immediately.
 3. acquire_file before editing a shared file, release_file after. No TODOs or placeholder logic.
 4. Never call signal_done without proof: run the code and tests; report what changed, what was tested and the results.
 5. Review loop: signal_done → reviewer submit_feedback(actionable=true) → fix every item → signal_done again → approve. Reviewers/QA: start the moment a teammate reaches done_pending_review, cite file:line, mark [BLOCKING] vs [SUGGESTION], approve only with zero blocking items.

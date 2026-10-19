@@ -117,7 +117,7 @@ describe("formatForwardedMessages", () => {
 });
 
 describe("Claude driver delivery", () => {
-  test("pending messages are written to the session as one user message and acked once echoed", async () => {
+  test("pending messages are written to the session as one user message and acked once written", async () => {
     const { sessionId, slot, send, unacked } = await slotWithSender("claude");
     const { driver, stdinTexts } = await fakeClaude();
     await send("use port 8080");

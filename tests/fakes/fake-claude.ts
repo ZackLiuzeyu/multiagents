@@ -103,6 +103,7 @@ process.stdin.on("data", (chunk) => {
     log({ stdin: msg });
     if (msg.type !== "user") continue;
     announceInit();
+    if (process.env.FAKE_CLAUDE_CRASH === "after-init") process.exit(3);
     if (replay) out({ type: "user", message: msg.message, session_id: sessionId, parent_tool_use_id: null, isReplay: true });
     if (inTurn) {
       absorbed.push(contentText(msg.message));

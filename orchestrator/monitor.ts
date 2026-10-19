@@ -14,8 +14,10 @@ import { log } from "../shared/utils.ts";
 const LOG_PREFIX = "monitor";
 type ProcessReadableStream = Exclude<Subprocess["stdout"], number | null | undefined>;
 
-// Track last-seen cumulative tokens per slot (Codex sends cumulative totals)
+// Last cumulative totals per slot, for sources that report running thread totals
 const lastTokenTotals = new Map<number, { input: number; output: number; cacheRead: number }>();
+// Input-side usage already metered from a Claude turn's API calls (keyed by message id), settled by its result event
+const claudeTurnInput = new Map<number, { input: number; cacheRead: number; calls: Set<string> }>();
 
 function isReadableStream(
   stream: Subprocess["stdout"] | Subprocess["stderr"],
@@ -23,33 +25,53 @@ function isReadableStream(
   return stream !== undefined && stream !== null && typeof stream !== "number";
 }
 
-/** Update token usage for a slot — handles both delta and cumulative formats. */
+type TokenCounts = { input: number; output: number; cacheRead: number };
+
+/**
+ * Add token usage to a slot. Codex reports cumulative thread totals, so only
+ * the increase since the last report counts; a Claude result carries that
+ * turn's own usage (verified on Claude Code 2.1.241) and is added as is.
+ */
 async function updateTokenUsage(
   slotId: number,
-  tokens: { input: number; output: number; cacheRead: number },
+  tokens: TokenCounts,
   brokerClient: BrokerClient,
+  reporting: "per_turn" | "cumulative",
 ): Promise<void> {
-  // Codex sends cumulative totals; Claude sends per-result totals.
-  // For Codex, we compute the delta from the last seen value.
-  // For Claude, each "result" contains the full session usage, so we also delta.
-  const last = lastTokenTotals.get(slotId) ?? { input: 0, output: 0, cacheRead: 0 };
-  const deltaInput = Math.max(0, tokens.input - last.input);
-  const deltaOutput = Math.max(0, tokens.output - last.output);
-  const deltaCacheRead = Math.max(0, tokens.cacheRead - last.cacheRead);
+  let delta = tokens;
+  if (reporting === "cumulative") {
+    const last = lastTokenTotals.get(slotId) ?? { input: 0, output: 0, cacheRead: 0 };
+    delta = {
+      input: Math.max(0, tokens.input - last.input),
+      output: Math.max(0, tokens.output - last.output),
+      cacheRead: Math.max(0, tokens.cacheRead - last.cacheRead),
+    };
+    lastTokenTotals.set(slotId, tokens);
+  }
 
-  lastTokenTotals.set(slotId, tokens);
-
-  if (deltaInput === 0 && deltaOutput === 0 && deltaCacheRead === 0) return;
+  if (delta.input === 0 && delta.output === 0 && delta.cacheRead === 0) return;
 
   try {
     await brokerClient.updateSlot({
       id: slotId,
-      input_tokens: deltaInput,
-      output_tokens: deltaOutput,
-      cache_read_tokens: deltaCacheRead,
+      input_tokens: delta.input,
+      output_tokens: delta.output,
+      cache_read_tokens: delta.cacheRead,
     });
   } catch {
     // Best-effort token tracking
+  }
+}
+
+/** Record the agent's latest activity on its slot without touching the other snapshot keys (driver session ids). */
+async function patchSummary(slotId: number, summary: string, brokerClient: BrokerClient): Promise<void> {
+  try {
+    await brokerClient.updateSlot({
+      id: slotId,
+      context_patch: { last_summary: summary, last_status: "working", updated_at: Date.now() },
+    });
+  } catch {
+    // Best-effort snapshot update
   }
 }
 
@@ -132,12 +154,14 @@ const transitionedToWorking = new Set<number>();
 /** Clear all tracking state for a slot (call on release/session end). */
 export function clearSlotTracking(slotId: number): void {
   lastTokenTotals.delete(slotId);
+  claudeTurnInput.delete(slotId);
   transitionedToWorking.delete(slotId);
 }
 
 /** Clear all tracking state (call on full session cleanup). */
 export function clearAllTracking(): void {
   lastTokenTotals.clear();
+  claudeTurnInput.clear();
   transitionedToWorking.clear();
 }
 
@@ -190,13 +214,30 @@ export async function processEvent(
         data: { result: parsed.result, subtype: parsed.subtype },
       });
 
+      // The turn's usage minus what its assistant events already metered; output is only known here.
       const usage = parsed.usage ?? parsed.result?.usage;
       if (usage) {
+        const metered = claudeTurnInput.get(slotId) ?? { input: 0, cacheRead: 0 };
+        claudeTurnInput.delete(slotId);
         await updateTokenUsage(slotId, {
-          input: usage.input_tokens ?? 0,
+          input: Math.max(0, (usage.input_tokens ?? 0) - metered.input),
           output: usage.output_tokens ?? 0,
-          cacheRead: usage.cache_read_input_tokens ?? usage.cache_creation_input_tokens ?? 0,
-        }, brokerClient);
+          cacheRead: Math.max(0, (usage.cache_read_input_tokens ?? usage.cache_creation_input_tokens ?? 0) - metered.cacheRead),
+        }, brokerClient, "per_turn");
+      }
+    }
+
+    // Claude emits one assistant event per content block, each carrying its API call's usage;
+    // input and cache counts are final there, output_tokens is a streaming placeholder.
+    if (parsed.type === "assistant" && parsed.message?.usage && typeof parsed.message.id === "string") {
+      const turn = claudeTurnInput.get(slotId) ?? { input: 0, cacheRead: 0, calls: new Set<string>() };
+      if (!turn.calls.has(parsed.message.id)) {
+        turn.calls.add(parsed.message.id);
+        const call = { input: parsed.message.usage.input_tokens ?? 0, cacheRead: parsed.message.usage.cache_read_input_tokens ?? 0 };
+        turn.input += call.input;
+        turn.cacheRead += call.cacheRead;
+        claudeTurnInput.set(slotId, turn);
+        await updateTokenUsage(slotId, { input: call.input, output: 0, cacheRead: call.cacheRead }, brokerClient, "per_turn");
       }
     }
 
@@ -207,7 +248,7 @@ export async function processEvent(
         input: tu.input_tokens ?? 0,
         output: tu.output_tokens ?? 0,
         cacheRead: tu.cached_input_tokens ?? 0,
-      }, brokerClient);
+      }, brokerClient, "cumulative");
     }
 
     // Codex JSONL activity events — update context_snapshot so the
@@ -224,110 +265,48 @@ export async function processEvent(
       const itemType = codexItem.type;
 
       if (itemType === "agent_message" && codexItem.text) {
-        try {
-          const summary = codexItem.text.slice(0, 200);
-          await brokerClient.updateSlot({
-            id: slotId,
-            context_snapshot: JSON.stringify({
-              last_summary: summary,
-              last_status: "working",
-              updated_at: Date.now(),
-            }),
-          });
-        } catch {
-          // Best-effort snapshot update
-        }
+        await patchSummary(slotId, codexItem.text.slice(0, 200), brokerClient);
       }
 
       if (itemType === "command_execution") {
-        try {
-          await brokerClient.updateSlot({
-            id: slotId,
-            context_snapshot: JSON.stringify({
-              last_summary: `Running: ${(codexItem.command ?? "shell command").slice(0, 100)}`,
-              last_status: "working",
-              updated_at: Date.now(),
-            }),
-          });
-        } catch { /* best-effort */ }
+        await patchSummary(slotId, `Running: ${(codexItem.command ?? "shell command").slice(0, 100)}`, brokerClient);
       }
 
       if (itemType === "mcp_tool_call") {
-        try {
-          await brokerClient.updateSlot({
-            id: slotId,
-            context_snapshot: JSON.stringify({
-              last_summary: `MCP: ${codexItem.server ?? ""}/${codexItem.tool ?? "unknown"}`.slice(0, 100),
-              last_status: "working",
-              updated_at: Date.now(),
-            }),
-          });
-        } catch { /* best-effort */ }
+        await patchSummary(slotId, `MCP: ${codexItem.server ?? ""}/${codexItem.tool ?? "unknown"}`.slice(0, 100), brokerClient);
       }
     }
 
     // Legacy Codex format (older versions): {msg:{type:"message"|"exec_command_output",...}}
     if (parsed.msg?.type === "message" && parsed.msg?.role === "assistant") {
-      try {
-        const content = parsed.msg.content;
-        const contentText = Array.isArray(content)
-          ? content
-              .filter((c: any) => c.type === "output_text")
-              .map((c: any) => c.text)
-              .join("")
-          : typeof content === "string" ? content : "";
-        if (contentText) {
-          await brokerClient.updateSlot({
-            id: slotId,
-            context_snapshot: JSON.stringify({
-              last_summary: contentText.slice(0, 200),
-              last_status: "working",
-              updated_at: Date.now(),
-            }),
-          });
-        }
-      } catch { /* best-effort */ }
+      const content = parsed.msg.content;
+      const contentText = Array.isArray(content)
+        ? content
+            .filter((c: any) => c.type === "output_text")
+            .map((c: any) => c.text)
+            .join("")
+        : typeof content === "string" ? content : "";
+      if (contentText) {
+        await patchSummary(slotId, contentText.slice(0, 200), brokerClient);
+      }
     }
     if (parsed.msg?.type === "exec_command_output" || parsed.msg?.type === "mcp_tool_call") {
-      try {
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            last_summary: parsed.msg.type === "exec_command_output"
-              ? `Running: ${(parsed.msg.info?.command ?? "shell command").slice(0, 100)}`
-              : `MCP tool: ${(parsed.msg.info?.tool_name ?? "unknown").slice(0, 100)}`,
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-      } catch { /* best-effort */ }
+      await patchSummary(slotId, parsed.msg.type === "exec_command_output"
+        ? `Running: ${(parsed.msg.info?.command ?? "shell command").slice(0, 100)}`
+        : `MCP tool: ${(parsed.msg.info?.tool_name ?? "unknown").slice(0, 100)}`, brokerClient);
     }
 
     // Claude stream-json assistant message with content
     if (parsed.type === "assistant" && parsed.message?.content) {
       // Auto-transition to "working" on first Claude output
       await autoTransitionToWorking(slotId, brokerClient);
-      // Update the slot's context snapshot with latest output
-      try {
-        const contentText = Array.isArray(parsed.message.content)
-          ? parsed.message.content
-              .filter((c: any) => c.type === "text")
-              .map((c: any) => c.text)
-              .join("")
-          : String(parsed.message.content);
-
-        const summary = contentText.slice(0, 200);
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            last_summary: summary,
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-      } catch {
-        // Best-effort snapshot update
-      }
+      const contentText = Array.isArray(parsed.message.content)
+        ? parsed.message.content
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text)
+            .join("")
+        : String(parsed.message.content);
+      if (contentText) await patchSummary(slotId, contentText.slice(0, 200), brokerClient);
     }
 
     // Tool use signals progress — auto-transition to "working"
@@ -508,7 +487,7 @@ async function handleCodexNotification(
         input: total.inputTokens ?? 0,
         output: total.outputTokens ?? 0,
         cacheRead: total.cachedInputTokens ?? 0,
-      }, brokerClient);
+      }, brokerClient, "cumulative");
     }
     return;
   }
@@ -523,55 +502,19 @@ async function handleCodexNotification(
     const itemType = item.type as string | undefined;
 
     if (itemType === "agentMessage" && item.text) {
-      try {
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            last_summary: String(item.text).slice(0, 200),
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-      } catch { /* best-effort */ }
+      await patchSummary(slotId, String(item.text).slice(0, 200), brokerClient);
     }
 
     if (itemType === "commandExecution") {
-      try {
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            last_summary: `Running: ${String(item.command ?? "shell command").slice(0, 100)}`,
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-      } catch { /* best-effort */ }
+      await patchSummary(slotId, `Running: ${String(item.command ?? "shell command").slice(0, 100)}`, brokerClient);
     }
 
     if (itemType === "mcpToolCall") {
-      try {
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            last_summary: `MCP: ${String(item.serverLabel ?? "")}/${String(item.toolName ?? "unknown")}`.slice(0, 100),
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-      } catch { /* best-effort */ }
+      await patchSummary(slotId, `MCP: ${String(item.serverLabel ?? "")}/${String(item.toolName ?? "unknown")}`.slice(0, 100), brokerClient);
     }
 
     if (itemType === "fileChange") {
-      try {
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            last_summary: `File: ${String(item.filePath ?? "unknown file").slice(0, 100)}`,
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-      } catch { /* best-effort */ }
+      await patchSummary(slotId, `File: ${String(item.filePath ?? "unknown file").slice(0, 100)}`, brokerClient);
     }
 
     onEvent({

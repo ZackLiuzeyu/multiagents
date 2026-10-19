@@ -177,6 +177,17 @@ describe("CodexDriver server requests", () => {
 });
 
 describe("CodexDriver process lifecycle", () => {
+  test("onExit registered after the process already exited fires with the exit code", async () => {
+    const { driver } = await spawnFake();
+    await driver.kill();
+    await driver.process.exited;
+    const seen: number[] = [];
+    driver.onExit((code) => { seen.push(code); });
+    await Bun.sleep(50);
+    expect(seen).toHaveLength(1);
+    expect(typeof seen[0]).toBe("number");
+  });
+
   test("process exit rejects the in-flight turn and fires onExit", async () => {
     const { driver, dir } = await spawnFake();
     const first = await driver.startSession({ prompt: "warm up", cwd: dir });

@@ -278,6 +278,7 @@ multiagents/
 │   ├── launcher.ts         Agent spawning (drivers, MCP configs, prompts)
 │   ├── monitor.ts          Process/driver monitoring (event parsing, token tracking)
 │   ├── recovery.ts         Crash recovery (flap detection, respawn with context)
+│   ├── supervision.ts      Driver registry, loop tick guard, release/watchdog verdicts
 │   ├── progress.ts         Team status aggregation
 │   ├── session-control.ts  Pause/resume/broadcast
 │   ├── guardrails.ts       Guardrail enforcement

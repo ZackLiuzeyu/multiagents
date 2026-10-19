@@ -114,7 +114,7 @@ export class ClaudeDriver {
   private _initWaiter: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private _turnWaiters: Array<{ resolve: (r: ClaudeTurnResult) => void; reject: (e: Error) => void }> = [];
   /** Texts we wrote to stdin that the host has not echoed back yet (FIFO). */
-  private _awaitingEcho: Array<{ text: string; resolve: () => void }> = [];
+  private _awaitingEcho: Array<{ text: string; settle: (echoed: boolean) => void }> = [];
 
   get alive(): boolean { return this._alive; }
   get pid(): number { return this.proc.pid; }
@@ -141,14 +141,22 @@ export class ClaudeDriver {
       this._initWaiter?.reject(err);
       this._initWaiter = null;
       for (const w of this._turnWaiters.splice(0)) w.reject(err);
-      for (const e of this._awaitingEcho.splice(0)) e.resolve();
+      for (const e of this._awaitingEcho.splice(0)) e.settle(false);
       for (const cb of this._onExit) {
         try { cb(code); } catch { /* keep going */ }
       }
     });
   }
 
-  onExit(cb: (code: number) => void): void { this._onExit.push(cb); }
+  /** Fires with the exit code; a callback registered after the exit fires right away. */
+  onExit(cb: (code: number) => void): void {
+    if (this._exitCode !== null) {
+      const code = this._exitCode;
+      queueMicrotask(() => cb(code));
+      return;
+    }
+    this._onExit.push(cb);
+  }
   onEvent(cb: ClaudeEventListener): void { this._listeners.push(cb); }
 
   /**
@@ -191,19 +199,21 @@ export class ClaudeDriver {
   }
 
   /**
-   * Write a user message. Resolves true once the host echoed it back (the
-   * message is in Claude's queue), false if no echo arrived within the grace
-   * period. The first message also waits for the session's init event.
-   * Throws if the process is gone or never initializes.
+   * Write a user message. The first message also waits for the session's init
+   * event. Resolves true once the host echoed the message back — Claude echoes
+   * it when it reads it, which during a long tool call can be much later — or
+   * false if no echo arrived within the grace period; with `awaitEcho: false`
+   * it resolves right after the write. Throws if the process is gone or never
+   * initializes.
    */
-  async send(text: string, opts: { priority?: "next" | "later" | "now"; echoTimeoutMs?: number } = {}): Promise<boolean> {
+  async send(text: string, opts: { priority?: "next" | "later" | "now"; echoTimeoutMs?: number; awaitEcho?: boolean } = {}): Promise<boolean> {
     if (!this._alive) throw new Error("claude is not alive");
     const message: Record<string, unknown> = { type: "user", message: { role: "user", content: text } };
     if (opts.priority) message.priority = opts.priority;
 
     let settle!: (echoed: boolean) => void;
     const echoed = new Promise<boolean>((resolve) => { settle = resolve; });
-    const entry = { text, resolve: () => settle(true) };
+    const entry = { text, settle };
     this._awaitingEcho.push(entry);
 
     this.proc.stdin.write(JSON.stringify(message) + "\n");
@@ -220,6 +230,7 @@ export class ClaudeDriver {
         settle(false);
       }
     }, opts.echoTimeoutMs ?? 10_000);
+    if (opts.awaitEcho === false) return true;
     return echoed;
   }
 
@@ -295,7 +306,7 @@ export class ClaudeDriver {
         const idx = this._awaitingEcho.findIndex((e) => e.text === text);
         if (idx !== -1) {
           const [entry] = this._awaitingEcho.splice(idx, 1);
-          entry!.resolve();
+          entry!.settle(true);
         }
         return;
       }

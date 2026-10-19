@@ -241,18 +241,18 @@ export async function respawnAgent(
 
     await brokerClient.updateSlot({
       id: slotId,
-      context_snapshot: JSON.stringify({ codex_thread_id: threadId, last_summary: "Restarting after crash", last_status: "working", updated_at: Date.now() }),
+      context_patch: { codex_thread_id: threadId, last_summary: "Restarting after crash", last_status: "working", updated_at: Date.now() },
     });
 
     driver.reply(threadId, handoffTask).then(async (result) => {
       await brokerClient.updateSlot({
         id: slotId,
-        context_snapshot: JSON.stringify({
+        context_patch: {
           codex_thread_id: result.threadId,
           last_summary: result.content.slice(0, 200),
           last_status: "working",
           updated_at: Date.now(),
-        }),
+        },
       });
     }).catch((err) => log(LOG_PREFIX, `Codex respawn task failed: ${err}`));
 

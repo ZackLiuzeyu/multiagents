@@ -32,7 +32,8 @@ import type { Subprocess } from "bun";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
+const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
 const brokerClient = new BrokerClient(BROKER_URL);
 
 // Parse --timeout flag (default 5 minutes)
@@ -67,9 +68,11 @@ async function ensureBroker(): Promise<void> {
   info("Starting broker daemon...");
   const brokerScript = path.resolve(import.meta.dir, "..", "broker.ts");
   const proc = Bun.spawn(["bun", brokerScript], {
-    stdio: ["ignore", "ignore", "inherit"],
+    stdio: ["ignore", "ignore", "ignore"],
   });
   proc.unref();
+  // The broker is this run's own; left behind it would keep the port and any output pipe open.
+  process.on("exit", () => { try { proc.kill(); } catch { /* already gone */ } });
 
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 200));

@@ -208,7 +208,9 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string, ag
     }
     const codexMcp = mcpServerCommand("codex");
     const codexEnvLine = portOverride ? `env = { MULTIAGENTS_PORT = ${JSON.stringify(portOverride)} }\n` : "";
-    const codexEntry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n${codexEnvLine}`;
+    // Agents run with approval_policy "never", under which Codex denies MCP tool
+    // calls that would need approval; the team tools must be pre-approved.
+    const codexEntry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\ndefault_tools_approval_mode = "approve"\n${codexEnvLine}`;
     await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
   }
 
@@ -493,12 +495,12 @@ async function spawnClaudeAgent(
 
   await brokerClient.updateSlot({
     id: identity.slotId,
-    context_snapshot: JSON.stringify({
+    context_patch: {
       claude_session_id: driver.sessionId,
       last_summary: `Starting: ${firstPrompt.slice(0, 100)}`,
       last_status: "working",
       updated_at: Date.now(),
-    }),
+    },
   });
 
   log(LOG_PREFIX, `Claude ${identity.name} (pid ${driver.pid}, session ${driver.sessionId}) started`);
@@ -550,12 +552,12 @@ async function spawnCodexAgent(
 
       await brokerClient.updateSlot({
         id: identity.slotId,
-        context_snapshot: JSON.stringify({
+        context_patch: {
           codex_thread_id: bootstrap.threadId,
           last_summary: `Starting: ${taskPrompt.slice(0, 100)}`,
           last_status: "working",
           updated_at: Date.now(),
-        }),
+        },
       });
 
       const taskResult = await driver.reply(bootstrap.threadId, taskPrompt);
@@ -563,12 +565,12 @@ async function spawnCodexAgent(
 
       await brokerClient.updateSlot({
         id: identity.slotId,
-        context_snapshot: JSON.stringify({
+        context_patch: {
           codex_thread_id: taskResult.threadId,
           last_summary: taskResult.content.slice(0, 200),
           last_status: "working",
           updated_at: Date.now(),
-        }),
+        },
       });
     } catch (err) {
       log(LOG_PREFIX, `${identity.name} startup failed: ${err}`);

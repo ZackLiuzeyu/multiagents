@@ -120,6 +120,7 @@ export class CodexDriver {
   private _threadId: string | null = null;
   private _activeTurnId: string | null = null;
   private _alive = true;
+  private _exitCode: number | null = null;
   private _onExitCallbacks: Array<(code: number) => void> = [];
   private _notificationListeners: NotificationListener[] = [];
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -171,6 +172,7 @@ export class CodexDriver {
     this.startReader();
     this.proc.exited.then((code) => {
       this._alive = false;
+      this._exitCode = code;
       this._activeTurnId = null;
       this._activeItems = 0;
       log(LOG_PREFIX, `codex app-server exited with code ${code}`);
@@ -189,8 +191,15 @@ export class CodexDriver {
     });
   }
 
-  /** Register a callback for when the process exits. Multiple callbacks supported. */
-  onExit(cb: (code: number) => void): void { this._onExitCallbacks.push(cb); }
+  /** Fires with the exit code; a callback registered after the exit fires right away. */
+  onExit(cb: (code: number) => void): void {
+    if (this._exitCode !== null) {
+      const code = this._exitCode;
+      queueMicrotask(() => cb(code));
+      return;
+    }
+    this._onExitCallbacks.push(cb);
+  }
 
   /** Register a listener for notifications from the app-server. */
   onNotification(cb: NotificationListener): void { this._notificationListeners.push(cb); }

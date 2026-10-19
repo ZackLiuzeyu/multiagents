@@ -313,6 +313,15 @@ describe("ensureMcpConfigs — Codex ~/.codex/config.toml (global)", () => {
     expect(content).toContain("codex");
   });
 
+  test("auto-approves every team tool for the Codex agent (approval_policy=never would deny them otherwise)", async () => {
+    await ensureMcpConfigs(tmpDir, "test-session", "codex");
+
+    const content = fs.readFileSync(globalCodexPath, "utf-8");
+    const section = content.slice(content.indexOf('[mcp_servers."multiagents-peer"]'));
+    const body = section.split("\n[")[0];
+    expect(body).toContain('default_tools_approval_mode = "approve"');
+  });
+
   test("does not duplicate multiagents-peer if already present", async () => {
     await ensureMcpConfigs(tmpDir, "test-session");
     await ensureMcpConfigs(tmpDir, "test-session");
