@@ -19,49 +19,164 @@ import { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentLaunchConfig } from "../shared/types.ts";
 import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
-  DEFAULT_BROKER_PORT,
-  BROKER_HOSTNAME,
   GUARDRAIL_CHECK_INTERVAL,
   CONFLICT_CHECK_INTERVAL,
   FLAP_WINDOW_MS,
+  STUCK_THRESHOLD_MS,
 } from "../shared/constants.ts";
+import { brokerUrl } from "../shared/broker-url.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
-import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
+import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
+import { deliverPendingMessages, type DriverSlot } from "./delivery.ts";
+import { RespawnGuard } from "./respawn-guard.ts";
+import type { CodexDriver } from "./codex-driver.ts";
+import type { ClaudeDriver } from "./claude-driver.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
+import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox } from "./supervision.ts";
 
 const LOG_PREFIX = "orchestrator";
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_URL = brokerUrl();
 
 // Track active processes per session
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
 // Track pending events to push as notifications
 const pendingEvents: AgentEvent[] = [];
-// Track active CodexDriver instances: Map<sessionId, Map<slotId, state>>
-import type { CodexDriver, CodexTurnResult } from "./codex-driver.ts";
-interface CodexSlotState {
-  driver: CodexDriver;
-  threadId: string | null;
-  /** True when a reply() is in flight (prevents double-dispatch). */
-  busy: boolean;
-  /** Timestamp of last steer nudge (prevents spam). */
-  lastNudge: number;
+// Driver-managed agents (Claude over stream-json, Codex over app-server), one driver per slot
+const activeDrivers = new DriverRegistry();
+// One respawn per slot at a time, whichever path (crash, code-0 exit, watchdog, resume) triggers it
+const respawnGuard = new RespawnGuard();
+
+interface LaunchedAgent {
+  pid: number;
+  process: Subprocess;
+  codexDriver?: CodexDriver;
+  claudeDriver?: ClaudeDriver;
 }
-const activeCodexDrivers: Map<string, Map<number, CodexSlotState>> = new Map();
+
+async function slotIsReleased(slotId: number, brokerClient: BrokerClient): Promise<boolean> {
+  try {
+    return (await brokerClient.getTaskState(slotId)).task_state === "released";
+  } catch {
+    return false;
+  }
+}
+
+/** Graceful stop: Claude finishes its turn and exits on stdin EOF, Codex is killed. */
+async function closeDriver(state: DriverSlot): Promise<void> {
+  if (state.kind === "claude") await state.driver.close();
+  else await state.driver.kill();
+}
+
+/**
+ * Stop every agent of a session. The session is forgotten BEFORE anything is
+ * killed, so the exit handlers that fire while processes die find no session
+ * to respawn into.
+ */
+function stopSession(sessionId: string): { stopped: number } {
+  activeSessions.delete(sessionId);
+  const procs = activeProcesses.get(sessionId);
+  activeProcesses.delete(sessionId);
+  const drivers = activeDrivers.dropSession(sessionId);
+
+  let stopped = 0;
+  for (const [slotId, state] of drivers ?? []) {
+    log(LOG_PREFIX, `Stopping ${state.kind} driver in slot ${slotId}`);
+    state.driver.kill().catch(() => { /* already dead */ });
+    stopped++;
+  }
+  for (const [slotId, proc] of procs ?? []) {
+    if (drivers?.has(slotId)) continue; // a driver's process was killed above
+    log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
+    try { proc.kill(); } catch { /* already dead */ }
+    stopped++;
+  }
+  return { stopped };
+}
+
+/**
+ * Track a launched or respawned agent: process map, driver map, monitoring
+ * and exit handling. Every launch path goes through here so no agent is left
+ * unmonitored or double-tracked.
+ */
+function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, brokerClient: BrokerClient): void {
+  let procs = activeProcesses.get(sessionId);
+  if (!procs) {
+    procs = new Map();
+    activeProcesses.set(sessionId, procs);
+  }
+  procs.set(slotId, result.process);
+
+  const state: DriverSlot | null = result.claudeDriver
+    ? { kind: "claude", driver: result.claudeDriver, busy: false, lastNudge: 0 }
+    : result.codexDriver
+      ? { kind: "codex", driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 }
+      : null;
+  if (!state) {
+    monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
+    return;
+  }
+
+  const displaced = activeDrivers.track(sessionId, slotId, state);
+  if (displaced) {
+    log(LOG_PREFIX, `Slot ${slotId} already had a live ${displaced.kind} driver (pid ${displaced.driver.pid}) — stopping it in favour of the new one`);
+    displaced.driver.kill().catch(() => { /* already dead */ });
+  }
+  if (state.kind === "claude") {
+    monitorClaudeDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
+  } else {
+    monitorCodexDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
+  }
+  state.driver.onExit((code) => onDriverExit(sessionId, slotId, state, code, brokerClient));
+}
+
+/** A driver process ended: detach it, mark the slot disconnected, and respawn only if it was not released. */
+function onDriverExit(sessionId: string, slotId: number, state: DriverSlot, code: number, brokerClient: BrokerClient): void {
+  const replaced = !activeDrivers.detach(sessionId, slotId, state) && activeDrivers.has(sessionId, slotId);
+  const procs = activeProcesses.get(sessionId);
+  if (procs?.get(slotId) === state.driver.process) procs.delete(slotId);
+  if (replaced) {
+    log(LOG_PREFIX, `${state.kind} driver for slot ${slotId} exited (code ${code}) after being replaced — its slot is live`);
+    return;
+  }
+
+  void (async () => {
+    try {
+      await brokerClient.updateSlot({ id: slotId, status: "disconnected" });
+    } catch { /* broker may be down */ }
+
+    if (await slotIsReleased(slotId, brokerClient)) {
+      log(LOG_PREFIX, `${state.kind} driver for slot ${slotId} exited after release (code ${code})`);
+      pendingEvents.push({ type: "agent_released", severity: "info", slotId, sessionId, message: `Slot ${slotId} exited after being released` });
+      return;
+    }
+    handleEvent({
+      type: code === 0 ? "agent_completed" : "agent_crashed",
+      severity: code === 0 ? "info" : "critical",
+      slotId,
+      sessionId,
+      message: `${state.kind} driver for slot ${slotId} exited with code ${code}`,
+      data: { exit_code: code },
+    });
+  })();
+}
 
 // --- Dashboard auto-launch ---
 
 const CLI_PATH = new URL("../cli.ts", import.meta.url).pathname;
+// Tests and headless hosts run the orchestrator without terminal windows or a browser
+const DASHBOARDS_DISABLED = process.env.MULTIAGENTS_NO_DASHBOARD === "1";
 
 /**
  * Launch the TUI dashboard in a new terminal window.
  * Tries macOS Terminal.app first via `open`, falls back to detached process.
  */
 function launchDashboard(sessionId: string, projectDir: string): void {
+  if (DASHBOARDS_DISABLED) return;
   try {
     const platform = process.platform;
     if (platform === "darwin") {
@@ -96,6 +211,7 @@ const WEB_DASHBOARD_PATH = new URL("../dashboard/server.ts", import.meta.url).pa
  * Auto-opens the browser on localhost:7900.
  */
 function launchWebDashboard(sessionId: string, projectDir: string): void {
+  if (DASHBOARDS_DISABLED) return;
   try {
     const proc = Bun.spawn(["bun", WEB_DASHBOARD_PATH, sessionId], {
       cwd: projectDir,
@@ -139,64 +255,9 @@ async function ensureBroker(brokerClient: BrokerClient): Promise<void> {
 function handleEvent(event: AgentEvent): void {
   log(LOG_PREFIX, `[${event.severity}] ${event.message}`);
 
-  // Auto-respawn on crash (unless flapping)
+  // Auto-respawn on crash (unless flapping or the slot was intentionally released)
   if (event.type === "agent_crashed" && event.data && !event.data.is_flapping) {
-    const sessionMeta = activeSessions.get(event.sessionId);
-    if (sessionMeta) {
-      const brokerClient = new BrokerClient(BROKER_URL);
-      handleAgentCrash(event.slotId, event.data.exit_code as number, event.sessionId, brokerClient)
-        .then(async (crashEvent) => {
-          pendingEvents.push(crashEvent);
-          if (!crashEvent.data?.is_flapping) {
-            try {
-              const { respawnAgent } = await import("./recovery.ts");
-              const result = await respawnAgent(event.sessionId, event.slotId, brokerClient, sessionMeta.projectDir);
-
-              // CRITICAL: Track the new process and CodexDriver
-              const sessionProcs = activeProcesses.get(event.sessionId);
-              if (sessionProcs && result.process) {
-                sessionProcs.set(event.slotId, result.process);
-              }
-
-              // If respawned as CodexDriver, track in activeCodexDrivers (not monitorProcess)
-              if (result.codexDriver) {
-                let drivers = activeCodexDrivers.get(event.sessionId);
-                if (!drivers) {
-                  drivers = new Map();
-                  activeCodexDrivers.set(event.sessionId, drivers);
-                }
-                drivers.set(event.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
-                monitorCodexDriver(result.codexDriver, event.slotId, event.sessionId, brokerClient, handleEvent);
-                result.codexDriver.onExit(() => {
-                  handleEvent({
-                    type: "agent_crashed", severity: "critical",
-                    slotId: event.slotId, sessionId: event.sessionId,
-                    message: `Codex driver for slot ${event.slotId} exited after respawn`,
-                    data: { exit_code: -1 },
-                  });
-                });
-              } else {
-                // Non-Codex: traditional process monitoring
-                if (sessionProcs && result.process) {
-                  monitorProcess(result.process, event.slotId, event.sessionId, brokerClient, handleEvent);
-                }
-              }
-              log(LOG_PREFIX, `Auto-respawned slot ${event.slotId} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : ""})`);
-
-              pendingEvents.push({
-                type: "agent_restarted",
-                severity: "info",
-                slotId: event.slotId,
-                sessionId: event.sessionId,
-                message: `Slot ${event.slotId} auto-respawned after crash (PID ${result.pid})`,
-              });
-            } catch (err) {
-              log(LOG_PREFIX, `Failed to auto-respawn slot ${event.slotId}: ${err}`);
-            }
-          }
-        })
-        .catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
-    }
+    respawnAfterCrash(event).catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
   } else if (event.type === "agent_completed" && event.data) {
     // Codex agents exit with code 0 when they finish their turn, but they may
     // not have actually completed their task. Check task_state — if the agent
@@ -215,6 +276,46 @@ function handleEvent(event: AgentEvent): void {
       });
   } else {
     pendingEvents.push(event);
+  }
+}
+
+async function respawnAfterCrash(event: AgentEvent): Promise<void> {
+  const sessionMeta = activeSessions.get(event.sessionId);
+  if (!sessionMeta) return;
+  const brokerClient = new BrokerClient(BROKER_URL);
+
+  // A released slot exits on purpose (remove_agent, release_agent); respawning it
+  // would create an unassigned ghost agent that then receives the team's traffic.
+  if (await slotIsReleased(event.slotId, brokerClient)) {
+    log(LOG_PREFIX, `Slot ${event.slotId} exited after being released — not respawning`);
+    return;
+  }
+
+  const crashEvent = await handleAgentCrash(event.slotId, event.data!.exit_code as number, event.sessionId, brokerClient);
+  pendingEvents.push(crashEvent);
+  if (crashEvent.data?.is_flapping) return;
+
+  try {
+    const result = await respawnGuard.run(event.slotId, async () => {
+      const { respawnAgent } = await import("./recovery.ts");
+      const launched = await respawnAgent(event.sessionId, event.slotId, brokerClient, sessionMeta.projectDir);
+      trackLaunch(event.sessionId, event.slotId, launched, brokerClient);
+      return launched;
+    });
+    if (!result) {
+      log(LOG_PREFIX, `Slot ${event.slotId} is already being respawned — skipping crash respawn`);
+      return;
+    }
+    log(LOG_PREFIX, `Auto-respawned slot ${event.slotId} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : result.claudeDriver ? ", ClaudeDriver" : ""})`);
+    pendingEvents.push({
+      type: "agent_restarted",
+      severity: "info",
+      slotId: event.slotId,
+      sessionId: event.sessionId,
+      message: `Slot ${event.slotId} auto-respawned after crash (PID ${result.pid})`,
+    });
+  } catch (err) {
+    log(LOG_PREFIX, `Failed to auto-respawn slot ${event.slotId}: ${err}`);
   }
 }
 
@@ -263,30 +364,17 @@ async function autoRestartIfIncomplete(
         return false;
       }
 
-      const { respawnAgent } = await import("./recovery.ts");
-      const result = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
-
-      // CRITICAL: Track the new process and CodexDriver
-      const sessionProcesses = activeProcesses.get(sessionId);
-      if (sessionProcesses && result.process) {
-        sessionProcesses.set(slotId, result.process);
+      const result = await respawnGuard.run(slotId, async () => {
+        const { respawnAgent } = await import("./recovery.ts");
+        const launched = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
+        trackLaunch(sessionId, slotId, launched, brokerClient);
+        return launched;
+      });
+      if (!result) {
+        log(LOG_PREFIX, `${name} is already being respawned — skipping code-0 restart`);
+        return true;
       }
-      if (result.codexDriver) {
-        let drivers = activeCodexDrivers.get(sessionId);
-        if (!drivers) { drivers = new Map(); activeCodexDrivers.set(sessionId, drivers); }
-        drivers.set(slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
-        monitorCodexDriver(result.codexDriver, slotId, sessionId, brokerClient, handleEvent);
-        result.codexDriver.onExit(() => {
-          handleEvent({
-            type: "agent_crashed", severity: "critical", slotId, sessionId,
-            message: `Codex driver for slot ${slotId} exited after code-0 respawn`,
-            data: { exit_code: -1 },
-          });
-        });
-      } else if (sessionProcesses && result.process) {
-        monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
-      }
-      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : ""})`);
+      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : result.claudeDriver ? ", ClaudeDriver" : ""})`);
 
       pendingEvents.push({
         type: "agent_restarted",
@@ -674,33 +762,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           launchedTypes.add(agentCfg.agent_type);
 
           const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient);
-          sessionProcs.set(result.slotId, result.process);
-
-          // Track CodexDriver instances for message forwarding
-          if (result.codexDriver) {
-            let sessionDrivers = activeCodexDrivers.get(sessionId);
-            if (!sessionDrivers) {
-              sessionDrivers = new Map();
-              activeCodexDrivers.set(sessionId, sessionDrivers);
-            }
-            sessionDrivers.set(result.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
-            monitorCodexDriver(result.codexDriver, result.slotId, sessionId, brokerClient, handleEvent);
-
-            // Monitor driver process exit for auto-restart
-            result.codexDriver.onExit(() => {
-              handleEvent({
-                type: "agent_crashed",
-                severity: "critical",
-                slotId: result.slotId,
-                sessionId,
-                message: `Codex driver for slot ${result.slotId} exited unexpectedly`,
-                data: { exit_code: -1 },
-              });
-            });
-          } else {
-            // Start process monitoring for non-Codex agents (Claude, Gemini)
-            monitorProcess(result.process, result.slotId, sessionId, brokerClient, handleEvent);
-          }
+          trackLaunch(sessionId, result.slotId, result, brokerClient);
 
           // Announce to previously launched agents
           const slot = await brokerClient.getSlot(result.slotId);
@@ -895,26 +957,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await launchAgent(session_id, session.project_dir, config, brokerClient);
-
-        const sessionProcs = activeProcesses.get(session_id) ?? new Map();
-        sessionProcs.set(result.slotId, result.process);
-        activeProcesses.set(session_id, sessionProcs);
         if (!activeSessions.has(session_id)) {
           activeSessions.set(session_id, { projectDir: session.project_dir });
         }
-
-        // Track CodexDriver for message forwarding (same pattern as create_team)
-        if (result.codexDriver) {
-          let sessionDrivers = activeCodexDrivers.get(session_id);
-          if (!sessionDrivers) {
-            sessionDrivers = new Map();
-            activeCodexDrivers.set(session_id, sessionDrivers);
-          }
-          sessionDrivers.set(result.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
-          monitorCodexDriver(result.codexDriver, result.slotId, session_id, brokerClient, handleEvent);
-        } else {
-          monitorProcess(result.process, result.slotId, session_id, brokerClient, handleEvent);
-        }
+        trackLaunch(session_id, result.slotId, result, brokerClient);
 
         const slot = await brokerClient.getSlot(result.slotId);
         await announceNewMember(session_id, slot, config, brokerClient);
@@ -935,18 +981,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: `Could not find agent matching "${target}".` }] };
         }
 
-        // Kill the process if we have it
-        const sessionProcs = activeProcesses.get(session_id);
-        if (sessionProcs) {
-          const proc = sessionProcs.get(slot.id);
-          if (proc) {
-            proc.kill();
-            sessionProcs.delete(slot.id);
-          }
-        }
+        // Release BEFORE stopping, so the exit handlers see "released" and skip auto-respawn
+        await brokerClient.updateSlot({ id: slot.id, status: "disconnected", task_state: "released" });
 
-        // Update slot to disconnected
-        await brokerClient.updateSlot({ id: slot.id, status: "disconnected" });
+        const driverState = activeDrivers.delete(session_id, slot.id);
+        if (driverState) {
+          await closeDriver(driverState);
+        }
+        const sessionProcs = activeProcesses.get(session_id);
+        const proc = sessionProcs?.get(slot.id);
+        if (proc) {
+          try { proc.kill(); } catch { /* already dead */ }
+          sessionProcs!.delete(slot.id);
+        }
+        clearSlotTracking(slot.id);
+        completionRestartHistory.delete(slot.id);
 
         // Notify remaining team
         const slots = await brokerClient.listSlots(session_id);
@@ -1142,27 +1191,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "end_session": {
         const { session_id, create_pr } = args as { session_id: string; create_pr?: boolean };
 
-        // Kill all active processes
-        const sessionProcs = activeProcesses.get(session_id);
-        if (sessionProcs) {
-          for (const [slotId, proc] of sessionProcs) {
-            log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
-            try { proc.kill(); } catch { /* already dead */ }
-          }
-          sessionProcs.clear();
-          activeProcesses.delete(session_id);
-        }
-
-        // Kill CodexDriver processes
-        const sessionDrivers = activeCodexDrivers.get(session_id);
-        if (sessionDrivers) {
-          for (const [slotId, state] of sessionDrivers) {
-            log(LOG_PREFIX, `Stopping Codex driver in slot ${slotId}`);
-            try { state.driver.kill(); } catch { /* already dead */ }
-          }
-          sessionDrivers.clear();
-          activeCodexDrivers.delete(session_id);
-        }
+        stopSession(session_id);
 
         // Clean driver-mode sentinel file
         try {
@@ -1191,7 +1220,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           completionRestartHistory.delete(slot.id);
         }
         clearAllCrashHistory();
-        activeSessions.delete(session_id);
 
         let prMessage = "";
         if (create_pr) {
@@ -1210,23 +1238,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "delete_session": {
         const { session_id } = args as { session_id: string };
 
-        // Kill any running agent processes first
-        const sessionProcs = activeProcesses.get(session_id);
-        if (sessionProcs) {
-          for (const [slotId, proc] of sessionProcs) {
-            try { proc.kill(); } catch { /* already dead */ }
-          }
-          activeProcesses.delete(session_id);
-        }
-        // Kill CodexDriver processes
-        const delDrivers = activeCodexDrivers.get(session_id);
-        if (delDrivers) {
-          for (const [, state] of delDrivers) {
-            try { state.driver.kill(); } catch { /* already dead */ }
-          }
-          activeCodexDrivers.delete(session_id);
-        }
-        activeSessions.delete(session_id);
+        stopSession(session_id);
 
         // Clean up per-slot tracking state (memory leak prevention)
         clearAllTracking();
@@ -1314,9 +1326,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Get all slots
         const slots = await brokerClient.listSlots(session_id);
+        // A slot whose driver this orchestrator still runs is not respawned on top of it,
+        // even if the broker lost track of its peer.
         const disconnected = slots.filter((s: any) =>
           s.status === "disconnected" &&
           s.task_state !== "released" &&
+          !activeDrivers.isLive(session_id, s.id) &&
           !skipSet.has((s.display_name ?? "").toLowerCase()) &&
           !skipSet.has((s.role ?? "").toLowerCase())
         );
@@ -1412,15 +1427,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resumeLaunchedTypes.add(slot.agent_type);
 
             // Relaunch into existing slot
-            const result = await relaunchIntoSlot(session_id, session.project_dir, slot, handoffTask, brokerClient);
-
-            // Track process
-            const sessionProcs = activeProcesses.get(session_id) ?? new Map();
-            sessionProcs.set(result.slotId, result.process);
-            activeProcesses.set(session_id, sessionProcs);
-
-            // Monitor process
-            monitorProcess(result.process, result.slotId, session_id, brokerClient, handleEvent);
+            const result = await respawnGuard.run(slot.id, async () => {
+              const launched = await relaunchIntoSlot(session_id, session.project_dir, slot, handoffTask, brokerClient);
+              trackLaunch(session_id, launched.slotId, launched, brokerClient);
+              return launched;
+            });
+            if (!result) {
+              failed.push(`${slot.display_name || slot.role || slot.id}: respawn already in progress`);
+              continue;
+            }
 
             // Release held messages for this slot
             try {
@@ -1515,9 +1530,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           const deadFor = now - disconnectedAt;
           if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
 
-          // Skip driver-managed Codex slots — orchestrator controls their lifecycle
-          const sessionDrivers = activeCodexDrivers.get(sessionId);
-          if (sessionDrivers?.has(slot.id)) continue;
+          // Skip driver-managed slots — orchestrator controls their lifecycle
+          if (activeDrivers.has(sessionId, slot.id)) continue;
 
           // Auto-cleanup: delete the dead slot
           try {
@@ -1529,119 +1543,83 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     }
   }, 60_000);
 
-  // --- Codex message forwarding prompt ---
-  function buildForwardingPrompt(formatted: string): string {
-    return `[Teammate message] ${formatted}\nAcknowledge briefly, then continue your current task.`;
+  // --- Driver delivery loop ---
+  // Every 3s: hand unacked messages to each driver (Claude: stdin user message,
+  // Codex: steer into the active turn or start a new one), interrupt Codex turns
+  // stuck in inference, and close drivers whose slot was released.
+  const INTERRUPT_IDLE_MS = 60_000;
+
+  async function interruptIfStuck(slotId: number, state: Extract<DriverSlot, { kind: "codex" }>): Promise<void> {
+    const threadId = state.threadId ?? state.driver.threadId;
+    const now = Date.now();
+    // A running item (shell command, tool call) is legitimate work, never "stuck".
+    if (
+      !threadId ||
+      !state.driver.activeTurnId ||
+      state.driver.activeItems > 0 ||
+      now - state.driver.lastNotificationActivity <= INTERRUPT_IDLE_MS ||
+      now - state.lastNudge <= INTERRUPT_IDLE_MS
+    ) return;
+
+    state.lastNudge = now;
+    log(LOG_PREFIX, `Codex slot ${slotId} silent for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s mid-turn — interrupting and requesting signal_done`);
+    await state.driver.interrupt(threadId);
+    await new Promise((r) => setTimeout(r, 2000));
+    if (state.driver.activeTurnId || state.busy) return;
+
+    state.busy = true;
+    state.driver.reply(threadId, "Your previous task is complete. Call signal_done NOW with a summary of what you accomplished. This is the ONLY thing you need to do.")
+      .then((result) => {
+        state.threadId = result.threadId;
+        log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn completed`);
+      })
+      .catch((err) => log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn failed: ${err}`))
+      .finally(() => { state.busy = false; });
   }
 
-  // --- Codex message forwarding loop ---
-  // For CodexDriver-managed agents, poll the broker for undelivered messages
-  // and deliver them. Two delivery paths:
-  //   1. turn/steer — if Codex has an active turn, inject mid-turn (instant)
-  //   2. reply() — if no active turn, start a new turn (fire-and-forget)
-  //
-  // The loop is NON-BLOCKING: busy slots are skipped (messages stay in
-  // broker queue with delivered=0), serviced on the next free cycle.
-  setInterval(async () => {
-    for (const [sessionId, drivers] of activeCodexDrivers) {
+  // A released driver is closed once idle (releaseVerdict). Codex heartbeat
+  // replies keep lastActivity fresh, so only its notifications count as output.
+  async function closeIfReleased(sessionId: string, slotId: number, state: DriverSlot): Promise<void> {
+    if (!(await slotIsReleased(slotId, brokerClient))) return;
+    const now = Date.now();
+    state.releasedAt ??= now;
+    const peek = await brokerClient.peekUndelivered(slotId).catch(() => ({ count: 0 }));
+    const verdict = releaseVerdict({
+      busy: state.busy,
+      turnActive: state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null,
+      lastOutputAt: state.kind === "claude" ? state.driver.lastActivity : state.driver.lastNotificationActivity,
+      releasedAt: state.releasedAt,
+      pendingCount: peek.count,
+      now,
+    });
+    if (verdict === "keep") return;
+    activeDrivers.delete(sessionId, slotId);
+    log(LOG_PREFIX, `Slot ${slotId} released ${Math.round((now - state.releasedAt) / 1000)}s ago and idle — closing ${state.kind} driver`);
+    // Not awaited: a Claude close waits for the turn to end and must not stall other slots.
+    closeDriver(state).catch((err) => log(LOG_PREFIX, `Closing driver for slot ${slotId} failed: ${err}`));
+  }
+
+  // One tick at a time: a slow driver call must not let the next tick hand out the same messages again.
+  setInterval(nonOverlapping(async () => {
+    for (const [sessionId, drivers] of activeDrivers.sessions()) {
       for (const [slotId, state] of drivers) {
         if (!state.driver.alive) continue;
-        const threadId = state.threadId ?? state.driver.threadId;
-        if (!threadId) continue; // First turn hasn't completed yet
 
-        // --- Interrupt + signal_done turn: if Codex turn is active but idle for >60s ---
-        // The Codex LLM can get stuck in a single long inference call after completing work.
-        // turn/steer only works between loop iterations — it can't interrupt mid-generation.
-        // Instead: interrupt the stuck turn, then start a new focused turn for signal_done.
-        const INTERRUPT_IDLE_MS = 60_000;
-        const now = Date.now();
-        if (
-          state.driver.activeTurnId &&
-          now - state.driver.lastNotificationActivity > INTERRUPT_IDLE_MS &&
-          now - state.lastNudge > INTERRUPT_IDLE_MS
-        ) {
-          state.lastNudge = now;
-          log(LOG_PREFIX, `Codex slot ${slotId} stuck for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s — interrupting turn and requesting signal_done`);
-          try {
-            await state.driver.interrupt(threadId);
-          } catch {
-            // Interrupt can fail if turn already completed
-          }
-          // Wait a moment for the turn to fully complete after interrupt
-          await new Promise(r => setTimeout(r, 2000));
-          // Start a new focused turn asking only for signal_done
-          if (!state.driver.activeTurnId && !state.busy) {
-            state.busy = true;
-            state.driver.reply(threadId, "Your previous task is complete. Call signal_done NOW with a summary of what you accomplished. This is the ONLY thing you need to do.")
-              .then(async (result) => {
-                state.threadId = result.threadId;
-                state.busy = false;
-                log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn completed`);
-              })
-              .catch((err) => {
-                state.busy = false;
-                log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn failed: ${err}`);
-              });
-          }
+        if (state.kind === "codex") {
+          try { await interruptIfStuck(slotId, state); } catch (err) { log(LOG_PREFIX, `Interrupt check failed for slot ${slotId}: ${err}`); }
         }
-
-        // If a reply() is in flight, skip — don't even poll. Messages
-        // accumulate in the broker and batch-deliver on the next free cycle.
-        if (state.busy) continue;
 
         try {
-          const pollResult = await brokerClient.pollBySlot(slotId);
-          if (!pollResult.messages || pollResult.messages.length === 0) continue;
-
-          const formatted = pollResult.messages.map((m: any) => {
-            const from = m.from_slot_id !== null
-              ? `slot ${m.from_slot_id}`
-              : m.from_id;
-            return `[${m.msg_type}] From ${from}: ${m.text}`;
-          }).join("\n\n---\n\n");
-
-          log(LOG_PREFIX, `Forwarding ${pollResult.messages.length} message(s) to Codex slot ${slotId}`);
-
-          // Path 1: Mid-turn injection via turn/steer (instant, non-blocking)
-          if (state.driver.activeTurnId) {
-            try {
-              await state.driver.steer(threadId, buildForwardingPrompt(formatted));
-              log(LOG_PREFIX, `Steered messages into active turn for slot ${slotId}`);
-            } catch (err) {
-              // Steer can fail if the turn completed between our check and the call.
-              // Fall through to Path 2 on next cycle.
-              log(LOG_PREFIX, `Steer failed for slot ${slotId} (will retry as new turn): ${err}`);
-            }
-            continue;
-          }
-
-          // Path 2: Start a new turn (fire-and-forget, non-blocking)
-          state.busy = true;
-          state.driver.reply(threadId, buildForwardingPrompt(formatted))
-            .then(async (result) => {
-              state.threadId = result.threadId;
-              state.busy = false;
-              await brokerClient.updateSlot({
-                id: slotId,
-                context_snapshot: JSON.stringify({
-                  codex_thread_id: result.threadId,
-                  last_summary: result.content.slice(0, 200),
-                  last_status: "working",
-                  updated_at: Date.now(),
-                }),
-              }).catch(() => {});
-              log(LOG_PREFIX, `Codex slot ${slotId} finished processing forwarded messages`);
-            })
-            .catch((err) => {
-              state.busy = false;
-              log(LOG_PREFIX, `Codex message forwarding error for slot ${slotId}: ${err}`);
-            });
+          const outcome = await deliverPendingMessages(sessionId, slotId, state, brokerClient);
+          if (outcome === "failed") log(LOG_PREFIX, `Delivery to slot ${slotId} failed — messages stay queued for retry`);
         } catch (err) {
-          log(LOG_PREFIX, `Codex poll error for slot ${slotId}: ${err}`);
+          log(LOG_PREFIX, `Delivery error for slot ${slotId}: ${err}`);
         }
+
+        try { await closeIfReleased(sessionId, slotId, state); } catch (err) { log(LOG_PREFIX, `Release check failed for slot ${slotId}: ${err}`); }
       }
     }
-  }, 3_000); // Check every 3 seconds
+  }), 3_000);
 
   // Stuck agent nudge loop — every 45s, nudge agents silent for >1 min
   setInterval(async () => {
@@ -1838,23 +1816,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             // Grace period elapsed — auto-end the session
             log(LOG_PREFIX, `Session ${sessionId}: auto-ending (all agents approved for 30s)`);
 
-            // Kill all processes
-            const sessionProcs = activeProcesses.get(sessionId);
-            if (sessionProcs) {
-              for (const [slotId, proc] of sessionProcs) {
-                try { proc.kill(); } catch { /* already dead */ }
-              }
-              sessionProcs.clear();
-              activeProcesses.delete(sessionId);
-            }
-            const sessionDrivers = activeCodexDrivers.get(sessionId);
-            if (sessionDrivers) {
-              for (const [, state] of sessionDrivers) {
-                try { state.driver.kill(); } catch { /* already dead */ }
-              }
-              sessionDrivers.clear();
-              activeCodexDrivers.delete(sessionId);
-            }
+            stopSession(sessionId);
 
             // Mark all connected slots as disconnected
             for (const slot of slots) {
@@ -1871,7 +1833,6 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
               clearSlotTracking(slot.id);
               completionRestartHistory.delete(slot.id);
             }
-            activeSessions.delete(sessionId);
             sessionCompletionTimers.delete(sessionId);
 
             pendingEvents.push({
@@ -1892,23 +1853,18 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Smart non-driver agent respawn ---
   //
-  // Problem: Gemini (and disconnected Claude) agents have no push/steer mechanism.
-  // After signal_done or when idle, the LLM stops calling MCP tools and messages
-  // pile up undelivered. Teammates are blocked waiting.
+  // Problem: process-launched agents (Gemini) only see teammate messages in
+  // their next MCP tool result. After signal_done or when idle, the LLM stops
+  // calling tools and messages pile up unacked. Teammates are blocked waiting.
   //
   // Solution: measure actual message staleness, not agent idle time.
-  //   - peek-undelivered returns `oldest_at` — the timestamp of the oldest unread message
-  //   - If actionable messages (review_request, feedback, task_complete) have been
-  //     sitting undelivered for >15s, the agent isn't polling → kill + respawn
-  //   - Disconnected agents with any actionable messages → respawn immediately
-  //   - Claude with channel push (connected) → skip, push handles delivery
-  //   - Codex with driver → skip, forwarding loop handles delivery
+  //   - A connected agent is judged by messages its adapter never claimed: a
+  //     claimed one is merely waiting for the agent's next tool call
+  //   - Disconnected agents with any actionable unacked messages → respawn immediately
+  //   - Driver-managed agents (Claude, Codex) → skip, the delivery loop handles them
+  //   - Paused agents are left alone
   //
-  // This means: teammate sends review_request → 15s for Gemini to self-poll →
-  // if not picked up, orchestrator kills idle process and spawns a fresh one
-  // that gets recap + pending messages on startup.
-  //
-  const MESSAGE_STALE_MS = 15_000; // 15s — enough for ~50 poll cycles at 300ms
+  const CONNECTED_STALE_MS = STUCK_THRESHOLD_MS;
   const lastRespawnAttempt: Map<number, number> = new Map();
 
   setInterval(async () => {
@@ -1919,30 +1875,29 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           const taskState = (slot as any).task_state;
           if (taskState === "released") continue;
 
-          // Skip Codex — driver-managed via forwarding loop
-          const drivers = activeCodexDrivers.get(sessionId);
-          if (drivers?.has(slot.id)) continue;
+          // Skip driver-managed slots — the delivery loop handles them
+          if (activeDrivers.has(sessionId, slot.id)) continue;
 
-          // Skip connected Claude — channel push handles delivery
-          if (slot.agent_type === "claude" && slot.status === "connected") continue;
+          // Only act on processes this orchestrator launched; a connected slot it
+          // does not own may be a human's interactive session.
+          const owned = activeProcesses.get(sessionId)?.has(slot.id) === true;
+          if (slot.status === "connected" && !owned) continue;
 
-          // Peek at undelivered messages
-          const peek = await brokerClient.peekUndelivered(slot.id);
-          if (!peek || peek.count === 0) continue;
+          const inbox = watchdogInbox(slot, await brokerClient.peekUndelivered(slot.id));
+          if (!inbox || inbox.count === 0) continue;
 
           // Only act on actionable message types
-          const hasActionable = peek.msg_types.some(
+          const hasActionable = inbox.msg_types.some(
             (t) => t === "review_request" || t === "task_complete" || t === "feedback" || t === "system"
           );
           if (!hasActionable) continue;
 
           const now = Date.now();
 
-          // For connected agents: check if messages are stale (agent not polling)
-          // For disconnected agents: always eligible for respawn
+          // A connected agent is stuck only when messages stay unclaimed past the threshold
           if (slot.status === "connected") {
-            const messageAge = peek.oldest_at ? now - peek.oldest_at : 0;
-            if (messageAge < MESSAGE_STALE_MS) continue; // Give agent time to self-poll
+            const messageAge = inbox.oldest_at ? now - inbox.oldest_at : 0;
+            if (messageAge < CONNECTED_STALE_MS) continue;
           }
 
           // Throttle respawns (at most once per 45s per slot)
@@ -1956,8 +1911,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
           // If connected but not polling — kill the stale process first
           if (slot.status === "connected") {
-            const messageAgeSec = peek.oldest_at ? Math.round((now - peek.oldest_at) / 1000) : 0;
-            log(LOG_PREFIX, `${agentName} (${slot.agent_type}) has ${peek.count} undelivered message(s) for ${messageAgeSec}s — not polling, killing process`);
+            const messageAgeSec = inbox.oldest_at ? Math.round((now - inbox.oldest_at) / 1000) : 0;
+            log(LOG_PREFIX, `${agentName} (${slot.agent_type}) has ${inbox.count} unclaimed message(s) for ${messageAgeSec}s — not polling, killing process`);
             const sessionProcs = activeProcesses.get(sessionId);
             const proc = sessionProcs?.get(slot.id);
             if (proc) {
@@ -1968,31 +1923,23 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             await new Promise((r) => setTimeout(r, 1000));
           }
 
-          log(LOG_PREFIX, `Respawning ${agentName} (${slot.agent_type}) — ${peek.count} unread messages`);
+          log(LOG_PREFIX, `Respawning ${agentName} (${slot.agent_type}) — ${inbox.count} unread messages`);
 
           try {
-            const { respawnAgent } = await import("./recovery.ts");
-            const result = await respawnAgent(sessionId, slot.id, brokerClient, sessionMeta.projectDir);
-
-            const sessionProcs = activeProcesses.get(sessionId);
-            if (sessionProcs && result.process) {
-              sessionProcs.set(slot.id, result.process);
-            }
-            if (result.codexDriver) {
-              let drvs = activeCodexDrivers.get(sessionId);
-              if (!drvs) { drvs = new Map(); activeCodexDrivers.set(sessionId, drvs); }
-              drvs.set(slot.id, { driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
-              monitorCodexDriver(result.codexDriver, slot.id, sessionId, brokerClient, handleEvent);
-            } else if (sessionProcs && result.process) {
-              monitorProcess(result.process, slot.id, sessionId, brokerClient, handleEvent);
-            }
+            const result = await respawnGuard.run(slot.id, async () => {
+              const { respawnAgent } = await import("./recovery.ts");
+              const launched = await respawnAgent(sessionId, slot.id, brokerClient, sessionMeta.projectDir);
+              trackLaunch(sessionId, slot.id, launched, brokerClient);
+              return launched;
+            });
+            if (!result) continue; // another path is already respawning this slot
 
             pendingEvents.push({
               type: "agent_restarted",
               severity: "info",
               slotId: slot.id,
               sessionId,
-              message: `${agentName} auto-respawned: ${peek.count} unread messages waiting ${peek.oldest_at ? Math.round((now - peek.oldest_at) / 1000) : "?"}s`,
+              message: `${agentName} auto-respawned: ${inbox.count} unread messages waiting ${inbox.oldest_at ? Math.round((now - inbox.oldest_at) / 1000) : "?"}s`,
             });
           } catch (err) {
             log(LOG_PREFIX, `Failed to respawn ${agentName}: ${err}`);
@@ -2029,16 +1976,9 @@ main().catch((err) => {
 // --- Graceful shutdown: kill all managed agent processes ---
 function shutdownOrchestrator() {
   log(LOG_PREFIX, "Shutting down — killing all managed agent processes");
-  for (const [sessionId, procs] of activeProcesses) {
-    for (const [slotId, proc] of procs) {
-      try { proc.kill(); } catch { /* already dead */ }
-    }
-  }
-  // Kill CodexDriver processes
-  for (const [sessionId, drivers] of activeCodexDrivers) {
-    for (const [slotId, state] of drivers) {
-      try { state.driver.kill(); } catch { /* already dead */ }
-    }
+  const sessions = new Set([...activeSessions.keys(), ...activeProcesses.keys(), ...activeDrivers.sessionIds()]);
+  for (const sessionId of sessions) {
+    stopSession(sessionId);
   }
   process.exit(0);
 }

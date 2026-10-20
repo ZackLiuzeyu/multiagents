@@ -90,6 +90,8 @@ export interface Message {
   sent_at: string; // ISO timestamp
   delivered: boolean;
   delivered_at: string | null;
+  /** Set once the message reached the model (piggybacked into a tool result or injected into a turn). */
+  acked_at: string | null;
   held: boolean;
 }
 
@@ -237,11 +239,25 @@ export interface SendMessageResult {
 
 export interface PollMessagesRequest {
   id: PeerId;
+  /** Only messages no delivery mechanism has handed off yet (driver-managed agents use this). */
+  unclaimed_only?: boolean;
+  /** Keep the returned messages pollable until the client acks them; by default a poll consumes them. */
+  retain?: boolean;
 }
 
 export interface PollMessagesResponse {
   messages: Message[];
   paused?: boolean;
+}
+
+/** Non-consuming view of a slot's inbox: unacked messages, and the subset no delivery mechanism has picked up. */
+export interface PeekResult {
+  count: number;
+  msg_types: string[];
+  oldest_at: number;
+  unclaimed_count: number;
+  unclaimed_msg_types: string[];
+  unclaimed_oldest_at: number;
 }
 
 export interface SetRoleRequest {
@@ -323,6 +339,8 @@ export interface UpdateSlotRequest {
   status?: SlotStatus;
   task_state?: TaskState;
   context_snapshot?: string;
+  /** Keys merged into the existing snapshot; other writers' keys (driver session ids) survive. */
+  context_patch?: Record<string, unknown>;
   display_name?: string;
   role?: string;
   role_description?: string;

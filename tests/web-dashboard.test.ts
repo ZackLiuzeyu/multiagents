@@ -135,6 +135,19 @@ describe("Web Dashboard — API endpoints", () => {
     expect(data.session_id).toBe("dash-test-session");
   });
 
+  test("/api/guardrail records the new limit on the broker", async () => {
+    const res = await fetch(`${DASHBOARD_URL}/api/guardrail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "dash-test-session", guardrail_id: "max_restarts", value: 7, reason: "test" }),
+    });
+    expect(res.status).toBe(200);
+    const guardrails = await brokerPost("/guardrails", { session_id: "dash-test-session" });
+    const maxRestarts = guardrails.find((g: any) => g.id === "max_restarts");
+    expect(maxRestarts.current_value).toBe(7);
+    expect(maxRestarts.is_overridden).toBe(true);
+  });
+
   test("/api/session rejects missing session_id", async () => {
     const res = await fetch(`${DASHBOARD_URL}/api/session`, {
       method: "POST",

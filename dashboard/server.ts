@@ -11,19 +11,16 @@
 // ============================================================================
 
 import { BrokerClient } from "../shared/broker-client.ts";
-import {
-  DEFAULT_BROKER_PORT,
-  BROKER_HOSTNAME,
-  DASHBOARD_REFRESH,
-} from "../shared/constants.ts";
+import { DASHBOARD_REFRESH } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
 
 // --- Configuration ---
 
 const WEB_DASHBOARD_PORT = parseInt(process.env.MULTIAGENTS_WEB_PORT ?? "7900", 10);
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 const broker = new BrokerClient(BROKER_URL);
 
 // --- Session resolution (same logic as TUI) ---
@@ -46,7 +43,7 @@ async function resolveSessionId(explicit?: string): Promise<string | null> {
     const active = sessions
       .filter((s: Session) => s.status === "active" || s.status === "paused")
       .sort((a: Session, b: Session) => (b.last_active_at ?? 0) - (a.last_active_at ?? 0));
-    if (active.length > 0) return active[0].id;
+    return active[0]?.id ?? null;
   } catch { /* broker down */ }
 
   return null;
@@ -263,7 +260,7 @@ const server = Bun.serve({
         const result = await broker.updateGuardrail({
           session_id: body.session_id,
           guardrail_id: body.guardrail_id,
-          value: body.value,
+          new_value: body.value,
           reason: body.reason ?? "Adjusted via web dashboard",
           changed_by: "web-dashboard",
         });

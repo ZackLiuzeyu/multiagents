@@ -38,12 +38,11 @@ import type {
 import {
   POLL_INTERVALS,
   HEARTBEAT_INTERVAL,
-  BROKER_HOSTNAME,
-  DEFAULT_BROKER_PORT,
   BROKER_STARTUP_POLL_MS,
   BROKER_STARTUP_MAX_ATTEMPTS,
   SESSION_FILE,
 } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import {
   log as sharedLog,
   getGitRoot,
@@ -120,7 +119,8 @@ const TOOLS = [
   },
   {
     name: "check_messages",
-    description: "Manually poll for new messages from other agents.",
+    description:
+      "Return teammate messages you have not seen yet. New messages are also prepended to every tool result under [PENDING MESSAGES].",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -384,7 +384,14 @@ const TOOLS = [
 // Role-specific best practices injection (from role-practices.ts module)
 // ---------------------------------------------------------------------------
 
-import { getRolePractices, getStructuredRolePractices } from "./role-practices.ts";
+import { getStructuredRolePractices } from "./role-practices.ts";
+import { SHORT_PROTOCOL } from "./protocol-text.ts";
+
+type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
+type EnrichCache = { peers: Peer[]; slots: Slot[] };
+
+/** How many acked message ids to remember so a stale poll cannot re-deliver them. */
+const ACKED_MEMORY = 500;
 
 // ---------------------------------------------------------------------------
 // BaseAdapter
@@ -413,13 +420,27 @@ export abstract class BaseAdapter {
   private readonly brokerUrl: string;
   private readonly brokerScript: string;
 
+  // --- Inbound delivery ---
+  /** Messages handed to this adapter but not yet surfaced to the model. */
+  private pending = new Map<number, BufferedMessage>();
+  /** Ids the model has seen — a poll issued before the ack landed must not re-deliver them. */
+  private acked = new Set<number>();
+  /** Seen ids whose broker ack has not succeeded yet; retried before every poll. */
+  private pendingAck = new Set<number>();
+  /** The poll in flight; the loop and check_messages share it so one message is never staged twice. */
+  private inflightPoll: Promise<BufferedMessage[]> | null = null;
+  /** check_messages calls currently waiting on a poll; the loop leaves their messages to them. */
+  private checkMessagesWaiting = 0;
+  /** Set when an orchestrator driver owns delivery for this agent (no polling, no piggyback). */
+  protected driverMode = false;
+  /** Subclasses whose host rarely reads instructions inject team context into the first tool result. */
+  protected autoStartupOnFirstCall = false;
+  private hasRunStartup = false;
+
   constructor(agentType: AgentType) {
     this.agentType = agentType;
-    this.brokerPort = parseInt(
-      process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT),
-      10,
-    );
-    this.brokerUrl = `http://${BROKER_HOSTNAME}:${this.brokerPort}`;
+    this.brokerPort = resolveBrokerPort();
+    this.brokerUrl = brokerUrl();
     this.brokerScript = new URL("../broker.ts", import.meta.url).pathname;
     this.broker = new BrokerClient(this.brokerUrl);
     this.pollInterval = POLL_INTERVALS[agentType] ?? POLL_INTERVALS.custom;
@@ -430,9 +451,15 @@ export abstract class BaseAdapter {
 
   // --- Abstract methods (subclasses MUST implement) ---
 
+  /** Best-effort out-of-band notification (channel push, inbox file). Delivery is confirmed only by ack. */
   abstract deliverMessage(msg: BufferedMessage): Promise<void>;
   abstract getSystemPrompt(): string;
   abstract getCapabilities(): Record<string, unknown>;
+
+  /** MCP `instructions`. Claude Code truncates at 4096 chars and Codex reads 512, so this stays short. */
+  getInstructions(): string {
+    return `${this.getSystemPrompt()}\n${SHORT_PROTOCOL}`;
+  }
 
   // --- Main entry point ---
 
@@ -468,6 +495,7 @@ export abstract class BaseAdapter {
       } catch { return false; }
     })();
     const driverMode = driverModeEnv || driverModeFile;
+    this.driverMode = driverMode;
 
     // 1. Resolve session/slot info eagerly (before any async work)
     const envSession = process.env.MULTIAGENTS_SESSION;
@@ -487,7 +515,7 @@ export abstract class BaseAdapter {
       { name: "multiagents-peer", version: "0.2.0" },
       {
         capabilities: mergedCapabilities,
-        instructions: this.getSystemPrompt() + this.getLifecyclePromptSection(),
+        instructions: this.getInstructions(),
       },
     );
 
@@ -866,7 +894,12 @@ export abstract class BaseAdapter {
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { name, arguments: args } = req.params;
+      const result = await this.dispatchTool(name, args as Record<string, unknown>);
+      return this.decorateResult(result);
+    });
+  }
 
+  private async dispatchTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
       switch (name) {
         case "list_peers":
           return this.handleListPeers(args as any);
@@ -909,7 +942,132 @@ export abstract class BaseAdapter {
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
-    });
+  }
+
+  // --- Inbound delivery pipeline ---
+
+  /** Prepend first-call team context and any pending teammate messages, acking what was surfaced. */
+  private async decorateResult(result: ToolResult): Promise<ToolResult> {
+    const startup = this.autoStartupOnFirstCall ? await this.runAutoStartup() : "";
+    const pendingBlock = this.driverMode ? "" : await this.flushPendingBlock();
+    if (!startup && !pendingBlock) return result;
+    const text = result.content.map((c) => c.text).join("\n");
+    return { ...result, content: [{ type: "text", text: startup + pendingBlock + text }] };
+  }
+
+  private async flushPendingBlock(): Promise<string> {
+    if (this.pending.size === 0) return "";
+    const msgs = this.takePending();
+    await this.ack(msgs.map((m) => m.id));
+    const lines = msgs.map((m) => this.formatMessage(m)).join("\n");
+    return `[PENDING MESSAGES]\n${lines}\n[END PENDING MESSAGES]\n\n`;
+  }
+
+  private takePending(): BufferedMessage[] {
+    const msgs = [...this.pending.values()];
+    this.pending.clear();
+    return msgs;
+  }
+
+  private markSeen(ids: number[]): void {
+    for (const id of ids) this.acked.add(id);
+    if (this.acked.size > ACKED_MEMORY) {
+      for (const id of [...this.acked].slice(0, this.acked.size - ACKED_MEMORY)) this.acked.delete(id);
+    }
+  }
+
+  /** The model saw these messages: never show them again, and tell the broker (retried until it succeeds). */
+  private async ack(ids: number[]): Promise<void> {
+    this.markSeen(ids);
+    for (const id of ids) this.pendingAck.add(id);
+    await this.flushAcks();
+  }
+
+  private async flushAcks(): Promise<void> {
+    if (this.pendingAck.size === 0) return;
+    const ids = [...this.pendingAck];
+    try {
+      await this.broker.ackMessages(ids);
+      for (const id of ids) this.pendingAck.delete(id);
+    } catch (e) {
+      this.log(`Ack failed for ${ids.length} message(s), will retry: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** Poll once and stage what is new as pending; callers that overlap share the one poll. */
+  private stagePending(): Promise<BufferedMessage[]> {
+    if (!this.inflightPoll) {
+      this.inflightPoll = this.pollAndStage().finally(() => { this.inflightPoll = null; });
+    }
+    return this.inflightPoll;
+  }
+
+  private async pollAndStage(): Promise<BufferedMessage[]> {
+    await this.flushAcks();
+    // Under a driver the orchestrator injects messages itself; only unclaimed ones
+    // may surface here, consumed at poll time so the driver cannot claim them too.
+    const result = this.driverMode
+      ? await this.broker.pollMessages(this.myId!, { unclaimedOnly: true })
+      : await this.broker.pollMessages(this.myId!, { retain: true });
+    const fresh = result.messages.filter((m) => !this.pending.has(m.id) && !this.acked.has(m.id));
+    if (fresh.length === 0) return [];
+    const cache = await this.lookupCache();
+    const staged: BufferedMessage[] = [];
+    for (const msg of fresh) {
+      const enriched = await this.enrichMessage(msg, cache);
+      if (this.pending.has(msg.id) || this.acked.has(msg.id)) continue;
+      this.pending.set(msg.id, enriched);
+      staged.push(enriched);
+    }
+    return staged;
+  }
+
+  /** Team context injected into the first tool result (hosts that do not read MCP instructions). */
+  private async runAutoStartup(): Promise<string> {
+    if (this.hasRunStartup || this.driverMode) return "";
+    this.hasRunStartup = true;
+
+    const parts: string[] = [
+      "╔══════════════════════════════════════════════════════════╗",
+      "║  AUTO-STARTUP: Team context injected on first tool call ║",
+      "╚══════════════════════════════════════════════════════════╝",
+      "",
+    ];
+
+    try {
+      const role = this.mySlot?.role ?? "team member";
+      const name = this.mySlot?.display_name ?? "agent";
+      await this.broker.setSummary(this.myId!, `${name} (${role}) — starting up, reading team context`);
+      parts.push(`✓ set_summary: Registered as ${name} (${role})`);
+    } catch (e) {
+      parts.push(`✗ set_summary failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    try {
+      const teamResult = await this.handleCheckTeamStatus();
+      parts.push("", "── TEAM STATUS ──", teamResult.content[0]?.text ?? "");
+    } catch { parts.push("✗ check_team_status failed"); }
+
+    try {
+      const planResult = await this.handleGetPlan();
+      parts.push("", "── YOUR PLAN ──", planResult.content[0]?.text ?? "");
+    } catch { parts.push("✗ get_plan failed"); }
+
+    parts.push(
+      "",
+      "── ACTION REQUIRED ──",
+      "Use multiagents-peer MCP tools to communicate:",
+      "  → set_summary after every major action",
+      "  → check_messages after every shell command",
+      "  → send_message to reply to teammates",
+      "  → signal_done when finished (with proof)",
+      "  → update_plan to mark items in_progress/done",
+      "DO NOT go 1+ minute without calling check_messages.",
+      "════════════════════════════════════════════════════════════",
+      "",
+    );
+
+    return parts.join("\n");
   }
 
   // --- Tool handlers (protected — subclasses can override) ---
@@ -968,7 +1126,6 @@ export abstract class BaseAdapter {
         to_id: args.to_id,
         text: args.message,
         session_id: this.sessionId ?? undefined,
-        from_slot_id: this.mySlot?.id ?? undefined,
       });
       if (!result.ok) {
         return this.errorResult(`Failed to send: ${result.error}`);
@@ -1016,23 +1173,27 @@ export abstract class BaseAdapter {
     if (!this.myId) {
       return this.errorResult("Not registered with broker yet");
     }
+    this.checkMessagesWaiting++;
     try {
-      const result = await this.broker.pollMessages(this.myId);
-      if (result.messages.length === 0) {
+      await this.stagePending();
+      if (this.pending.size === 0) {
         return this.textResult("No new messages.");
       }
-      const formatted: string[] = [];
-      for (const msg of result.messages) {
-        const enriched = await this.enrichMessage(msg);
-        formatted.push(this.formatMessage(enriched));
-      }
+      const msgs = this.takePending();
+      const ids = msgs.map((m) => m.id);
+      // Under a driver the poll already consumed them; otherwise they are acked now that this result carries them.
+      if (this.driverMode) this.markSeen(ids);
+      else await this.ack(ids);
+      const formatted = msgs.map((m) => this.formatMessage(m));
       return this.textResult(
-        `${result.messages.length} new message(s):\n\n${formatted.join("\n\n---\n\n")}`,
+        `${msgs.length} new message(s):\n\n${formatted.join("\n\n---\n\n")}`,
       );
     } catch (e) {
       return this.errorResult(
         `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
       );
+    } finally {
+      this.checkMessagesWaiting--;
     }
   }
 
@@ -1322,10 +1483,11 @@ export abstract class BaseAdapter {
       const task = s.task_state || "idle";
       const paused = (s.paused === true || (s.paused as unknown as number) === 1) ? " [PAUSED]" : "";
       const isMe = s.peer_id === this.myId ? " (you)" : "";
-      return `  ${name} | ${s.agent_type} | ${role} | ${conn}${paused} | task: ${task}${isMe}`;
+      const id = s.peer_id ? ` | id: ${s.peer_id}` : "";
+      return `  ${name} | ${s.agent_type} | ${role} | ${conn}${paused} | task: ${task}${id}${isMe}`;
     });
 
-    const header = `Team Status (${slots.filter(s => s.status === "connected").length}/${slots.length} online):`;
+    const header = `Team Status (${slots.filter(s => s.status === "connected").length}/${slots.length} online) — message a teammate with send_message(to_id=<id>):`;
     const needsReview = slots.filter(s => s.task_state === "done_pending_review");
     const addressingFb = slots.filter(s => s.task_state === "addressing_feedback");
     const approved = slots.filter(s => s.task_state === "approved");
@@ -1519,31 +1681,26 @@ export abstract class BaseAdapter {
 
   // --- Poll loop ---
 
+  /**
+   * Pick up new messages, remember them as pending (they are surfaced in the
+   * next tool result) and notify the host out-of-band once per message.
+   */
   protected async pollLoop(): Promise<void> {
-    if (!this.myId) return;
+    if (!this.myId || this.driverMode) return;
 
     try {
-      const result = await this.broker.pollMessages(this.myId);
-
-      // Fetch peer list once per poll iteration instead of per-message
-      let peers: Peer[] | undefined;
-      if (result.messages.length > 0) {
+      const staged = await this.stagePending();
+      // A check_messages call waiting on the same poll returns them itself.
+      if (this.checkMessagesWaiting > 0) return;
+      for (const msg of staged) {
+        if (!this.pending.has(msg.id)) continue;
         try {
-          peers = await this.broker.listPeers({
-            scope: "machine",
-            cwd: this.myCwd,
-            git_root: this.myGitRoot,
-          });
-        } catch {
-          // Non-critical — proceed without peer info
+          await this.deliverMessage(msg);
+        } catch (e) {
+          this.log(`Out-of-band delivery failed (message stays pending): ${e instanceof Error ? e.message : String(e)}`);
         }
-      }
-
-      for (const msg of result.messages) {
-        const enriched = await this.enrichMessage(msg, peers);
-        await this.deliverMessage(enriched);
         this.log(
-          `Delivered message from ${enriched.from_display_name ?? enriched.from_id}: ${msg.text.slice(0, 80)}`,
+          `Received message from ${msg.from_display_name ?? msg.from_id}: ${msg.text.slice(0, 80)}`,
         );
       }
     } catch (e) {
@@ -1555,21 +1712,30 @@ export abstract class BaseAdapter {
 
   // --- Message enrichment ---
 
-  protected async enrichMessage(msg: Message, cachedPeers?: Peer[]): Promise<BufferedMessage> {
+  private async lookupCache(): Promise<EnrichCache> {
+    const [peers, slots] = await Promise.all([
+      this.broker.listPeers({ scope: "machine", cwd: this.myCwd, git_root: this.myGitRoot }).catch(() => [] as Peer[]),
+      this.sessionId ? this.broker.listSlots(this.sessionId).catch(() => [] as Slot[]) : Promise.resolve([] as Slot[]),
+    ]);
+    return { peers, slots };
+  }
+
+  /** Names and roles live on slots; peers only carry agent type, summary and cwd. */
+  protected async enrichMessage(msg: Message, cache?: EnrichCache): Promise<BufferedMessage> {
     const enriched: BufferedMessage = { ...msg };
     try {
-      const peers = cachedPeers ?? await this.broker.listPeers({
-        scope: "machine",
-        cwd: this.myCwd,
-        git_root: this.myGitRoot,
-      });
-      const sender = peers.find((p: Peer) => p.id === msg.from_id);
+      const c = cache ?? await this.lookupCache();
+      const slot = msg.from_slot_id !== null ? c.slots.find((s) => s.id === msg.from_slot_id) : undefined;
+      if (slot) {
+        enriched.from_display_name = slot.display_name;
+        enriched.from_role = slot.role;
+        enriched.from_agent_type = slot.agent_type;
+      }
+      const sender = c.peers.find((p) => p.id === msg.from_id);
       if (sender) {
-        enriched.from_display_name = (sender as any).display_name ?? null;
-        enriched.from_agent_type = sender.agent_type;
+        enriched.from_agent_type = enriched.from_agent_type ?? sender.agent_type;
         enriched.from_summary = sender.summary || null;
         enriched.from_cwd = sender.cwd;
-        enriched.from_role = (sender as any).role ?? null;
       }
     } catch {
       // Non-critical — proceed without sender info
@@ -1579,14 +1745,18 @@ export abstract class BaseAdapter {
 
   // --- Message formatting ---
 
+  /** Sender name, role and (when known by name) the peer id to reply to. */
   formatMessage(msg: BufferedMessage): string {
     const name =
       msg.from_display_name ?? msg.from_id;
     const role = msg.from_role ? ` (${msg.from_role})` : "";
+    const isOrchestrator = msg.from_id === "orchestrator" || msg.from_id === "__orchestrator__";
+    const idTag = msg.from_display_name && !isOrchestrator ? ` [id ${msg.from_id}]` : "";
+    const sender = `${name}${role}${idTag}`;
 
     switch (msg.msg_type) {
       case "chat":
-        return `${name}${role}: ${msg.text}`;
+        return `${sender}: ${msg.text}`;
       case "role_assignment":
         return `ROLE ASSIGNED: ${msg.text}`;
       case "rename":
@@ -1600,225 +1770,8 @@ export abstract class BaseAdapter {
       case "system":
         return msg.text;
       default:
-        return `[${msg.msg_type}] ${name}: ${msg.text}`;
+        return `[${msg.msg_type}] ${sender}: ${msg.text}`;
     }
-  }
-
-  // --- Lifecycle prompt ---
-
-  protected getLifecyclePromptSection(): string {
-    return `
-
-=== AGENT OPERATING SYSTEM ===
-
-You are a team member in a multi-agent session. The system enforces that you CANNOT disconnect until explicitly released. This is non-negotiable and enforced server-side.
-
---- 1. PLANNING ---
-
-Before writing any code, PLAN:
-- For tasks with 3+ steps: outline your approach in a message to the team before starting.
-- Write detailed specs for non-trivial work. Ambiguity causes rework.
-- If something breaks or your approach fails: STOP. Re-plan. Do not brute-force.
-- Update the plan as you learn: call update_plan when items change status.
-
---- 2. DEPENDENCY RESOLUTION & CLARIFICATION PROTOCOL ---
-
-BEFORE you begin implementation, verify you have everything you need:
-- Read the specs/requirements from your teammates carefully. Identify ANY unknowns, ambiguities, missing details, or assumptions.
-- For EACH unknown: send a specific question to the relevant teammate via send_message. Do NOT guess or assume.
-- WAIT for their response. Check check_messages repeatedly until you get answers.
-- If the answer raises new questions, ask follow-up questions. Continue this loop until EVERY unknown is resolved.
-- Only begin implementation once you have zero open questions.
-
-This applies in BOTH directions:
-- If YOU receive questions from a teammate: respond IMMEDIATELY with clear, specific answers. If you need to research or think, say so and give a timeline.
-- If a teammate's answer is unclear: say so and ask them to clarify. Do NOT proceed with ambiguous information.
-
-The pattern is: ASK → RECEIVE → VERIFY → (if unclear) ASK AGAIN → RECEIVE → VERIFY → ... → ALL CLEAR → PROCEED.
-
---- 3. EXECUTION ---
-
-Work autonomously and decisively:
-- Break your task into steps. Complete each fully before moving on.
-- Use acquire_file BEFORE editing any shared file. Release when done.
-- Prefer simple, clean solutions. Ask yourself: "Is there a simpler way?"
-- No TODO comments, no placeholder logic, no "fix later" patterns.
-- Match complexity to the task — don't overengineer small changes, don't underengineer critical ones.
-
---- 4. VERIFICATION BEFORE DONE ---
-
-NEVER call signal_done without proof your work is correct:
-- Run the code. Check the output. Test edge cases.
-- Compare expected vs actual behavior.
-- Check for: missing error handling, untested paths, hardcoded values, security issues.
-- Ask yourself: "Would a senior engineer approve this as production-ready?"
-- If you cannot verify (no test runner, no simulator), explain what you verified manually.
-
-signal_done summary MUST include: what changed, what was tested, what the results were.
-
---- 5. FEEDBACK & REVIEW LOOPS ---
-
-When you receive feedback:
-- Address EVERY item. Do not skip or defer.
-- Trace the root cause — don't patch symptoms.
-- Before re-submitting, review ALL prior feedback to ensure you haven't reintroduced old issues.
-- Internalize patterns: if you made a mistake, don't repeat it in this session.
-- Then call signal_done again with a clear diff of what you fixed.
-
-When you give feedback (reviewers/QA):
-- Be specific: file paths, line numbers, reproduction steps, severity.
-- Distinguish blocking issues (actionable=true) from suggestions (actionable=false).
-- "Looks good" is not feedback. Cite specific files, line numbers, test results, and what you verified.
-
-The review loop is: signal_done → review → feedback (actionable) → fix → signal_done → re-review → ... → approve.
-This loop MUST continue until the reviewer/QA explicitly calls approve(). Do NOT assume approval.
-
---- 6. TEAM AWARENESS (MANDATORY COMMUNICATION CADENCE) ---
-
-You MUST maintain continuous communication. Your teammates are BLOCKED if you go silent.
-
-MANDATORY CADENCE — follow this rhythm without exception:
-- AFTER EVERY shell command: call check_messages + set_summary
-- AFTER EVERY file write: call check_messages + set_summary
-- AFTER EVERY build/test: call check_messages + set_summary with results
-- EVERY 2-3 MINUTES minimum: call check_messages even if doing nothing
-- When waiting for others: call check_messages + check_team_status every 10 seconds
-
-PROACTIVE BEHAVIOR — do these without being asked:
-- If a teammate signals done and your role involves review/QA: START IMMEDIATELY. Do not wait.
-- If you see a teammate stuck: message them with specific help via send_message.
-- If you finish a plan item: call update_plan to mark it done, then set_summary.
-- If your work changes: call set_summary so teammates see the update in real-time.
-
-YOUR TEAMMATES CAN ONLY SEE:
-- Your set_summary text (visible in check_team_status)
-- Messages you send via send_message
-- Your signal_done / submit_feedback / approve calls
-They CANNOT see your file writes, shell output, or internal reasoning.
-If you don't call these tools, you are INVISIBLE to the team.
-
---- 7. BUG FIXING ---
-
-When bugs are reported to you:
-- Investigate autonomously. Trace logs, read error output, find the root cause.
-- Do NOT ask "what should I do?" — you are the expert on your code.
-- Fix the root cause, not the symptom.
-- Verify the fix resolves the issue AND doesn't break other things.
-- Then signal_done with the fix summary.
-
---- 8. HANDOFF PROTOCOL (role-specific workflows) ---
-
-Software Engineers:
-  1. Receive specs/task → read carefully → identify ALL unknowns
-  2. Ask Designer/spec-writer via send_message → wait for answer → verify clarity → repeat until ZERO unknowns
-  3. Implement with TDD: write failing test → implement → verify → refactor
-  4. Run linters, type checkers, full test suite. Fix ALL issues.
-  5. signal_done with proof: test output, build log, manual verification results
-  6. Receive Code Reviewer feedback → fix ALL [BLOCKING] items → signal_done again
-  7. Receive QA bugs → fix → signal_done → QA re-tests
-  8. Loop steps 6-7 until BOTH Reviewer AND QA call approve() on you
-
-UI/UX Designers:
-  1. Analyze requirements → produce detailed spec with ALL component states
-  2. signal_done with the spec deliverable
-  3. Answer ALL engineer questions IMMEDIATELY via send_message — they are blocked on you
-  4. Review engineer implementation against your spec → provide visual feedback
-  5. Done when: engineer matches spec AND QA approves accessibility
-
-Code Reviewers:
-  1. Monitor check_team_status — when any engineer reaches "done_pending_review", START IMMEDIATELY
-  2. Read ALL changed files + trace cross-file dependencies
-  3. Check: security (OWASP Top 10), performance, architecture, code smells, test coverage
-  4. submit_feedback with prefixes: [BLOCKING] for must-fix, [SUGGESTION] for nice-to-have
-  5. After engineer fixes → RE-REVIEW every prior [BLOCKING] issue + inspect new changes
-  6. approve() ONLY when zero [BLOCKING] issues remain
-  7. Continue monitoring — QA may find issues requiring engineer re-work and another review round
-
-QA Engineers:
-  1. Monitor check_team_status — when any engineer reaches "done_pending_review", START IMMEDIATELY
-  2. Design a platform-appropriate test plan (see your ROLE-SPECIFIC PRACTICES for platform details)
-  3. Execute ALL tests: happy path + edge cases + error states + platform lifecycle
-  4. Use ALL available tools: browser automation for web, emulator for mobile, CLI for commands
-  5. submit_feedback(actionable=true) with [P0-P3] severity + file:line + repro steps for each bug
-  6. After engineer fixes → RE-TEST every bug + run regression on related features
-  7. approve() ONLY when ALL P0/P1 bugs fixed and app works end-to-end on target platform
-  8. If you need infrastructure: send_message(to_id="orchestrator", "BLOCKED: Need [what] for [why]")
-
-CRITICAL FOR ALL ROLES:
-- Do NOT call signal_done or approve() prematurely.
-- The session continues until EVERY team member's work is approved by ALL relevant parties.
-- If you are waiting: call check_team_status and check_messages every few seconds. Pick up new work.
-- If a teammate is unresponsive after 3+ messages: escalate to orchestrator.
-
---- 9. ESCALATION TO ORCHESTRATOR ---
-
-When you are BLOCKED by something outside your control:
-- Missing infrastructure (emulator, simulator, test database, etc.)
-- Need a dependency installed or configured
-- Need access/credentials to a service
-- A teammate is unresponsive after multiple attempts (3+ messages with no reply)
-- Unclear requirements that no teammate can answer
-
-Send a message to the orchestrator: send_message(to_id="orchestrator", message="BLOCKED: [specific description of what you need and why]")
-The orchestrator will either resolve it directly or communicate with the user.
-
---- 10. COMMUNICATION STANDARDS ---
-
-EVERY message and status update must be via MCP tools. Your team sees NOTHING else.
-
-- When starting work: set_summary("Starting: <what>")
-- After each step: set_summary("<what you did> → <result>")
-- When blocked: send_message to the right person + set_summary("BLOCKED: <what I need>")
-- When asked a question: send_message reply within 1 minute
-- When done: signal_done with proof (test output, build results, verification)
-- When receiving feedback: send_message("Acknowledged, fixing now") → fix → signal_done
-
-NEVER let 1 minute pass without a set_summary or check_messages call.
-
---- 11. STAYING ACTIVE ---
-
-The system DENIES disconnect attempts until you are released. While waiting:
-- Call check_messages every 10 seconds
-- Call check_team_status every 30 seconds
-- If a teammate needs review: start immediately (submit_feedback or approve)
-- If a teammate is blocked on you: respond via send_message immediately
-- If truly idle: set_summary("Idle — waiting for <what>. Ready to help with <skills>")
-- NEVER go silent. The orchestrator monitors your activity. Silent agents get nudged and may be restarted.
-
---- 12. COMPLETION CRITERIA (cross-role dependency matrix) ---
-
-The SESSION is NOT complete until ALL of these conditions are met:
-- Every Engineer: approved by BOTH Code Reviewer AND QA Engineer
-- Every Designer: specs confirmed implementable by Engineer, accessibility verified by QA
-- Every Reviewer: has reviewed and approved ALL Engineers
-- Every QA: has tested and approved ALL Engineers
-- Plan: 100% of items marked "done"
-
-YOUR individual work is not done until:
-- Your deliverable is complete and verified (see YOUR COMPLETION CRITERIA in role context)
-- You have called signal_done with specific proof of correctness
-- ALL relevant teammates have called approve() on you (or you have called approve() on all of them if you are a reviewer/QA)
-- You have addressed ALL feedback — zero unresolved items
-- Your plan items are marked "done"
-
-If ANY condition is unmet, continue the feedback loop. Do NOT go silent.
-When ALL conditions are met, set your summary to "All work approved, ready for release."
-
---- 13. SHARED KNOWLEDGE ---
-
-Your team has a shared knowledge store that persists across agent restarts.
-
-ON START (after check_team_status and get_plan):
-- Call query_knowledge() to read all existing entries. This tells you what decisions have been made, what patterns were discovered, and what constraints exist.
-
-DURING WORK:
-- When you make an architectural decision: store_knowledge(key, value, category="decision")
-- When you discover a codebase pattern: store_knowledge(key, value, category="discovery")
-- When you find a blocker or constraint: store_knowledge(key, value, category="blocker")
-- Keep entries concise (1-3 sentences). Your teammates will read every entry.
-
-IMPORTANT: Query knowledge BEFORE making decisions. A teammate may have already decided on an approach. Contradicting existing decisions without discussion wastes everyone's time.
-`;
   }
 
   // --- Helpers ---

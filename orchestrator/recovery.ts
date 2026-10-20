@@ -8,9 +8,10 @@
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentEvent } from "./monitor.ts";
 import type { CodexDriver } from "./codex-driver.ts";
+import type { ClaudeDriver } from "./claude-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
-import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
+import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH, codexDeveloperInstructions } from "./launcher.ts";
 
 const LOG_PREFIX = "recovery";
 
@@ -121,6 +122,13 @@ export async function handleAgentCrash(
   };
 }
 
+export interface RespawnResult {
+  pid: number;
+  process: import("bun").Subprocess;
+  codexDriver?: CodexDriver;
+  claudeDriver?: ClaudeDriver;
+}
+
 /**
  * Respawn a crashed agent with a handoff prompt that includes:
  * - The original role and task context
@@ -132,7 +140,7 @@ export async function respawnAgent(
   slotId: number,
   brokerClient: BrokerClient,
   projectDir: string,
-): Promise<{ pid: number; process: import("bun").Subprocess; codexDriver?: CodexDriver }> {
+): Promise<RespawnResult> {
   // Get the crashed slot's info
   const slot = await brokerClient.getSlot(slotId);
   const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string; codex_thread_id?: string }>(
@@ -172,17 +180,26 @@ export async function respawnAgent(
     .filter(Boolean)
     .join("\n");
 
-  // For Codex agents, use CodexDriver for respawn (same as initial launch).
-  // Without this, respawned Codex agents run as single-shot `codex exec` and
-  // lose the multi-turn driver, making them unable to receive messages.
+  // Codex: re-attach to the previous thread so the full conversation history
+  // survives the crash; fall back to a fresh thread if the app-server lost it.
   if (slot.agent_type === "codex") {
     const { CodexDriver: CD } = await import("./codex-driver.ts");
     const fs = await import("node:fs");
     const path = await import("node:path");
 
-    // Write driver-mode sentinel
+    const identity = {
+      sessionId,
+      projectDir,
+      slotId,
+      name: slot.display_name ?? `Agent #${slotId}`,
+      role: slot.role ?? "general",
+      roleDescription: slot.role_description ?? "",
+    };
+
     const driverModeFile = path.join(projectDir, ".multiagents", ".driver-mode");
-    try { fs.writeFileSync(driverModeFile, "1"); } catch {}
+    try {
+      fs.writeFileSync(driverModeFile, JSON.stringify({ slot_id: slotId, session_id: sessionId, role: identity.role, name: identity.name }));
+    } catch { /* best effort */ }
 
     const spawnEnv: Record<string, string | undefined> = {
       ...process.env,
@@ -196,54 +213,46 @@ export async function respawnAgent(
     delete spawnEnv.CLAUDECODE;
 
     const driver = await CD.spawn(projectDir, spawnEnv);
-
-    // Mark slot as connected
     await brokerClient.updateSlot({ id: slotId, status: "connected" });
 
-    // Try to resume the previous thread if we have a threadId in context_snapshot.
-    // This preserves full conversation history from before the crash instead of
-    // starting from a blank slate with only a 150-char recap.
-    const previousThreadId = snapshot.codex_thread_id as string | undefined;
+    const developerInstructions = codexDeveloperInstructions(identity);
+    const previousThreadId = snapshot.codex_thread_id;
+    let threadId: string | null = null;
 
     if (previousThreadId) {
-      log(LOG_PREFIX, `Attempting to resume Codex thread ${previousThreadId} for slot ${slotId}`);
       try {
-        const result = await driver.reply(previousThreadId, handoffTask);
-        await brokerClient.updateSlot({
-          id: slotId,
-          context_snapshot: JSON.stringify({
-            codex_thread_id: result.threadId,
-            last_summary: result.content.slice(0, 200),
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
+        await driver.resumeSession({ threadId: previousThreadId, cwd: projectDir, sandbox: "workspace-write", developerInstructions });
+        threadId = previousThreadId;
         log(LOG_PREFIX, `Resumed Codex thread ${previousThreadId} for slot ${slotId} (PID ${driver.pid})`);
-        return { pid: driver.pid, process: driver.process, codexDriver: driver };
       } catch (err) {
-        log(LOG_PREFIX, `Thread resume failed for ${previousThreadId}, falling back to new session: ${err}`);
-        // Fall through to fresh session below
+        log(LOG_PREFIX, `Thread resume failed for ${previousThreadId}, starting a fresh thread: ${err}`);
       }
     }
 
-    // Fallback: create a new session (fresh thread, no prior context)
-    const bootstrap = await driver.startSession({
-      prompt: `You are "${slot.display_name ?? `Agent #${slotId}`}" (${slot.role ?? "agent"}). You are being restarted. Reply: "Ready."`,
-      cwd: projectDir,
-      sandbox: "workspace-write",
-      developerInstructions: slot.role_description ?? "",
+    if (!threadId) {
+      const bootstrap = await driver.startSession({
+        prompt: `You are "${identity.name}" (${identity.role}). You are being restarted. Reply: "Ready."`,
+        cwd: projectDir,
+        sandbox: "workspace-write",
+        developerInstructions,
+      });
+      threadId = bootstrap.threadId;
+    }
+
+    await brokerClient.updateSlot({
+      id: slotId,
+      context_patch: { codex_thread_id: threadId, last_summary: "Restarting after crash", last_status: "working", updated_at: Date.now() },
     });
 
-    // Push handoff task as reply
-    driver.reply(bootstrap.threadId, handoffTask).then(async (result) => {
+    driver.reply(threadId, handoffTask).then(async (result) => {
       await brokerClient.updateSlot({
         id: slotId,
-        context_snapshot: JSON.stringify({
+        context_patch: {
           codex_thread_id: result.threadId,
           last_summary: result.content.slice(0, 200),
           last_status: "working",
           updated_at: Date.now(),
-        }),
+        },
       });
     }).catch((err) => log(LOG_PREFIX, `Codex respawn task failed: ${err}`));
 
@@ -251,10 +260,10 @@ export async function respawnAgent(
     return { pid: driver.pid, process: driver.process, codexDriver: driver };
   }
 
-  // Non-Codex agents: use traditional relaunch
+  // Claude (driver, resumes its session when the snapshot has one) and Gemini (process)
   const result = await relaunchIntoSlot(sessionId, projectDir, slot, handoffTask, brokerClient);
 
   log(LOG_PREFIX, `Respawned into existing slot ${slotId} (PID ${result.pid})`);
 
-  return { pid: result.pid, process: result.process };
+  return { pid: result.pid, process: result.process, codexDriver: result.codexDriver, claudeDriver: result.claudeDriver };
 }

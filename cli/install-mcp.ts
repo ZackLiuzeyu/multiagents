@@ -152,7 +152,7 @@ function upsertCodexMultiagentsSection(content: string, serverCmd: string, serve
     "[mcp_servers.multiagents]",
     `command = ${JSON.stringify(serverCmd)}`,
     `args = ${argsToml}`,
-    'default_approval_mode = "approve"',
+    'default_tools_approval_mode = "approve"',
     "",
   ].join("\n");
 
@@ -168,9 +168,15 @@ function upsertCodexMultiagentsSection(content: string, serverCmd: string, serve
   if (bodyLines.at(-1) === "") bodyLines.pop();
 
   let changed = false;
+  // Earlier releases wrote `default_approval_mode`, which Codex does not know (rejected under --strict-config).
+  const staleIdx = bodyLines.findIndex((line) => /^\s*default_approval_mode\s*=/.test(line));
+  if (staleIdx !== -1) {
+    bodyLines.splice(staleIdx, 1);
+    changed = true;
+  }
   changed = upsertTomlLine(bodyLines, "command", JSON.stringify(serverCmd)) || changed;
   changed = upsertTomlLine(bodyLines, "args", argsToml) || changed;
-  changed = upsertTomlLine(bodyLines, "default_approval_mode", '"approve"') || changed;
+  changed = upsertTomlLine(bodyLines, "default_tools_approval_mode", '"approve"') || changed;
 
   const replacement = `${match[1]}[mcp_servers.multiagents]\n${bodyLines.join("\n")}\n`;
   return {
@@ -346,7 +352,7 @@ function configureCodex(serverCmd: string, serverArgs: string[]): AgentConfigRes
       fs.mkdirSync(codexDir, { recursive: true });
     }
 
-    // Try CLI first — but always patch TOML afterward to ensure default_approval_mode,
+    // Try CLI first — but always patch TOML afterward to ensure default_tools_approval_mode,
     // because `codex mcp add` does NOT write approval mode settings.
     const codexPath = findAgentCli("codex");
     if (codexPath) {

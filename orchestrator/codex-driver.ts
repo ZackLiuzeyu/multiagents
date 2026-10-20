@@ -2,22 +2,20 @@
 // multiagents — Codex App-Server Driver
 // ============================================================================
 // Manages a long-running `codex app-server` child process and drives Codex
-// turns via the app-server JSON-RPC protocol over stdio.
+// turns via the app-server v2 JSON-RPC protocol over stdio (shapes verified
+// against the schema that `codex app-server generate-json-schema` emits for
+// codex-cli 0.156.1).
 //
-// The app-server protocol (unlike the simpler mcp-server) supports:
-//   - thread/start:    create a new conversation thread
-//   - turn/start:      begin a new agent turn (returns immediately, streams via notifications)
-//   - turn/steer:      inject content mid-turn (between agent loop iterations)
-//   - turn/interrupt:  cancel an in-flight turn
+//   thread/start  → creates the thread; carries cwd, sandbox, approvalPolicy,
+//                   developerInstructions (turn/start does NOT accept them)
+//   turn/start    → returns immediately; progress streams as notifications
+//   turn/steer    → appends input to the in-flight turn (needs expectedTurnId)
+//   turn/interrupt→ ends the turn with status "interrupted"
 //
-// This enables mid-turn message injection: when Codex is busy executing a
-// multi-minute task, the orchestrator can push teammate messages via
-// turn/steer without waiting for the turn to complete.
-//
-// Data flow:
-//   turn/start → turn/started notification (gives turnId)
-//   → item/started → item/*/delta → item/completed (streaming work)
-//   → turn/completed (final result with usage stats)
+// Notifications used: turn/started, turn/completed (turn.status, turn.error),
+// item/started, item/completed, item/agentMessage/delta,
+// thread/tokenUsage/updated (the only source of token usage),
+// thread/status/changed (idle/active + waitingOnApproval/waitingOnUserInput).
 // ============================================================================
 
 import type { Subprocess } from "bun";
@@ -28,10 +26,13 @@ type PipedSubprocess = Subprocess<"pipe", "pipe", "pipe">;
 
 const LOG_PREFIX = "codex-driver";
 
+export type CodexTurnStatus = "completed" | "interrupted";
+
 /** Result from a Codex turn. */
 export interface CodexTurnResult {
   threadId: string;
   content: string;
+  status: CodexTurnStatus;
   usage?: { input_tokens?: number; output_tokens?: number; cached_input_tokens?: number };
 }
 
@@ -56,8 +57,22 @@ export interface CodexSessionOptions {
   model?: string;
 }
 
-/** Convert a simplified sandbox string to the Codex app-server's serde enum object.
- *  The app-server uses camelCase variant names: workspaceWrite, readOnly, etc. */
+export interface CodexSpawnOptions {
+  /** Command to run instead of `codex app-server` (tests use a fake). */
+  command?: string[];
+  /** Handshake timeout. */
+  timeoutMs?: number;
+}
+
+type TokenUsageBreakdown = {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
+};
+
+/** Convert a simplified sandbox string to the app-server's turn-level sandboxPolicy object. */
 function sandboxPolicyObject(sandbox: string, cwd?: string): Record<string, unknown> {
   switch (sandbox) {
     case "danger-full-access":
@@ -78,6 +93,12 @@ function sandboxPolicyObject(sandbox: string, cwd?: string): Record<string, unkn
   }
 }
 
+function defaultCommand(): string[] {
+  const override = process.env.MULTIAGENTS_CODEX_COMMAND?.trim();
+  if (override) return override.split(/\s+/);
+  return ["codex", "app-server"];
+}
+
 /**
  * Drives a `codex app-server` child process via JSON-RPC over stdio.
  *
@@ -86,7 +107,7 @@ function sandboxPolicyObject(sandbox: string, cwd?: string): Record<string, unkn
  *   2. driver.startSession({prompt, ...}) — creates a thread, runs first turn
  *   3. driver.reply(threadId, message) — starts a new turn on the thread
  *   4. driver.steer(threadId, text) — injects content mid-turn
- *   5. driver.kill() — graceful shutdown
+ *   5. driver.kill() — shutdown
  */
 export class CodexDriver {
   private proc: PipedSubprocess;
@@ -99,13 +120,24 @@ export class CodexDriver {
   private _threadId: string | null = null;
   private _activeTurnId: string | null = null;
   private _alive = true;
-  private _onExitCallbacks: Array<() => void> = [];
+  private _exitCode: number | null = null;
+  private _onExitCallbacks: Array<(code: number) => void> = [];
   private _notificationListeners: NotificationListener[] = [];
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _lastActivity = Date.now();
   /** Tracks last notification activity (item/completed, turn events).
    *  Unlike _lastActivity, this is NOT updated by heartbeat responses. */
   private _lastNotificationActivity = Date.now();
+  private _approvalsReviewer: string | null = null;
+  private _threadStatus: string = "notLoaded";
+  private _activeFlags: string[] = [];
+  private _activeItems = 0;
+  /** Per-turn usage from thread/tokenUsage/updated (last = this turn's usage). */
+  private _turnUsage = new Map<string, TokenUsageBreakdown>();
+  /** Notifications that arrived for a turn before its resolver was registered
+   *  (the server may stream them in the same chunk as the turn/start response). */
+  private _earlyContent = new Map<string, string[]>();
+  private _earlyCompletion = new Map<string, Record<string, unknown>>();
 
   // Turn completion tracking: when a turn is in flight, we collect content
   // from streaming notifications and resolve when turn/completed fires.
@@ -113,7 +145,6 @@ export class CodexDriver {
     resolve: (result: CodexTurnResult) => void;
     reject: (error: Error) => void;
     content: string[];
-    usage?: CodexTurnResult["usage"];
     timer: ReturnType<typeof setTimeout>;
   }>();
 
@@ -125,36 +156,50 @@ export class CodexDriver {
   /** Last time a notification (item/completed, turn event) was received.
    *  Use this for idle detection — not polluted by heartbeat responses. */
   get lastNotificationActivity(): number { return this._lastNotificationActivity; }
-
   /** The currently in-flight turn ID, or null if no turn is active. */
   get activeTurnId(): string | null { return this._activeTurnId; }
+  /** Who answers approvals, as reported by thread/start ("user" means this driver). */
+  get approvalsReviewer(): string | null { return this._approvalsReviewer; }
+  /** Latest thread/status/changed type: notLoaded | idle | active | systemError. */
+  get threadStatus(): string { return this._threadStatus; }
+  /** Active flags from thread/status/changed (waitingOnApproval, waitingOnUserInput). */
+  get activeFlags(): string[] { return this._activeFlags; }
+  /** Items started but not completed (a running command counts as 1). */
+  get activeItems(): number { return this._activeItems; }
 
   private constructor(proc: PipedSubprocess) {
     this.proc = proc;
     this.startReader();
     this.proc.exited.then((code) => {
       this._alive = false;
+      this._exitCode = code;
       this._activeTurnId = null;
+      this._activeItems = 0;
       log(LOG_PREFIX, `codex app-server exited with code ${code}`);
-      // Reject all pending requests
       for (const [id, pending] of this.pendingRequests) {
         pending.reject(new Error(`codex app-server exited (code ${code})`));
         this.pendingRequests.delete(id);
       }
-      // Reject all pending turn completions
       for (const [turnId, resolver] of this._turnResolvers) {
         clearTimeout(resolver.timer);
         resolver.reject(new Error(`codex app-server exited (code ${code}) during turn ${turnId}`));
         this._turnResolvers.delete(turnId);
       }
       for (const cb of this._onExitCallbacks) {
-        try { cb(); } catch { /* don't let one callback break others */ }
+        try { cb(code); } catch { /* don't let one callback break others */ }
       }
     });
   }
 
-  /** Register a callback for when the process exits. Multiple callbacks supported. */
-  onExit(cb: () => void): void { this._onExitCallbacks.push(cb); }
+  /** Fires with the exit code; a callback registered after the exit fires right away. */
+  onExit(cb: (code: number) => void): void {
+    if (this._exitCode !== null) {
+      const code = this._exitCode;
+      queueMicrotask(() => cb(code));
+      return;
+    }
+    this._onExitCallbacks.push(cb);
+  }
 
   /** Register a listener for notifications from the app-server. */
   onNotification(cb: NotificationListener): void { this._notificationListeners.push(cb); }
@@ -165,9 +210,10 @@ export class CodexDriver {
   static async spawn(
     cwd: string,
     env: Record<string, string | undefined>,
-    timeoutMs = 30_000,
+    opts: CodexSpawnOptions = {},
   ): Promise<CodexDriver> {
-    const proc = Bun.spawn(["codex", "app-server"], {
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    const proc = Bun.spawn(opts.command ?? defaultCommand(), {
       cwd,
       stdin: "pipe",
       stdout: "pipe",
@@ -178,13 +224,11 @@ export class CodexDriver {
     const driver = new CodexDriver(proc);
     driver.readStderr();
 
-    // App-server handshake: initialize → response → initialized notification
     const initResult = await driver.sendRequest("initialize", {
       clientInfo: { name: "multiagents-orchestrator", version: "1.0" },
       capabilities: {},
     }, timeoutMs) as { userAgent?: string };
 
-    // Send initialized notification (required before any other requests)
     try {
       driver.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }) + "\n");
       driver.proc.stdin.flush();
@@ -198,42 +242,63 @@ export class CodexDriver {
 
   /**
    * Start a new Codex session (thread + first turn).
-   *
-   * Creates a thread, then starts a turn with the given prompt.
    * Blocks until the turn completes (can take minutes).
    */
   async startSession(opts: CodexSessionOptions): Promise<CodexTurnResult> {
     log(LOG_PREFIX, `Starting session: ${opts.prompt.slice(0, 100)}...`);
 
-    // Step 1: create a thread
-    // thread/start returns { thread: { id: "..." }, ... }
-    const threadResult = await this.sendRequest("thread/start", {}, 30_000) as { thread: { id: string } };
+    const threadParams: Record<string, unknown> = { approvalPolicy: "never" };
+    if (opts.cwd) threadParams.cwd = opts.cwd;
+    if (opts.sandbox) threadParams.sandbox = opts.sandbox;
+    if (opts.developerInstructions) threadParams.developerInstructions = opts.developerInstructions;
+    if (opts.baseInstructions) threadParams.baseInstructions = opts.baseInstructions;
+    if (opts.model) threadParams.model = opts.model;
+
+    const threadResult = await this.sendRequest("thread/start", threadParams, 30_000) as {
+      thread?: { id: string };
+      approvalsReviewer?: string;
+    };
     const threadId = threadResult.thread?.id;
     if (!threadId) throw new Error("thread/start did not return a thread ID");
     this._threadId = threadId;
+    this._approvalsReviewer = threadResult.approvalsReviewer ?? null;
+    if (this._approvalsReviewer && this._approvalsReviewer !== "user") {
+      log(LOG_PREFIX, `Warning: approvals are routed to "${this._approvalsReviewer}", not to this driver`);
+    }
 
-    // Step 2: start the first turn
     const turnInput: Record<string, unknown> = {
       threadId,
       input: [{ type: "text", text: opts.prompt }],
+      approvalPolicy: "never",
     };
     if (opts.cwd) turnInput.cwd = opts.cwd;
-    // Codex app-server expects sandboxPolicy as a serde internally-tagged enum.
-    // Convert our simplified string to the full object format.
-    if (opts.sandbox) {
-      turnInput.sandboxPolicy = sandboxPolicyObject(opts.sandbox, opts.cwd);
-    }
-    if (opts.developerInstructions) turnInput.developerInstructions = opts.developerInstructions;
+    if (opts.sandbox) turnInput.sandboxPolicy = sandboxPolicyObject(opts.sandbox, opts.cwd);
     if (opts.model) turnInput.model = opts.model;
-    // Enable fully autonomous execution (equivalent to `codex exec -a never`).
-    // Without this, MCP tool calls require interactive approval which hangs in headless mode.
-    // The schema accepts: "untrusted" | "on-failure" | "on-request" | "never"
-    turnInput.approvalPolicy = "never";
 
     const result = await this.startTurnAndWait(threadId, turnInput);
-
     log(LOG_PREFIX, `Session started: thread=${result.threadId}, content=${result.content.slice(0, 100)}...`);
     return result;
+  }
+
+  /**
+   * Re-attach to a previous thread (full history preserved) so `reply()` can
+   * continue it. Throws if the app-server does not know the thread.
+   */
+  async resumeSession(opts: { threadId: string } & Omit<CodexSessionOptions, "prompt">): Promise<void> {
+    const params: Record<string, unknown> = { threadId: opts.threadId, approvalPolicy: "never" };
+    if (opts.cwd) params.cwd = opts.cwd;
+    if (opts.sandbox) params.sandbox = opts.sandbox;
+    if (opts.developerInstructions) params.developerInstructions = opts.developerInstructions;
+    if (opts.baseInstructions) params.baseInstructions = opts.baseInstructions;
+    if (opts.model) params.model = opts.model;
+
+    const result = await this.sendRequest("thread/resume", params, 30_000) as {
+      thread?: { id: string };
+      approvalsReviewer?: string;
+    };
+    this._threadId = result.thread?.id ?? opts.threadId;
+    this._approvalsReviewer = result.approvalsReviewer ?? this._approvalsReviewer;
+    log(LOG_PREFIX, `Resumed thread ${this._threadId}`);
   }
 
   /**
@@ -253,14 +318,9 @@ export class CodexDriver {
   }
 
   /**
-   * Inject content into an active turn (mid-turn message delivery).
-   *
-   * This is the key improvement over mcp-server: steer pushes content
-   * between agent loop iterations without waiting for the turn to finish.
-   * Returns immediately — the agent processes the steered input as part
-   * of the ongoing turn.
-   *
-   * Throws if no turn is active or if the turn rejects the steer.
+   * Inject content into the active turn. Codex delivers it at the next item
+   * boundary (instantly on ≥0.163). Throws if no turn is active or the server
+   * rejects the steer (e.g. the turn finished in between).
    */
   async steer(threadId: string, text: string): Promise<void> {
     const turnId = this._activeTurnId;
@@ -278,14 +338,19 @@ export class CodexDriver {
   }
 
   /**
-   * Interrupt an active turn.
+   * Interrupt the active turn. A turn that already finished makes the server
+   * answer INVALID_REQUEST, which is not an error for the caller.
    */
   async interrupt(threadId: string): Promise<void> {
     const turnId = this._activeTurnId;
     if (!turnId) return;
 
     log(LOG_PREFIX, `Interrupting turn ${turnId}`);
-    await this.sendRequest("turn/interrupt", { threadId, turnId }, 10_000);
+    try {
+      await this.sendRequest("turn/interrupt", { threadId, turnId }, 10_000);
+    } catch (err) {
+      log(LOG_PREFIX, `Interrupt not applied: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async kill(): Promise<void> {
@@ -299,18 +364,11 @@ export class CodexDriver {
 
   // --- Turn lifecycle ---
 
-  /**
-   * Start a turn and wait for it to complete via notifications.
-   *
-   * Sends turn/start, then collects content from item/agentMessage/delta
-   * and item/completed notifications. Resolves when turn/completed fires.
-   */
   private async startTurnAndWait(
     threadId: string,
     params: Record<string, unknown>,
     timeoutMs = 10 * 60_000,
   ): Promise<CodexTurnResult> {
-    // Send the turn/start request — returns immediately with turn metadata
     const turnMeta = await this.sendRequest("turn/start", params, 30_000) as {
       turn?: { id: string; status: string };
     };
@@ -320,9 +378,9 @@ export class CodexDriver {
       throw new Error("turn/start did not return a turn ID");
     }
 
-    this._activeTurnId = turnId;
+    const early = this._earlyCompletion.get(turnId);
+    if (!early) this._activeTurnId = turnId;
 
-    // Wait for turn/completed notification
     return new Promise<CodexTurnResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this._turnResolvers.delete(turnId);
@@ -339,9 +397,39 @@ export class CodexDriver {
           this._activeTurnId = null;
           reject(err);
         },
-        content: [],
+        content: this._earlyContent.get(turnId) ?? [],
         timer,
       });
+      this._earlyContent.delete(turnId);
+
+      if (early) {
+        this._earlyCompletion.delete(turnId);
+        this.completeTurn(turnId, early.turn as { status?: string; error?: { message?: string } } | undefined);
+      }
+    });
+  }
+
+  private completeTurn(turnId: string, turn: { status?: string; error?: { message?: string } } | undefined): void {
+    const resolver = this._turnResolvers.get(turnId);
+    if (!resolver) return;
+    clearTimeout(resolver.timer);
+    this._turnResolvers.delete(turnId);
+
+    if (turn?.status === "failed") {
+      resolver.reject(new Error(`Turn ${turnId} failed: ${turn.error?.message ?? "unknown error"}`));
+      return;
+    }
+    const last = this._turnUsage.get(turnId);
+    this._turnUsage.delete(turnId);
+    resolver.resolve({
+      threadId: this._threadId ?? "",
+      content: resolver.content.join(""),
+      status: turn?.status === "interrupted" ? "interrupted" : "completed",
+      usage: last ? {
+        input_tokens: last.inputTokens,
+        output_tokens: last.outputTokens,
+        cached_input_tokens: last.cachedInputTokens,
+      } : undefined,
     });
   }
 
@@ -353,7 +441,6 @@ export class CodexDriver {
       if (Date.now() - this._lastActivity < 30_000) return;
 
       try {
-        // Use thread/list as a lightweight health check
         await this.sendRequest("thread/list", { limit: 1 }, 30_000);
       } catch (err) {
         log(LOG_PREFIX, `Heartbeat failed: ${err instanceof Error ? err.message : err}`);
@@ -380,8 +467,6 @@ export class CodexDriver {
       const id = this.nextId++;
       const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
 
-      this.pendingRequests.set(id, { resolve, reject });
-
       const timer = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
@@ -389,11 +474,9 @@ export class CodexDriver {
         }
       }, timeoutMs);
 
-      const origResolve = resolve;
-      const origReject = reject;
       this.pendingRequests.set(id, {
-        resolve: (v) => { clearTimeout(timer); origResolve(v); },
-        reject: (e) => { clearTimeout(timer); origReject(e); },
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
       });
 
       try {
@@ -405,6 +488,15 @@ export class CodexDriver {
         reject(new Error(`Failed to write to codex app-server stdin: ${err}`));
       }
     });
+  }
+
+  private writeResponse(id: number | string, body: { result?: unknown; error?: { code: number; message: string } }): void {
+    try {
+      this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, ...body }) + "\n");
+      this.proc.stdin.flush();
+    } catch (err) {
+      log(LOG_PREFIX, `Failed to respond to server request ${id}: ${err}`);
+    }
   }
 
   // --- stdio readers ---
@@ -439,9 +531,7 @@ export class CodexDriver {
     try {
       const msg = JSON.parse(line);
 
-      // Server-initiated REQUEST (has both "id" AND "method").
-      // These are approval requests — the server asks us to approve commands,
-      // file changes, MCP tool calls, etc. We must respond or the turn blocks.
+      // Server-initiated REQUEST (has both "id" AND "method") — must be answered or the turn blocks.
       if (msg.id !== undefined && msg.id !== null && msg.method) {
         this._lastActivity = Date.now();
         this._lastNotificationActivity = Date.now();
@@ -476,18 +566,9 @@ export class CodexDriver {
     }
   }
 
-  /**
-   * Handle an app-server notification. Key events:
-   *
-   * - turn/started:           Active turn ID assigned
-   * - turn/completed:         Turn finished (resolve pending promise)
-   * - item/agentMessage/delta: Streaming content (collect for final result)
-   * - item/completed:         Single item finished (token tracking, activity)
-   */
   private handleNotification(method: string, params: Record<string, unknown>): void {
     const turnId = params.turnId as string | undefined;
 
-    // Dispatch to registered external listeners
     if (this._notificationListeners.length > 0) {
       const notification: CodexNotification = {
         method,
@@ -500,117 +581,95 @@ export class CodexDriver {
       }
     }
 
-    // --- Internal turn lifecycle tracking ---
-
-    if (method === "turn/started") {
-      const id = (params.turn as any)?.id ?? turnId;
-      if (id) this._activeTurnId = id;
-      return;
-    }
-
-    if (method === "turn/completed") {
-      this._activeTurnId = null;
-      const completedTurnId = turnId ?? (params.turn as any)?.id;
-      if (!completedTurnId) return;
-
-      const resolver = this._turnResolvers.get(completedTurnId);
-      if (resolver) {
-        clearTimeout(resolver.timer);
-        this._turnResolvers.delete(completedTurnId);
-
-        // Extract usage from turn/completed params
-        const usage = (params.usage ?? (params.turn as any)?.usage) as CodexTurnResult["usage"] | undefined;
-
-        resolver.resolve({
-          threadId: this._threadId ?? "",
-          content: resolver.content.join(""),
-          usage: usage ?? resolver.usage,
-        });
+    switch (method) {
+      case "turn/started": {
+        const id = (params.turn as { id?: string } | undefined)?.id ?? turnId;
+        if (id) this._activeTurnId = id;
+        return;
       }
-      return;
-    }
+      case "turn/completed": {
+        this._activeTurnId = null;
+        this._activeItems = 0;
+        const turn = params.turn as { id?: string; status?: string; error?: { message?: string } } | undefined;
+        const completedTurnId = turn?.id ?? turnId;
+        if (!completedTurnId) return;
 
-    // Collect streaming agent message content
-    if (method === "item/agentMessage/delta") {
-      const delta = params.delta as string | undefined;
-      if (delta && turnId) {
-        const resolver = this._turnResolvers.get(turnId);
-        if (resolver) resolver.content.push(delta);
-      }
-      return;
-    }
-
-    // Item completed — extract any content and usage
-    if (method === "item/completed") {
-      const item = params.item as Record<string, unknown> | undefined;
-      if (item?.type === "agentMessage" && item.text && turnId) {
-        const resolver = this._turnResolvers.get(turnId);
-        if (resolver && resolver.content.length === 0) {
-          // If we missed deltas, use the completed item text as fallback
-          resolver.content.push(item.text as string);
+        if (!this._turnResolvers.has(completedTurnId)) {
+          this._earlyCompletion.set(completedTurnId, params);
+          return;
         }
+        this.completeTurn(completedTurnId, turn);
+        return;
       }
-      // Extract token usage from item
-      if (item?.usage && turnId) {
-        const resolver = this._turnResolvers.get(turnId);
-        if (resolver) resolver.usage = item.usage as CodexTurnResult["usage"];
+      case "item/agentMessage/delta": {
+        const delta = params.delta as string | undefined;
+        if (delta && turnId) {
+          const resolver = this._turnResolvers.get(turnId);
+          if (resolver) resolver.content.push(delta);
+          else this._earlyContent.set(turnId, [...(this._earlyContent.get(turnId) ?? []), delta]);
+        }
+        return;
       }
-      return;
+      case "item/started":
+        this._activeItems++;
+        return;
+      case "item/completed": {
+        this._activeItems = Math.max(0, this._activeItems - 1);
+        const item = params.item as Record<string, unknown> | undefined;
+        if (item?.type === "agentMessage" && item.text && turnId) {
+          const resolver = this._turnResolvers.get(turnId);
+          const content = resolver ? resolver.content : (this._earlyContent.get(turnId) ?? []);
+          // If we missed deltas, use the completed item text as fallback
+          if (content.length === 0) content.push(item.text as string);
+          if (!resolver) this._earlyContent.set(turnId, content);
+        }
+        return;
+      }
+      case "thread/tokenUsage/updated": {
+        const usage = params.tokenUsage as { last?: TokenUsageBreakdown } | undefined;
+        if (turnId && usage?.last) this._turnUsage.set(turnId, usage.last);
+        return;
+      }
+      case "thread/status/changed": {
+        const status = params.status as { type?: string; activeFlags?: string[] } | undefined;
+        if (status?.type) this._threadStatus = status.type;
+        this._activeFlags = status?.activeFlags ?? [];
+        return;
+      }
     }
   }
 
   /**
-   * Handle a server-initiated JSON-RPC request (has both id and method).
-   * These are approval requests — auto-approve all of them for headless operation.
-   *
-   * Known request types:
-   *   - item/commandExecution/requestApproval → approve shell commands
-   *   - item/fileChange/requestApproval → approve file writes
-   *   - item/applyPatch/requestApproval → approve patches
-   *   - mcp/server/elicitationRequest → approve MCP interactions
-   *   - item/permissions/requestApproval → approve permission escalations
+   * Answer a server-initiated request with the shape its response schema
+   * requires. Unattended operation approves command/file requests, grants the
+   * requested permissions for the session, declines elicitations and user-input
+   * questions, and refuses requests this driver cannot fulfil.
    */
   private handleServerRequest(id: number | string, method: string, params: Record<string, unknown>): void {
-    log(LOG_PREFIX, `Auto-approving server request: ${method} (id=${id})`);
+    log(LOG_PREFIX, `Server request: ${method} (id=${id})`);
 
-    // Each server request type has its own response schema — must match exactly.
-    let result: Record<string, unknown>;
-
-    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
-      // Schema: { decision: "accept" | "acceptForSession" | "decline" | "cancel" }
-      result = { decision: "acceptForSession" };
-    } else if (method === "item/applyPatch/requestApproval" || method === "execCommand/requestApproval") {
-      // Schema: { decision: "approved" | "approved_for_session" | "denied" | "abort" }
-      result = { decision: "approved_for_session" };
-    } else if (method.includes("elicitation")) {
-      // Schema: { action: "accept" | "decline" | "cancel" }
-      result = { action: "accept" };
-    } else if (method === "permissions/requestApproval") {
-      // Schema: { permissions: { fileSystem: { read: [...], write: [...] }, network: { enabled: true } }, scope: "session" }
-      result = {
-        permissions: {
-          fileSystem: { read: [process.cwd()], write: [process.cwd()] },
-          network: { enabled: true },
-        },
-        scope: "session",
-      };
-    } else if (method.includes("requestUserInput") || method.includes("toolRequestUserInput")) {
-      // Schema: { answers: {} }
-      result = { answers: {} };
-    } else if (method.includes("requestApproval") || method.includes("approval")) {
-      // Fallback for unknown approval types
-      result = { decision: "acceptForSession" };
-    } else {
-      // Unknown server request — try generic approval
-      result = { decision: "acceptForSession" };
-    }
-
-    try {
-      const response = JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n";
-      this.proc.stdin.write(response);
-      this.proc.stdin.flush();
-    } catch (err) {
-      log(LOG_PREFIX, `Failed to respond to server request ${method}: ${err}`);
+    switch (method) {
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+        return this.writeResponse(id, { result: { decision: "acceptForSession" } });
+      case "execCommandApproval":
+      case "applyPatchApproval":
+        return this.writeResponse(id, { result: { decision: "approved_for_session" } });
+      case "item/permissions/requestApproval":
+        return this.writeResponse(id, { result: { permissions: params.permissions ?? {}, scope: "session" } });
+      case "item/tool/requestUserInput":
+        return this.writeResponse(id, { result: { answers: {} } });
+      case "mcpServer/elicitation/request":
+        return this.writeResponse(id, { result: { action: "decline" } });
+      case "item/tool/call":
+        return this.writeResponse(id, {
+          result: {
+            success: false,
+            contentItems: [{ type: "inputText", text: "Dynamic tools are not provided by multiagents-orchestrator." }],
+          },
+        });
+      default:
+        return this.writeResponse(id, { error: { code: -32601, message: `${method} is not supported by multiagents-orchestrator` } });
     }
   }
 

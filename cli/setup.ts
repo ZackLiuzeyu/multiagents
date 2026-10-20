@@ -2,14 +2,14 @@
 // multiagents — Setup: detect agents + install MCP globally
 // ============================================================================
 
-import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import { BrokerClient } from "../shared/broker-client.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 
 /** Known install locations per agent type. */
 const KNOWN_PATHS: Record<string, string[]> = {

@@ -10,10 +10,16 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. A message is `delivered` once a delivery mechanism picked it up and `acked` once it reached the model. A plain poll consumes what it returns; clients that confirm delivery themselves poll with `retain: true` and call `/ack-messages`, so a failed delivery is retried. Messages match by peer id or slot id, so an agent respawned into a slot inherits its predecessor's inbox. `/peek-undelivered` reports unacked and unclaimed counts; `/slots/update` takes `context_patch` to merge into the slot snapshot without clobbering other writers' keys (driver session ids).
+- `server.ts` — MCP stdio server, one per agent CLI instance (`adapters/*`). Prepends unread messages to every tool result (`[PENDING MESSAGES]`) and acks them; Claude also gets a best-effort channel notification.
+- `adapters/protocol-text.ts` — Team protocol: short form for MCP `instructions` (Claude Code caps them at 4096 chars, Codex reads 512), full form for orchestrator prompts.
+- `orchestrator/claude-driver.ts` — Long-lived `claude -p --input-format stream-json` session; teammate messages are written to stdin and read mid-turn. `system/init` only arrives after the first message; closing stdin ends the session.
+- `orchestrator/codex-driver.ts` — `codex app-server` JSON-RPC client (shapes verified against the 0.156.1 schema).
+- `orchestrator/delivery.ts` — Hands unacked messages to a driver (`retain` poll) and acks them on confirmed hand-off.
+- `orchestrator/supervision.ts` — Driver registry (one driver per slot), non-overlapping loop ticks, release and watchdog verdicts; pure enough to unit-test.
+- `orchestrator/monitor.ts` — Slot summaries and token accounting. Claude's `result.usage` is per turn (added as is); Codex's `thread/tokenUsage/updated.total` is cumulative (diffed).
 - `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Git-based summary of what an agent is working on (no API calls).
 - `cli.ts` — CLI utility for inspecting broker state.
 
 ## Running
@@ -24,6 +30,17 @@ claude --dangerously-load-development-channels server:multiagents
 
 # Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
 # { "multiagents": { "command": "bun", "args": ["./server.ts"] } }
+# Channel push only renders in interactive sessions started with the flag; headless
+# `-p` sessions drop it. Messages still arrive inside the next tool result.
+
+# Env knobs: MULTIAGENTS_PORT (broker port; every component resolves it through
+# shared/broker-url.ts and the orchestrator forwards it to spawned agents — an
+# invalid value falls back to the default with a warning),
+# MULTIAGENTS_CLAUDE_MODEL (model for driver-launched Claude agents),
+# MULTIAGENTS_CLAUDE_COMMAND / MULTIAGENTS_CODEX_COMMAND (override the CLI binaries),
+# MULTIAGENTS_CLEANUP_INTERVAL_MS (broker stale-peer sweep), MULTIAGENTS_NO_DASHBOARD=1
+# (orchestrator opens no terminal/web dashboards — tests, headless hosts),
+# MULTIAGENTS_LIVE_TESTS=1 (run the live tests against the real CLIs, costs API usage).
 
 # CLI:
 bun cli.ts status
@@ -54,9 +71,19 @@ Default to using Bun instead of Node.js.
 - Prefer `Bun.file` over `node:fs`'s readFile/writeFile
 - Bun.$`ls` instead of execa.
 
+## Releasing
+
+`bun run version:<patch|minor|major>` bumps package.json and creates the `vX.Y.Z` commit and tag;
+`git push && git push --tags` makes `.github/workflows/publish.yml` test and publish to npm via
+trusted publishing (OIDC — no token in the repo or secrets; the publisher on npmjs.com names
+`publish.yml` and the `npm` environment). Pull requests run `.github/workflows/ci.yml`.
+
 ## Testing
 
-Use `bun test` to run tests.
+Use `bun test` to run tests. `tests/launcher.test.ts` writes the global `~/.codex/config.toml` /
+`~/.gemini/settings.json` (it saves and restores them); run the suite with a throwaway
+`HOME=$(mktemp -d) bun test` to keep your real configs untouched. Driver tests run against
+`tests/fakes/fake-claude.ts` and `tests/fakes/fake-codex-app-server.ts`.
 
 ```ts#index.test.ts
 import { test, expect } from "bun:test";

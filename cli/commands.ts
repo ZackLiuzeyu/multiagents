@@ -3,11 +3,11 @@
 // multiagents — CLI Command Router
 // ============================================================================
 
-import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import { BrokerClient } from "../shared/broker-client.ts";
 
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 
 const COMMAND_HELP: Record<string, string> = {
   "setup": `multiagents setup
@@ -302,6 +302,10 @@ export async function runCli(args: string[]): Promise<void> {
       if (roleIdx !== -1 && args[roleIdx + 1]) process.env.MULTIAGENTS_ROLE = args[roleIdx + 1];
       const nameIdx = args.indexOf("--name");
       if (nameIdx !== -1 && args[nameIdx + 1]) process.env.MULTIAGENTS_NAME = args[nameIdx + 1];
+      // Orchestrator drivers own message delivery for this agent (no adapter polling).
+      if (args.includes("--driver-mode")) process.env.MULTIAGENTS_DRIVER_MODE = "1";
+      const portIdx = args.indexOf("--port");
+      if (portIdx !== -1 && args[portIdx + 1]) process.env.MULTIAGENTS_PORT = args[portIdx + 1];
       await import("../server.ts");
       break;
     }

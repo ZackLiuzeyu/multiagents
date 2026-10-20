@@ -13,7 +13,6 @@
 import { Database } from "bun:sqlite";
 import { normalize } from "node:path";
 import {
-  DEFAULT_BROKER_PORT,
   DEFAULT_DB_PATH,
   DEFAULT_LOCK_TIMEOUT_MS,
   MAX_LOCK_TIMEOUT_MS,
@@ -22,6 +21,7 @@ import {
   CLEANUP_INTERVAL,
 } from "./shared/constants.ts";
 import { generatePeerId } from "./shared/utils.ts";
+import { resolveBrokerPort } from "./shared/broker-url.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -66,7 +66,7 @@ import type {
 
 // --- Configuration ---
 
-const PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
+const PORT = resolveBrokerPort();
 
 const DB_PATH = process.env.MULTIAGENTS_DB ?? DEFAULT_DB_PATH;
 
@@ -112,32 +112,6 @@ db.run(`
   )
 `);
 
-// Add new columns to existing tables (idempotent via try/catch)
-const alterStatements = [
-  "ALTER TABLE peers ADD COLUMN session_id TEXT",
-  "ALTER TABLE peers ADD COLUMN slot_id INTEGER",
-  "ALTER TABLE peers ADD COLUMN agent_type TEXT DEFAULT 'claude'",
-  "ALTER TABLE peers ADD COLUMN status TEXT DEFAULT 'idle'",
-  "ALTER TABLE messages ADD COLUMN session_id TEXT",
-  "ALTER TABLE messages ADD COLUMN from_slot_id INTEGER",
-  "ALTER TABLE messages ADD COLUMN to_slot_id INTEGER",
-  "ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'",
-  "ALTER TABLE messages ADD COLUMN delivered_at TEXT",
-  "ALTER TABLE messages ADD COLUMN held INTEGER DEFAULT 0",
-  "ALTER TABLE slots ADD COLUMN task_state TEXT DEFAULT 'idle'",
-  "ALTER TABLE slots ADD COLUMN input_tokens INTEGER DEFAULT 0",
-  "ALTER TABLE slots ADD COLUMN output_tokens INTEGER DEFAULT 0",
-  "ALTER TABLE slots ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
-];
-
-for (const stmt of alterStatements) {
-  try {
-    db.run(stmt);
-  } catch {
-    // Column already exists — ignore
-  }
-}
-
 // New tables
 db.run(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -171,7 +145,10 @@ db.run(`
     last_peer_pid INTEGER,
     last_connected INTEGER,
     last_disconnected INTEGER,
-    context_snapshot TEXT
+    context_snapshot TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0
   )
 `);
 
@@ -265,11 +242,57 @@ db.run(`
   )
 `);
 
+// Columns added after a table first shipped; the ALTER fails harmlessly once the column exists.
+// Runs after every CREATE TABLE so a fresh database gets them too.
+function addColumn(stmt: string): boolean {
+  try {
+    db.run(stmt);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+for (const stmt of [
+  "ALTER TABLE peers ADD COLUMN session_id TEXT",
+  "ALTER TABLE peers ADD COLUMN slot_id INTEGER",
+  "ALTER TABLE peers ADD COLUMN agent_type TEXT DEFAULT 'claude'",
+  "ALTER TABLE peers ADD COLUMN status TEXT DEFAULT 'idle'",
+  "ALTER TABLE messages ADD COLUMN session_id TEXT",
+  "ALTER TABLE messages ADD COLUMN from_slot_id INTEGER",
+  "ALTER TABLE messages ADD COLUMN to_slot_id INTEGER",
+  "ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'",
+  "ALTER TABLE messages ADD COLUMN delivered_at TEXT",
+  "ALTER TABLE messages ADD COLUMN held INTEGER DEFAULT 0",
+  "ALTER TABLE slots ADD COLUMN task_state TEXT DEFAULT 'idle'",
+  "ALTER TABLE slots ADD COLUMN input_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE slots ADD COLUMN output_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE slots ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+]) {
+  addColumn(stmt);
+}
+
+// Before acked_at existed a poll consumed what it returned, so every delivered
+// message of an older database counts as acked or it would be replayed.
+if (addColumn("ALTER TABLE messages ADD COLUMN acked_at TEXT")) {
+  db.run("UPDATE messages SET acked_at = COALESCE(delivered_at, sent_at) WHERE delivered = 1 AND acked_at IS NULL");
+}
+
 // --- Context snapshot builder ---
 
-/** Build a rich context snapshot for a disconnecting peer/slot. */
+function parseSnapshot(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Build a rich context snapshot for a disconnecting peer/slot, keeping keys other writers stored (driver session ids). */
 function buildContextSnapshot(peer: { summary?: string | null; cwd?: string | null }, slotId: number): string {
-  const slotRow = db.query("SELECT task_state FROM slots WHERE id = ?").get(slotId) as { task_state: string } | null;
+  const slotRow = db.query("SELECT task_state, context_snapshot FROM slots WHERE id = ?").get(slotId) as { task_state: string; context_snapshot: string | null } | null;
 
   // Get plan items assigned to this slot (if any plan exists)
   let planItems: { label: string; status: string }[] = [];
@@ -281,6 +304,7 @@ function buildContextSnapshot(peer: { summary?: string | null; cwd?: string | nu
   } catch { /* plan tables may not have data */ }
 
   return JSON.stringify({
+    ...parseSnapshot(slotRow?.context_snapshot),
     last_summary: peer.summary ?? null,
     last_status: "disconnected",
     last_cwd: peer.cwd ?? null,
@@ -310,9 +334,9 @@ function cleanStalePeers() {
         );
       }
 
-      // Process dead — clean up peer (after snapshot capture)
+      // Process dead — clean up peer (after snapshot capture). Messages are kept:
+      // they are addressed to the slot as well and must reach the respawned agent.
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
 
       // Release file locks held by this peer
       db.run("DELETE FROM file_locks WHERE held_by_peer = ?", [peer.id]);
@@ -350,8 +374,9 @@ function cleanStalePeers() {
   }
 }
 
+const CLEANUP_MS = parseInt(process.env.MULTIAGENTS_CLEANUP_INTERVAL_MS ?? String(CLEANUP_INTERVAL), 10);
 cleanStalePeers();
-setInterval(cleanStalePeers, CLEANUP_INTERVAL);
+setInterval(cleanStalePeers, CLEANUP_MS);
 
 // --- Prepared statements ---
 
@@ -389,12 +414,25 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
 `);
 
-const selectUndelivered = db.prepare(
-  "SELECT * FROM messages WHERE to_id = ? AND delivered = 0 AND held = 0 ORDER BY sent_at ASC"
+// A message follows the slot: a peer respawned into it receives what was addressed to its predecessor.
+const selectUnacked = db.prepare(
+  "SELECT * FROM messages WHERE (to_id = ? OR to_slot_id = ?) AND acked_at IS NULL AND held = 0 ORDER BY sent_at ASC"
+);
+
+const selectUnclaimed = db.prepare(
+  "SELECT * FROM messages WHERE (to_id = ? OR to_slot_id = ?) AND delivered = 0 AND held = 0 ORDER BY sent_at ASC"
+);
+
+const selectUnackedBySlot = db.prepare(
+  "SELECT * FROM messages WHERE to_slot_id = ? AND acked_at IS NULL AND held = 0 ORDER BY sent_at ASC"
 );
 
 const markDelivered = db.prepare(
-  "UPDATE messages SET delivered = 1, delivered_at = ? WHERE id = ?"
+  "UPDATE messages SET delivered = 1, delivered_at = COALESCE(delivered_at, ?) WHERE id = ?"
+);
+
+const markAcked = db.prepare(
+  "UPDATE messages SET acked_at = ? WHERE id = ? AND acked_at IS NULL"
 );
 
 // --- Request handlers ---
@@ -623,30 +661,47 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
     }
   }
 
-  const messages = selectUndelivered.all(body.id) as Message[];
-  const now = new Date().toISOString();
-  for (const msg of messages) {
-    markDelivered.run(now, msg.id);
-  }
-
-  return { messages };
+  const rows = (body.unclaimed_only ? selectUnclaimed : selectUnacked).all(body.id, peer?.slot_id ?? null) as Message[];
+  return { messages: handOff(rows, body.retain !== true) };
 }
 
-/** Poll undelivered messages by slot_id (for driver-managed agents without peer_id). */
-function handlePollBySlot(body: { slot_id: number; session_id?: string }): PollMessagesResponse {
+/** Poll a slot's messages (driver-managed agents have no peer id). */
+function handlePollBySlot(body: { slot_id: number; session_id?: string; retain?: boolean }): PollMessagesResponse {
   const slot = db.query("SELECT paused FROM slots WHERE id = ?").get(body.slot_id) as { paused: number } | null;
   if (slot?.paused) return { messages: [], paused: true };
 
-  const messages = db.query(
-    "SELECT * FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY sent_at ASC"
-  ).all(body.slot_id) as Message[];
+  return { messages: handOff(selectUnackedBySlot.all(body.slot_id) as Message[], body.retain !== true) };
+}
 
+/**
+ * Hand messages to a delivery mechanism. A plain poll consumes them (acked at
+ * once); a `retain` poll keeps them pollable until the client acks them itself.
+ */
+function handOff(messages: Message[], consume: boolean): Message[] {
   const now = new Date().toISOString();
   for (const msg of messages) {
-    markDelivered.run(now, msg.id);
+    if (!msg.delivered) {
+      markDelivered.run(now, msg.id);
+      msg.delivered = 1 as unknown as boolean;
+      msg.delivered_at = now;
+    }
+    if (consume) {
+      markAcked.run(now, msg.id);
+      msg.acked_at = now;
+    }
   }
+  return messages;
+}
 
-  return { messages };
+/** Mark messages as acked: they reached the model and will not be polled again. */
+function handleAckMessages(body: { ids?: unknown }): { ok: boolean; acked: number } {
+  const now = new Date().toISOString();
+  const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is number => Number.isInteger(id)) : [];
+  let acked = 0;
+  for (const id of ids) {
+    acked += markAcked.run(now, id).changes;
+  }
+  return { ok: true, acked };
 }
 
 function handleUnregister(body: { id: string }): { ok: boolean; denied?: boolean; reason?: string; task_state?: string } {
@@ -873,7 +928,12 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
       fields.push("last_connected = ?"); values.push(Date.now());
     }
   }
-  if (body.context_snapshot !== undefined) { fields.push("context_snapshot = ?"); values.push(body.context_snapshot); }
+  let snapshot = body.context_snapshot;
+  if (body.context_patch !== undefined) {
+    const current = snapshot ?? (db.query("SELECT context_snapshot FROM slots WHERE id = ?").get(body.id) as { context_snapshot: string | null } | null)?.context_snapshot;
+    snapshot = JSON.stringify({ ...parseSnapshot(current), ...body.context_patch });
+  }
+  if (snapshot !== undefined) { fields.push("context_snapshot = ?"); values.push(snapshot); }
   if (body.display_name !== undefined) { fields.push("display_name = ?"); values.push(body.display_name); }
   if (body.role !== undefined) { fields.push("role = ?"); values.push(body.role); }
   if (body.role_description !== undefined) { fields.push("role_description = ?"); values.push(body.role_description); }
@@ -1314,16 +1374,26 @@ Bun.serve({
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/poll-by-slot":
-          return Response.json(handlePollBySlot(body as { slot_id: number; session_id?: string }));
+          return Response.json(handlePollBySlot(body as { slot_id: number; session_id?: string; retain?: boolean }));
         case "/peek-undelivered": {
-          // Non-consuming: returns count, msg_types, and oldest_at (epoch ms) of undelivered messages
+          // Non-consuming: `count` covers messages not yet acked, `unclaimed_count` those no delivery mechanism has picked up
           const { slot_id } = body as { slot_id: number };
           const rows = db.query(
-            "SELECT msg_type, sent_at FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY id ASC"
-          ).all(slot_id) as { msg_type: string; sent_at: string }[];
-          const oldest_at = rows.length > 0 ? new Date(rows[0].sent_at).getTime() : 0;
-          return Response.json({ count: rows.length, msg_types: rows.map(r => r.msg_type), oldest_at });
+            "SELECT msg_type, sent_at, delivered FROM messages WHERE to_slot_id = ? AND acked_at IS NULL AND held = 0 ORDER BY id ASC"
+          ).all(slot_id) as { msg_type: string; sent_at: string; delivered: number }[];
+          const unclaimed = rows.filter((r) => !r.delivered);
+          const oldestAt = (list: typeof rows) => (list[0] ? new Date(list[0].sent_at).getTime() : 0);
+          return Response.json({
+            count: rows.length,
+            msg_types: rows.map((r) => r.msg_type),
+            oldest_at: oldestAt(rows),
+            unclaimed_count: unclaimed.length,
+            unclaimed_msg_types: unclaimed.map((r) => r.msg_type),
+            unclaimed_oldest_at: oldestAt(unclaimed),
+          });
         }
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as { ids?: unknown }));
         case "/unregister":
           return Response.json(handleUnregister(body as { id: string }));
 

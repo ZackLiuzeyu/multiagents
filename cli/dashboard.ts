@@ -8,15 +8,16 @@
 //   [4] Files — file locks and ownership
 // ============================================================================
 
-import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME, SESSION_FILE, DASHBOARD_REFRESH } from "../shared/constants.ts";
+import { SESSION_FILE, DASHBOARD_REFRESH } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import { BrokerClient, type PlanState, type PlanItem } from "../shared/broker-client.ts";
 import { formatDuration, formatTime, truncate } from "../shared/utils.ts";
 import type { Session, Slot, Peer, Message, FileLock, FileOwnership, GuardrailState, SessionFile } from "../shared/types.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 
 // Read version from package.json at startup
 let PKG_VERSION = "?";

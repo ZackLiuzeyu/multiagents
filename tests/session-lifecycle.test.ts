@@ -234,7 +234,7 @@ describe("peek-undelivered", () => {
     const peek2 = await post("/peek-undelivered", { slot_id: engineer.slot.id });
     expect(peek2.count).toBe(2);
 
-    // Now poll (consuming) — should return and mark delivered
+    // A plain poll consumes the messages (clients that ack explicitly pass retain: true)
     const poll = await post("/poll-by-slot", { slot_id: engineer.slot.id });
     expect(poll.messages.length).toBe(2);
 
