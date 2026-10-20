@@ -1,6 +1,7 @@
 # Publishes to npm through trusted publishing (OIDC): no npm token is stored
-# anywhere. The trusted publisher on npmjs.com must name this file (publish.yml)
-# and the `npm` environment.
+# anywhere. The trusted publisher on npmjs.com names this file (publish.yml) and
+# the `npm` environment, which only v* tags and main may deploy to — so no other
+# ref can mint a token npm would accept.
 name: Publish Package
 
 on:

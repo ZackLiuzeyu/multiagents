@@ -305,7 +305,8 @@ to npm through [trusted publishing](https://docs.npmjs.com/trusted-publishers/) 
 no npm token is stored in the repository or in GitHub secrets, and npm attaches a
 provenance attestation automatically. The trusted publisher on npmjs.com (package
 Settings → Trusted publishing) must name the `zetbrush/multiagents` repository, the
-`publish.yml` workflow and the `npm` environment. The same workflow can be run by hand
+`publish.yml` workflow and the `npm` environment; that GitHub environment only lets `v*`
+tags and `main` deploy, so no other ref can obtain a token npm accepts. The same workflow can be run by hand
 from the Actions tab with "dry run" enabled to validate the package without publishing.
 Every pull request runs `.github/workflows/ci.yml` (`bun install --frozen-lockfile`,
 `bunx tsc --noEmit`, `bun test`).
