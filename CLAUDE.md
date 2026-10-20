@@ -71,6 +71,13 @@ Default to using Bun instead of Node.js.
 - Prefer `Bun.file` over `node:fs`'s readFile/writeFile
 - Bun.$`ls` instead of execa.
 
+## Releasing
+
+`bun run version:<patch|minor|major>` bumps package.json and creates the `vX.Y.Z` commit and tag;
+`git push && git push --tags` makes `.github/workflows/publish.yml` test and publish to npm via
+trusted publishing (OIDC — no token in the repo or secrets; the publisher on npmjs.com names
+`publish.yml` and the `npm` environment). Pull requests run `.github/workflows/ci.yml`.
+
 ## Testing
 
 Use `bun test` to run tests. `tests/launcher.test.ts` writes the global `~/.codex/config.toml` /

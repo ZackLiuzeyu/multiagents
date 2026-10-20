@@ -1,0 +1,51 @@
+# Publishes to npm through trusted publishing (OIDC): no npm token is stored
+# anywhere. The trusted publisher on npmjs.com must name this file (publish.yml)
+# and the `npm` environment.
+name: Publish Package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Pack and validate without publishing
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - name: Use an npm that supports trusted publishing (11.5.1 or later)
+        run: |
+          npm install -g npm@latest
+          npm --version
+      - name: The tag must match package.json
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(bun -p "require('./package.json').version")"
+          [ "$tag" = "$version" ] || { echo "tag v$tag does not match package.json version $version"; exit 1; }
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - name: Dry run
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: npm publish --ignore-scripts --dry-run
+      - name: Publish
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        run: npm publish --ignore-scripts

@@ -293,7 +293,24 @@ multiagents/
 
 ## Process Lifecycle
 
-### Graceful Shutdown
+### Releasing
+
+```bash
+bun run version:minor      # bumps package.json, commits "release: vX.Y.Z", tags vX.Y.Z
+git push && git push --tags
+```
+
+The tag triggers `.github/workflows/publish.yml`, which runs the test suite and publishes
+to npm through [trusted publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC):
+no npm token is stored in the repository or in GitHub secrets, and npm attaches a
+provenance attestation automatically. The trusted publisher on npmjs.com (package
+Settings → Trusted publishing) must name the `zetbrush/multiagents` repository, the
+`publish.yml` workflow and the `npm` environment. The same workflow can be run by hand
+from the Actions tab with "dry run" enabled to validate the package without publishing.
+Every pull request runs `.github/workflows/ci.yml` (`bun install --frozen-lockfile`,
+`bunx tsc --noEmit`, `bun test`).
+
+## Graceful Shutdown
 - **Broker** (`SIGINT`/`SIGTERM`): kills all registered peer processes, closes SQLite cleanly
 - **Orchestrator** (`SIGINT`/`SIGTERM`): kills all managed agent processes and CodexDriver instances
 - **Adapters** (`SIGINT`/`SIGTERM`): unregister from broker, release file locks

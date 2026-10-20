@@ -59,4 +59,4 @@ Bun.spawnSync(["git", "commit", "-m", `release: ${tag}`], { cwd: ROOT });
 Bun.spawnSync(["git", "tag", "-a", tag, "-m", `Release ${tag}`], { cwd: ROOT });
 
 console.log(`Committed and tagged: ${tag}`);
-console.log(`To publish: git push && git push --tags && bun publish`);
+console.log(`To publish: git push && git push --tags  (the tag triggers .github/workflows/publish.yml)`);
