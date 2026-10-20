@@ -17,6 +17,14 @@ function fakeBroker() {
   return { broker, updates };
 }
 
+async function untilUpdates(updates: unknown[], count: number): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (updates.length < count) {
+    if (Date.now() > deadline) throw new Error(`expected ${count} slot update(s), saw ${updates.length}`);
+    await Bun.sleep(5);
+  }
+}
+
 const tokenUpdates = (updates: Array<Record<string, unknown>>) => updates.filter((u) => u.input_tokens !== undefined);
 
 describe("processEvent — Claude stream-json", () => {
@@ -92,7 +100,7 @@ describe("monitorCodexDriver — app-server notifications", () => {
     monitorCodexDriver(driver, 4245, "session-a", broker, () => {});
     emit("thread/tokenUsage/updated", { tokenUsage: { total: { inputTokens: 1000, outputTokens: 200, cachedInputTokens: 50 } } });
     emit("thread/tokenUsage/updated", { tokenUsage: { total: { inputTokens: 1600, outputTokens: 260, cachedInputTokens: 50 } } });
-    await Bun.sleep(20);
+    await untilUpdates(updates, 2);
 
     expect(tokenUpdates(updates)).toEqual([
       { id: 4245, input_tokens: 1000, output_tokens: 200, cache_read_tokens: 50 },
@@ -105,7 +113,7 @@ describe("monitorCodexDriver — app-server notifications", () => {
     const { driver, emit } = fakeDriver();
     monitorCodexDriver(driver, 4246, "session-a", broker, () => {});
     emit("item/completed", { item: { type: "agentMessage", text: "Tests are green." } });
-    await Bun.sleep(20);
+    await untilUpdates(updates, 1);
 
     const patch = updates.find((u) => u.context_patch !== undefined);
     expect((patch!.context_patch as Record<string, unknown>).last_summary).toBe("Tests are green.");

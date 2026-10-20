@@ -130,11 +130,12 @@ describe("CodexDriver thread status and items", () => {
   test("tracks thread/status/changed and in-flight items", async () => {
     const { driver, dir } = await spawnFake();
     const first = await driver.startSession({ prompt: "warm up", cwd: dir });
-    expect(driver.threadStatus).toBe("idle");
+    // thread/status/changed is its own notification and may land after turn/completed
+    await waitFor(() => driver.threadStatus === "idle");
 
     const slow = driver.reply(first.threadId, "SCENARIO:slow:1200");
     await waitFor(() => driver.activeItems === 1);
-    expect(driver.threadStatus).toBe("active");
+    await waitFor(() => driver.threadStatus === "active");
     await slow;
     expect(driver.activeItems).toBe(0);
     await waitFor(() => driver.threadStatus === "idle");

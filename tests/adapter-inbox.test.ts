@@ -45,6 +45,14 @@ function scriptedBroker() {
   return { broker, polls, acked, failNextAcks: (n: number) => { failAcks = n; } };
 }
 
+async function untilPolls(polls: unknown[], count: number): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (polls.length < count) {
+    if (Date.now() > deadline) throw new Error(`expected ${count} poll(s), saw ${polls.length}`);
+    await Bun.sleep(5);
+  }
+}
+
 function adapterWith(broker: unknown): StubAdapter {
   const adapter = new StubAdapter();
   (adapter as any).myId = "cl-me";
@@ -58,9 +66,9 @@ describe("BaseAdapter inbox", () => {
     const adapter = adapterWith(broker);
 
     const loop = adapter.poll();
-    await Bun.sleep(5);
+    await untilPolls(polls, 1);
     const check = adapter.check();
-    await Bun.sleep(5);
+    await untilPolls(polls, 1);
     expect(polls).toHaveLength(1);
     polls[0]!.resolve([message(1, "review auth.ts")]);
 
@@ -78,14 +86,14 @@ describe("BaseAdapter inbox", () => {
     const adapter = adapterWith(broker);
 
     const first = adapter.check();
-    await Bun.sleep(5);
+    await untilPolls(polls, 1);
     polls[0]!.resolve([message(7, "first copy")]);
     const firstResult = await first;
     expect(firstResult.content[0]!.text).toContain("first copy");
     expect(acked).toEqual([[7]]);
 
     const loop = adapter.poll();
-    await Bun.sleep(5);
+    await untilPolls(polls, 2);
     polls[1]!.resolve([message(7, "first copy")]);
     await loop;
 
@@ -100,13 +108,13 @@ describe("BaseAdapter inbox", () => {
     failNextAcks(1);
 
     const check = adapter.check();
-    await Bun.sleep(5);
+    await untilPolls(polls, 1);
     polls[0]!.resolve([message(3, "flaky ack")]);
     expect((await check).content[0]!.text).toContain("flaky ack");
     expect(acked).toEqual([]);
 
     const loop = adapter.poll();
-    await Bun.sleep(5);
+    await untilPolls(polls, 2);
     polls[1]!.resolve([message(3, "flaky ack")]);
     await loop;
 
@@ -118,7 +126,7 @@ describe("BaseAdapter inbox", () => {
     const { broker, polls } = scriptedBroker();
     const adapter = adapterWith(broker);
     const loop = adapter.poll();
-    await Bun.sleep(5);
+    await untilPolls(polls, 1);
     expect(polls[0]!.opts).toMatchObject({ retain: true });
     polls[0]!.resolve([]);
     await loop;
@@ -130,7 +138,7 @@ describe("BaseAdapter inbox", () => {
     (adapter as any).driverMode = true;
 
     const check = adapter.check();
-    await Bun.sleep(5);
+    await untilPolls(polls, 1);
     expect(polls[0]!.opts).toMatchObject({ unclaimedOnly: true });
     expect((polls[0]!.opts as { retain?: boolean }).retain).not.toBe(true);
     polls[0]!.resolve([message(9, "unclaimed")]);
@@ -138,7 +146,7 @@ describe("BaseAdapter inbox", () => {
     expect(acked).toEqual([]);
 
     const again = adapter.check();
-    await Bun.sleep(5);
+    await untilPolls(polls, 2);
     polls[1]!.resolve([message(9, "unclaimed")]);
     expect((await again).content[0]!.text).toBe("No new messages.");
   });

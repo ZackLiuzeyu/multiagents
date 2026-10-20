@@ -94,8 +94,23 @@ async function spawnAgent(agentType: "claude" | "codex" | "gemini", extraEnv: Re
   const send = (text: string, msg_type = "chat") =>
     post("/send-message", { from_id: sender.id, to_id: peerId, text, msg_type, session_id: sessionId });
   const unacked = async () => (await post("/peek-undelivered", { slot_id: slot.id })).count as number;
+  /** Wait until the adapter's poll loop has picked everything up (it ticks every 0.3–1 s). */
+  const claimed = async () => {
+    const deadline = Date.now() + 10_000;
+    while ((await post("/peek-undelivered", { slot_id: slot.id })).unclaimed_count > 0) {
+      if (Date.now() > deadline) throw new Error("adapter never claimed the message");
+      await Bun.sleep(100);
+    }
+  };
+  const pushed = async (count: number) => {
+    const deadline = Date.now() + 10_000;
+    while (client.notifications.filter((n) => n.method === "notifications/claude/channel").length < count) {
+      if (Date.now() > deadline) throw new Error(`expected ${count} channel notification(s)`);
+      await Bun.sleep(100);
+    }
+  };
 
-  return { client, sessionId, slot, peerId, send, unacked };
+  return { client, sessionId, slot, peerId, send, unacked, claimed, pushed };
 }
 
 describe("tool-result delivery", () => {
@@ -103,7 +118,7 @@ describe("tool-result delivery", () => {
     test(`${agentType}: a teammate message is piggybacked onto the next tool result and acked`, async () => {
       const agent = await spawnAgent(agentType);
       await agent.send("please review auth.ts");
-      await Bun.sleep(1500);
+      await agent.claimed();
 
       const result = await agent.client.callTool("set_summary", { summary: "working" });
       expect(result.text).toContain("please review auth.ts");
@@ -130,7 +145,7 @@ describe("tool-result delivery", () => {
   test("claude: the channel notification is still pushed as best-effort", async () => {
     const agent = await spawnAgent("claude");
     await agent.send("channel me");
-    await Bun.sleep(1500);
+    await agent.pushed(1);
 
     const pushed = agent.client.notifications.filter((n) => n.method === "notifications/claude/channel");
     expect(pushed).toHaveLength(1);
