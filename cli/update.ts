@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 
 export type PackageManager = "bun" | "npm" | "pnpm" | "yarn";
-export type InstallKind = PackageManager | "source" | "unknown";
+export type InstallKind = PackageManager | "local" | "source" | "unknown";
 
 /** What the broker's /health reports; anything else answering on the port is some other service. */
 export interface BrokerHealth {
@@ -36,7 +36,7 @@ export interface UpdateDeps {
   log: (line: string) => void;
 }
 
-export type UpdateAction = "updated" | "up-to-date" | "check" | "dry-run" | "source-checkout" | "unknown-install" | "failed";
+export type UpdateAction = "updated" | "up-to-date" | "check" | "dry-run" | "source-checkout" | "local-dependency" | "unknown-install" | "failed";
 
 export interface UpdateResult {
   ok: boolean;
@@ -58,7 +58,10 @@ export function detectInstall(root: string, opts: { env: Record<string, string |
   if (where.includes("/.bun/install/global/") || (bunGlobal !== null && where.startsWith(bunGlobal))) return "bun";
   if (where.includes("/pnpm/")) return "pnpm";
   if (where.includes("/yarn/")) return "yarn";
-  if (where.includes("/node_modules/")) return "npm";
+  // npm's global prefix keeps packages under lib/node_modules (npm/node_modules on Windows);
+  // any other node_modules is a project's own dependency.
+  if (where.includes("/lib/node_modules/") || where.includes("/npm/node_modules/")) return "npm";
+  if (where.includes("/node_modules/")) return "local";
   return "unknown";
 }
 
@@ -100,7 +103,12 @@ export async function runUpdate(args: string[], deps: UpdateDeps): Promise<Updat
     deps.log(`This copy (${deps.packageRoot}) is a source checkout — update it with git pull, then bun install.`);
     return { ok: true, action: "source-checkout", kind, installed };
   };
+  const localDependency = (): UpdateResult => {
+    deps.log(`This copy (${deps.packageRoot}) is a dependency of a project; update it there with \`bun update multiagents\` or \`npm update multiagents\`.`);
+    return { ok: true, action: "local-dependency", kind, installed };
+  };
   if (kind === "source" && !check) return sourceCheckout();
+  if (kind === "local" && !check) return localDependency();
 
   let latest: string;
   try {
@@ -113,6 +121,7 @@ export async function runUpdate(args: string[], deps: UpdateDeps): Promise<Updat
   deps.log(`Installed: ${installed}   Latest: ${latest}`);
   if (check) return { ok: true, action: "check", kind, installed, latest };
   if (kind === "source") return sourceCheckout();
+  if (kind === "local") return localDependency();
   const cmp = compareVersions(installed, latest);
   if (cmp === 0) {
     deps.log(`multiagents ${installed} is already the latest version.`);
@@ -165,6 +174,21 @@ export async function runUpdate(args: string[], deps: UpdateDeps): Promise<Updat
 
   deps.log(`multiagents ${installed} → ${latest} installed. Restart open Claude Code / Codex sessions to pick up the new version.`);
   return { ok: true, action: "updated", kind, installed, latest, command, brokerRestarted };
+}
+
+/** The broker's /health within `timeoutMs`; null for no answer, a wedged server, or something that is not the broker. */
+export async function probeBrokerHealth(url: string, timeoutMs = 3000): Promise<BrokerHealth | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${url}/health`, { signal: controller.signal });
+    if (!res.ok) return null;
+    return parseBrokerHealth(await res.json());
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function parseBrokerHealth(body: unknown): BrokerHealth | null {
@@ -232,15 +256,7 @@ export function defaultUpdateDeps(): UpdateDeps {
       }
     },
     run: (cmd) => Bun.spawn(cmd, { stdio: ["inherit", "inherit", "inherit"] }).exited,
-    brokerHealth: async () => {
-      try {
-        const res = await fetch(`${brokerUrl()}/health`);
-        if (!res.ok) return null;
-        return parseBrokerHealth(await res.json());
-      } catch {
-        return null;
-      }
-    },
+    brokerHealth: () => probeBrokerHealth(brokerUrl()),
     stopBroker: async (health) => { stopBrokerProcess(health, resolveBrokerPort()); },
     log: (line) => console.log(line),
   };

@@ -5,7 +5,7 @@
  */
 
 import { test, expect, describe } from "bun:test";
-import { detectInstall, upgradeCommand, runUpdate, listeningPids, parseBrokerHealth, stopBrokerProcess, type UpdateDeps } from "../cli/update.ts";
+import { detectInstall, upgradeCommand, runUpdate, listeningPids, parseBrokerHealth, stopBrokerProcess, probeBrokerHealth, type UpdateDeps } from "../cli/update.ts";
 
 const BUN_ROOT = "/Users/me/.bun/install/global/node_modules/multiagents";
 const NPM_ROOT = "/usr/local/lib/node_modules/multiagents";
@@ -35,9 +35,15 @@ describe("detectInstall", () => {
     expect(detectInstall("/opt/bun/install/global/node_modules/multiagents", { env: { BUN_INSTALL: "/opt/bun" }, exists: () => false })).toBe("bun");
   });
 
-  test("a copy under an npm prefix is an npm install", () => {
+  test("a copy under an npm global prefix is an npm install", () => {
     expect(detectInstall(NPM_ROOT, { env: {}, exists: () => false })).toBe("npm");
     expect(detectInstall("/Users/me/.nvm/versions/node/v24.0.0/lib/node_modules/multiagents", { env: {}, exists: () => false })).toBe("npm");
+    expect(detectInstall("/opt/homebrew/lib/node_modules/multiagents", { env: {}, exists: () => false })).toBe("npm");
+    expect(detectInstall("C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\multiagents", { env: {}, exists: () => false })).toBe("npm");
+  });
+
+  test("a project's own node_modules copy is a local dependency, not a global install", () => {
+    expect(detectInstall("/Users/me/project/node_modules/multiagents", { env: {}, exists: () => false })).toBe("local");
   });
 
   test("a copy with a .git directory is a source checkout", () => {
@@ -93,8 +99,36 @@ describe("stopBrokerProcess", () => {
   });
 });
 
+describe("probeBrokerHealth", () => {
+  test("gives up on a broker that accepts the connection but never answers", async () => {
+    const port = 17912;
+    const server = Bun.serve({ port, fetch: () => new Promise<Response>(() => {}) });
+    try {
+      const started = Date.now();
+      expect(await probeBrokerHealth(`http://127.0.0.1:${port}`, 500)).toBeNull();
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("reads a healthy broker", async () => {
+    const port = 17913;
+    const server = Bun.serve({ port, fetch: () => Response.json({ status: "ok", peers: 1, pid: 4242, version: "0.6.0" }) });
+    try {
+      expect(await probeBrokerHealth(`http://127.0.0.1:${port}`, 2000)).toEqual({ peers: 1, pid: 4242, version: "0.6.0" });
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("treats a closed port as no broker", async () => {
+    expect(await probeBrokerHealth("http://127.0.0.1:17914", 2000)).toBeNull();
+  });
+});
+
 describe("listeningPids", () => {
-  test("names only the process listening on the port, never clients connected to it", async () => {
+  test.skipIf(!Bun.which("lsof"))("names only the process listening on the port, never clients connected to it", async () => {
     const port = 17909;
     const server = Bun.spawn(["bun", "-e", `Bun.serve({ port: ${port}, fetch: () => new Response("ok") })`], { stdout: "ignore", stderr: "ignore" });
     let client: { end: () => void } | null = null;
@@ -184,6 +218,22 @@ describe("runUpdate", () => {
     expect(runs).toEqual([]);
     expect(result).toMatchObject({ ok: true, action: "source-checkout", kind: "source" });
     expect(log.join("\n")).toContain("git pull");
+  });
+
+  test("a local dependency is not upgraded globally", async () => {
+    const { deps, runs, log } = fakeDeps({ packageRoot: "/Users/me/project/node_modules/multiagents" });
+    const result = await runUpdate([], deps);
+    expect(runs).toEqual([]);
+    expect(result).toMatchObject({ ok: true, action: "local-dependency", kind: "local" });
+    expect(log.join("\n")).toContain("bun update multiagents");
+    expect(log.join("\n")).toContain("npm update multiagents");
+  });
+
+  test("--check also works from a local dependency", async () => {
+    const { deps, runs } = fakeDeps({ packageRoot: "/Users/me/project/node_modules/multiagents" });
+    const result = await runUpdate(["--check"], deps);
+    expect(runs).toEqual([]);
+    expect(result).toMatchObject({ ok: true, action: "check", kind: "local", latest: "0.6.0" });
   });
 
   test("an unknown install location gets both commands instead of a guess", async () => {

@@ -339,6 +339,7 @@ Every pull request runs `.github/workflows/ci.yml` (`bun install --frozen-lockfi
 
 - [Bun](https://bun.sh/) runtime (v1.1+)
 - At least one of: Claude Code, Codex CLI, or Gemini CLI
+- `lsof` (optional; ships with macOS): used by `multiagents broker stop`, and by `multiagents update` to find a broker that does not report its pid
 
 ## License
 
