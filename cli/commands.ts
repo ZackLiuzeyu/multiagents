@@ -101,6 +101,22 @@ const COMMAND_HELP: Record<string, string> = {
 
   Example:
     multiagents install-mcp`,
+
+  "update": `multiagents update [--check] [--dry-run]
+
+  Update this installation to the latest version on npm with the package
+  manager that installed it (bun add -g or npm install -g); the install's
+  postinstall refreshes the MCP configs. An idle broker is stopped so the
+  next start runs the new version; open Claude Code / Codex sessions keep
+  the old code until they are restarted.
+
+  Options:
+    --check     Only show the installed and latest versions
+    --dry-run   Show the upgrade command without running it
+
+  Examples:
+    multiagents update
+    multiagents update --check`,
 };
 
 function printUsage(topic?: string): void {
@@ -122,6 +138,7 @@ Commands:
   status                          Broker health + peers summary
   broker start|stop|status        Manage broker daemon
   install-mcp                     Configure MCP servers
+  update [--check|--dry-run]      Update to the latest version on npm
   mcp-server [--agent-type <t>]   Run agent MCP server (internal)
   orchestrator                    Run orchestrator MCP server (internal)
   help [command]                  Show help (optionally for a specific command)
@@ -268,13 +285,12 @@ export async function runCli(args: string[]): Promise<void> {
         console.error("Broker failed to start within 6s.");
         process.exit(1);
       } else if (sub === "stop") {
-        const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-        const pids = new TextDecoder().decode(proc.stdout).trim().split("\n").filter(Boolean);
-        if (pids.length === 0) {
-          console.log("Broker is not running.");
-        } else {
-          for (const pid of pids) process.kill(parseInt(pid), "SIGTERM");
-          console.log("Broker stopped.");
+        const { stopBrokerOnPort } = await import("./update.ts");
+        try {
+          console.log(stopBrokerOnPort(BROKER_PORT).length === 0 ? "Broker is not running." : "Broker stopped.");
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          process.exit(1);
         }
       } else if (sub === "status") {
         const client = new BrokerClient(BROKER_URL);
@@ -312,6 +328,14 @@ export async function runCli(args: string[]): Promise<void> {
 
     case "orchestrator": {
       await import("../orchestrator/orchestrator-server.ts");
+      break;
+    }
+
+    case "update":
+    case "--update": {
+      const { runUpdate, defaultUpdateDeps } = await import("./update.ts");
+      const result = await runUpdate(args.slice(1), defaultUpdateDeps());
+      if (!result.ok) process.exit(1);
       break;
     }
 

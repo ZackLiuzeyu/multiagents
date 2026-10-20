@@ -47,6 +47,7 @@ bun cli.ts status
 bun cli.ts peers
 bun cli.ts send <peer-id> <message>
 bun cli.ts kill-broker
+bun cli.ts update --check   # installed vs latest; `update` upgrades with the owning package manager
 ```
 
 ## Bun

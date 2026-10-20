@@ -69,6 +69,7 @@ import type {
 const PORT = resolveBrokerPort();
 
 const DB_PATH = process.env.MULTIAGENTS_DB ?? DEFAULT_DB_PATH;
+const BROKER_VERSION = ((await Bun.file(new URL("./package.json", import.meta.url)).json()) as { version: string }).version;
 
 // Ensure parent directory exists
 const dbDir = DB_PATH.substring(0, DB_PATH.lastIndexOf("/"));
@@ -1349,7 +1350,7 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, pid: process.pid, version: BROKER_VERSION });
       }
       return new Response("multiagents broker", { status: 200 });
     }
