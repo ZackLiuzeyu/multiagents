@@ -6,10 +6,10 @@
   "type": "module",
   "private": false,
   "bin": {
-    "multiagents": "./cli.ts",
-    "multiagents-server": "./server.ts",
-    "multiagents-orch": "./orchestrator/orchestrator-server.ts",
-    "multiagents-broker": "./broker.ts"
+    "multiagents": "cli.ts",
+    "multiagents-server": "server.ts",
+    "multiagents-orch": "orchestrator/orchestrator-server.ts",
+    "multiagents-broker": "broker.ts"
   },
   "files": [
     "cli.ts",
