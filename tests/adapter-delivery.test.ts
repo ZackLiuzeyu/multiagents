@@ -94,12 +94,14 @@ async function spawnAgent(agentType: "claude" | "codex" | "gemini", extraEnv: Re
   const send = (text: string, msg_type = "chat") =>
     post("/send-message", { from_id: sender.id, to_id: peerId, text, msg_type, session_id: sessionId });
   const unacked = async () => (await post("/peek-undelivered", { slot_id: slot.id })).count as number;
-  /** Wait until the adapter's poll loop has picked everything up (it ticks every 0.3–1 s). */
-  const claimed = async () => {
+  /** Call a tool until its result carries `text`; the poll loop stages messages between calls (every 0.3–1 s). */
+  const resultCarrying = async (text: string) => {
     const deadline = Date.now() + 10_000;
-    while ((await post("/peek-undelivered", { slot_id: slot.id })).unclaimed_count > 0) {
-      if (Date.now() > deadline) throw new Error("adapter never claimed the message");
-      await Bun.sleep(100);
+    while (true) {
+      const result = await client.callTool("set_summary", { summary: "working" });
+      if (result.text.includes(text)) return result;
+      if (Date.now() > deadline) throw new Error(`no tool result carried ${JSON.stringify(text)}`);
+      await Bun.sleep(150);
     }
   };
   const pushed = async (count: number) => {
@@ -110,7 +112,7 @@ async function spawnAgent(agentType: "claude" | "codex" | "gemini", extraEnv: Re
     }
   };
 
-  return { client, sessionId, slot, peerId, send, unacked, claimed, pushed };
+  return { client, sessionId, slot, peerId, send, unacked, resultCarrying, pushed };
 }
 
 describe("tool-result delivery", () => {
@@ -118,10 +120,8 @@ describe("tool-result delivery", () => {
     test(`${agentType}: a teammate message is piggybacked onto the next tool result and acked`, async () => {
       const agent = await spawnAgent(agentType);
       await agent.send("please review auth.ts");
-      await agent.claimed();
 
-      const result = await agent.client.callTool("set_summary", { summary: "working" });
-      expect(result.text).toContain("please review auth.ts");
+      const result = await agent.resultCarrying("please review auth.ts");
       expect(result.text).toMatch(/Reviewer \(Code Reviewer\) \[id cx-[a-z0-9]+\]: please review auth\.ts/);
       expect(await agent.unacked()).toBe(0);
 
