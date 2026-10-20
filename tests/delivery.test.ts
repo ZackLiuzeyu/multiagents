@@ -24,6 +24,22 @@ function livePid(): number {
 
 const uid = (prefix = "t") => `${prefix}-${Date.now()}-${++counter}`;
 
+/** A peer process that is alive now and can be killed so the cleanup loop finds it dead. */
+function mortalPeer(): { pid: number; die: () => Promise<void> } {
+  const proc = Bun.spawn(["sleep", "600"], { stdout: "ignore", stderr: "ignore" });
+  dummies.push(proc);
+  return { pid: proc.pid, die: async () => { proc.kill("SIGKILL"); await proc.exited; } };
+}
+
+async function waitForDisconnect(slotId: number): Promise<any> {
+  for (let i = 0; i < 50; i++) {
+    const slot = await post("/slots/get", { id: slotId });
+    if (slot.status === "disconnected") return slot;
+    await Bun.sleep(100);
+  }
+  throw new Error(`slot ${slotId} was never disconnected by the cleanup loop`);
+}
+
 async function post(path: string, body: unknown): Promise<any> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
@@ -203,12 +219,14 @@ describe("messages follow the slot", () => {
     const sessionId = uid("s");
     await post("/sessions/create", { id: sessionId, name: "follow", project_dir: "/tmp/follow" });
     const slot = await post("/slots/create", { session_id: sessionId, agent_type: "gemini", display_name: "Designer", role: "UI/UX Designer" });
-    const predecessor = await post("/register", { agent_type: "gemini", pid: 2_000_000_002, cwd: "/tmp/follow", git_root: null, tty: null, summary: "", session_id: sessionId, slot_id: slot.id });
+    const predecessorProcess = mortalPeer();
+    const predecessor = await post("/register", { agent_type: "gemini", pid: predecessorProcess.pid, cwd: "/tmp/follow", git_root: null, tty: null, summary: "", session_id: sessionId, slot_id: slot.id });
     const sender = await post("/register", { agent_type: "codex", pid: livePid(), cwd: "/tmp/follow", git_root: null, tty: null, summary: "", session_id: sessionId });
-    await post("/send-message", { from_id: sender.id, to_id: predecessor.id, text: "please revisit the spec", msg_type: "feedback", session_id: sessionId });
+    const sent = await post("/send-message", { from_id: sender.id, to_id: predecessor.id, text: "please revisit the spec", msg_type: "feedback", session_id: sessionId });
+    expect(sent.ok).toBe(true);
 
-    await Bun.sleep(900);
-    expect((await post("/slots/get", { id: slot.id })).status).toBe("disconnected");
+    await predecessorProcess.die();
+    await waitForDisconnect(slot.id);
 
     const successor = await post("/register", { agent_type: "gemini", pid: livePid(), cwd: "/tmp/follow", git_root: null, tty: null, summary: "", session_id: sessionId, slot_id: slot.id });
     const polled = await post("/poll-messages", { id: successor.id, retain: true });
@@ -283,12 +301,11 @@ describe("slot context snapshot", () => {
     await post("/sessions/create", { id: sessionId, name: "snap", project_dir: "/tmp/snap" });
     const slot = await post("/slots/create", { session_id: sessionId, agent_type: "claude", display_name: "Resumable", role: "Software Engineer" });
     await post("/slots/update", { id: slot.id, context_snapshot: JSON.stringify({ claude_session_id: "sess-keep", last_summary: "mid-task" }) });
-    await post("/register", { agent_type: "claude", pid: 2_000_000_001, cwd: "/tmp/snap", git_root: null, tty: null, summary: "mid-task", session_id: sessionId, slot_id: slot.id });
+    const peerProcess = mortalPeer();
+    await post("/register", { agent_type: "claude", pid: peerProcess.pid, cwd: "/tmp/snap", git_root: null, tty: null, summary: "mid-task", session_id: sessionId, slot_id: slot.id });
 
-    await Bun.sleep(900);
-
-    const after = await post("/slots/get", { id: slot.id });
-    expect(after.status).toBe("disconnected");
+    await peerProcess.die();
+    const after = await waitForDisconnect(slot.id);
     const snapshot = JSON.parse(after.context_snapshot);
     expect(snapshot.claude_session_id).toBe("sess-keep");
     expect(snapshot.last_status).toBe("disconnected");
@@ -300,22 +317,17 @@ describe("stale peer cleanup", () => {
     const sessionId = uid("s");
     await post("/sessions/create", { id: sessionId, name: "dead", project_dir: "/tmp/dead" });
     const slot = await post("/slots/create", { session_id: sessionId, agent_type: "claude", display_name: "Ghost", role: "Software Engineer" });
-    const deadPid = 2_000_000_000;
-    let deadPidIsAlive = true;
-    try { process.kill(deadPid, 0); } catch { deadPidIsAlive = false; }
-    expect(deadPidIsAlive).toBe(false);
-
-    const ghost = await post("/register", { agent_type: "claude", pid: deadPid, cwd: "/tmp/dead", git_root: null, tty: null, summary: "", session_id: sessionId, slot_id: slot.id });
+    const ghostProcess = mortalPeer();
+    const ghost = await post("/register", { agent_type: "claude", pid: ghostProcess.pid, cwd: "/tmp/dead", git_root: null, tty: null, summary: "", session_id: sessionId, slot_id: slot.id });
     const sender = await post("/register", { agent_type: "codex", pid: livePid(), cwd: "/tmp/dead", git_root: null, tty: null, summary: "", session_id: sessionId });
-    await post("/send-message", { from_id: sender.id, to_id: ghost.id, text: "fix the failing test", msg_type: "feedback", session_id: sessionId });
+    const sent = await post("/send-message", { from_id: sender.id, to_id: ghost.id, text: "fix the failing test", msg_type: "feedback", session_id: sessionId });
+    expect(sent.ok).toBe(true);
 
-    await Bun.sleep(900);
+    await ghostProcess.die();
 
     // The cleanup loop (not list-peers) is what detaches the slot — proves it ran.
-    const slotAfter = await post("/slots/get", { id: slot.id });
-    expect(slotAfter.status).toBe("disconnected");
+    const slotAfter = await waitForDisconnect(slot.id);
     expect(slotAfter.peer_id).toBeNull();
-    expect(ghost.id).toBeTruthy();
 
     const peek = await post("/peek-undelivered", { slot_id: slot.id });
     expect(peek.count).toBe(1);
