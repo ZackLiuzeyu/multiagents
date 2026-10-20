@@ -23,7 +23,7 @@ for (const p of extraPaths) {
 }
 
 import { BrokerClient } from "../shared/broker-client.ts";
-import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import { launchAgent, detectAgent } from "../orchestrator/launcher.ts";
 import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearAllTracking } from "../orchestrator/monitor.ts";
 import { deliverPendingMessages, type DriverSlot } from "../orchestrator/delivery.ts";
@@ -32,8 +32,8 @@ import type { Subprocess } from "bun";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 const brokerClient = new BrokerClient(BROKER_URL);
 
 // Parse --timeout flag (default 5 minutes)

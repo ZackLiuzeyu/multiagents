@@ -11,19 +11,16 @@
 // ============================================================================
 
 import { BrokerClient } from "../shared/broker-client.ts";
-import {
-  DEFAULT_BROKER_PORT,
-  BROKER_HOSTNAME,
-  DASHBOARD_REFRESH,
-} from "../shared/constants.ts";
+import { DASHBOARD_REFRESH } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
 
 // --- Configuration ---
 
 const WEB_DASHBOARD_PORT = parseInt(process.env.MULTIAGENTS_WEB_PORT ?? "7900", 10);
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 const broker = new BrokerClient(BROKER_URL);
 
 // --- Session resolution (same logic as TUI) ---

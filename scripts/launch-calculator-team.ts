@@ -9,13 +9,13 @@ import { launchAgent, ensureMcpConfigs, announceNewMember } from "../orchestrato
 import { monitorProcess, monitorClaudeDriver, monitorCodexDriver, type AgentEvent } from "../orchestrator/monitor.ts";
 import { deliverPendingMessages, type DriverSlot } from "../orchestrator/delivery.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "../orchestrator/progress.ts";
-import { BROKER_HOSTNAME, DEFAULT_BROKER_PORT } from "../shared/constants.ts";
+import { brokerUrl } from "../shared/broker-url.ts";
 import { slugify, log } from "../shared/utils.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentLaunchConfig } from "../shared/types.ts";
 
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_URL = brokerUrl();
 const PROJECT_DIR = "/tmp/calculator-app";
 const SESSION_NAME = "calculator-app";
 

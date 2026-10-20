@@ -38,12 +38,11 @@ import type {
 import {
   POLL_INTERVALS,
   HEARTBEAT_INTERVAL,
-  BROKER_HOSTNAME,
-  DEFAULT_BROKER_PORT,
   BROKER_STARTUP_POLL_MS,
   BROKER_STARTUP_MAX_ATTEMPTS,
   SESSION_FILE,
 } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import {
   log as sharedLog,
   getGitRoot,
@@ -440,11 +439,8 @@ export abstract class BaseAdapter {
 
   constructor(agentType: AgentType) {
     this.agentType = agentType;
-    this.brokerPort = parseInt(
-      process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT),
-      10,
-    );
-    this.brokerUrl = `http://${BROKER_HOSTNAME}:${this.brokerPort}`;
+    this.brokerPort = resolveBrokerPort();
+    this.brokerUrl = brokerUrl();
     this.brokerScript = new URL("../broker.ts", import.meta.url).pathname;
     this.broker = new BrokerClient(this.brokerUrl);
     this.pollInterval = POLL_INTERVALS[agentType] ?? POLL_INTERVALS.custom;

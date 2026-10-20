@@ -19,13 +19,12 @@ import { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentLaunchConfig } from "../shared/types.ts";
 import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
-  DEFAULT_BROKER_PORT,
-  BROKER_HOSTNAME,
   GUARDRAIL_CHECK_INTERVAL,
   CONFLICT_CHECK_INTERVAL,
   FLAP_WINDOW_MS,
   STUCK_THRESHOLD_MS,
 } from "../shared/constants.ts";
+import { brokerUrl } from "../shared/broker-url.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
@@ -41,7 +40,7 @@ import { controlSession, broadcastToTeam, resolveTarget } from "./session-contro
 import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox } from "./supervision.ts";
 
 const LOG_PREFIX = "orchestrator";
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_URL = brokerUrl();
 
 // Track active processes per session
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
@@ -169,12 +168,15 @@ function onDriverExit(sessionId: string, slotId: number, state: DriverSlot, code
 // --- Dashboard auto-launch ---
 
 const CLI_PATH = new URL("../cli.ts", import.meta.url).pathname;
+// Tests and headless hosts run the orchestrator without terminal windows or a browser
+const DASHBOARDS_DISABLED = process.env.MULTIAGENTS_NO_DASHBOARD === "1";
 
 /**
  * Launch the TUI dashboard in a new terminal window.
  * Tries macOS Terminal.app first via `open`, falls back to detached process.
  */
 function launchDashboard(sessionId: string, projectDir: string): void {
+  if (DASHBOARDS_DISABLED) return;
   try {
     const platform = process.platform;
     if (platform === "darwin") {
@@ -209,6 +211,7 @@ const WEB_DASHBOARD_PATH = new URL("../dashboard/server.ts", import.meta.url).pa
  * Auto-opens the browser on localhost:7900.
  */
 function launchWebDashboard(sessionId: string, projectDir: string): void {
+  if (DASHBOARDS_DISABLED) return;
   try {
     const proc = Bun.spawn(["bun", WEB_DASHBOARD_PATH, sessionId], {
       cwd: projectDir,

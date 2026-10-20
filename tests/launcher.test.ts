@@ -402,6 +402,18 @@ describe("ensureMcpConfigs — session file", () => {
     expect(session.broker_port).toBe(DEFAULT_BROKER_PORT);
   });
 
+  test("session file records the broker port in effect", async () => {
+    const previous = process.env.MULTIAGENTS_PORT;
+    process.env.MULTIAGENTS_PORT = "17999";
+    try {
+      await ensureMcpConfigs(tmpDir, "test-session");
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_PORT; else process.env.MULTIAGENTS_PORT = previous;
+    }
+    const session = JSON.parse(fs.readFileSync(path.join(tmpDir, ".multiagents", "session.json"), "utf-8"));
+    expect(session.broker_port).toBe(17999);
+  });
+
   test("session file contains created_at ISO timestamp", async () => {
     await ensureMcpConfigs(tmpDir, "test-session");
 

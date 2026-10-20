@@ -3,11 +3,11 @@
 // multiagents — CLI Command Router
 // ============================================================================
 
-import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME } from "../shared/constants.ts";
+import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import { BrokerClient } from "../shared/broker-client.ts";
 
-const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+const BROKER_PORT = resolveBrokerPort();
+const BROKER_URL = brokerUrl();
 
 const COMMAND_HELP: Record<string, string> = {
   "setup": `multiagents setup

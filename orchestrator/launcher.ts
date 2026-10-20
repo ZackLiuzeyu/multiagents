@@ -14,6 +14,7 @@ import type { AgentType, AgentLaunchConfig, Slot } from "../shared/types.ts";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import { log } from "../shared/utils.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
+import { resolveBrokerPort } from "../shared/broker-url.ts";
 import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 import { getStructuredRolePractices } from "../adapters/role-practices.ts";
 import { ClaudeDriver } from "./claude-driver.ts";
@@ -251,7 +252,7 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string, ag
   const sessionFile = {
     session_id: sessionId,
     created_at: new Date().toISOString(),
-    broker_port: DEFAULT_BROKER_PORT,
+    broker_port: resolveBrokerPort(),
   };
   await Bun.write(sessionFilePath, JSON.stringify(sessionFile, null, 2));
 
@@ -441,8 +442,8 @@ export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boo
 
 /** The broker port agents must use when it is not the default one. */
 function brokerPortOverride(): string | null {
-  const port = process.env.MULTIAGENTS_PORT?.trim();
-  return port && port !== String(DEFAULT_BROKER_PORT) ? port : null;
+  const port = resolveBrokerPort();
+  return port === DEFAULT_BROKER_PORT ? null : String(port);
 }
 
 /** System prompt appended to Claude's defaults: the full team protocol and role practices. */

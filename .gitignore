@@ -21,3 +21,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Scratch project created by tests/e2e-team.ts
+.e2e-test-workspace/

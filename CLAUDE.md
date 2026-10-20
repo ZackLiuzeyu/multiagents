@@ -33,11 +33,14 @@ claude --dangerously-load-development-channels server:multiagents
 # Channel push only renders in interactive sessions started with the flag; headless
 # `-p` sessions drop it. Messages still arrive inside the next tool result.
 
-# Env knobs: MULTIAGENTS_PORT (broker port, forwarded to spawned agents),
+# Env knobs: MULTIAGENTS_PORT (broker port; every component resolves it through
+# shared/broker-url.ts and the orchestrator forwards it to spawned agents — an
+# invalid value falls back to the default with a warning),
 # MULTIAGENTS_CLAUDE_MODEL (model for driver-launched Claude agents),
 # MULTIAGENTS_CLAUDE_COMMAND / MULTIAGENTS_CODEX_COMMAND (override the CLI binaries),
-# MULTIAGENTS_CLEANUP_INTERVAL_MS (broker stale-peer sweep), MULTIAGENTS_LIVE_TESTS=1
-# (run tests/live-claude.test.ts against the real `claude`, costs API usage).
+# MULTIAGENTS_CLEANUP_INTERVAL_MS (broker stale-peer sweep), MULTIAGENTS_NO_DASHBOARD=1
+# (orchestrator opens no terminal/web dashboards — tests, headless hosts),
+# MULTIAGENTS_LIVE_TESTS=1 (run the live tests against the real CLIs, costs API usage).
 
 # CLI:
 bun cli.ts status

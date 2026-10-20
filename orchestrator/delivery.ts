@@ -16,9 +16,9 @@ const LOG_PREFIX = "delivery";
 
 export type DriverSlot =
   | { kind: "codex"; driver: CodexDriver; threadId: string | null; busy: boolean; lastNudge: number; releasedAt?: number }
-  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number };
+  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number; inflight?: Set<number> };
 
-export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "steered" | "replied" | "sent" | "failed";
+export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "in_flight" | "steered" | "replied" | "sent" | "failed";
 
 type SenderInfo = { display_name: string | null; role: string | null };
 
@@ -54,26 +54,14 @@ export async function deliverPendingMessages(
   if (state.busy) return "busy";
 
   const poll = await brokerClient.pollBySlot(slotId, { retain: true });
-  const messages = poll.messages ?? [];
-  if (messages.length === 0) return "none";
+  const pending = poll.messages ?? [];
+  if (pending.length === 0) return "none";
 
-  const prompt = buildForwardingPrompt(formatForwardedMessages(messages, await senderMap(sessionId, brokerClient)));
-  const ids = messages.map((m) => m.id);
-  log(LOG_PREFIX, `Forwarding ${messages.length} message(s) to ${state.kind} slot ${slotId}`);
+  if (state.kind === "claude") return deliverToClaude(sessionId, slotId, state, pending, brokerClient);
 
-  if (state.kind === "claude") {
-    // Claude Code queues stdin messages and reads them at the next tool-call
-    // boundary; it echoes a message only then, so the echo is not awaited here —
-    // waiting for it would re-send messages during long tool calls.
-    try {
-      await state.driver.send(prompt, { awaitEcho: false });
-    } catch (err) {
-      log(LOG_PREFIX, `Claude slot ${slotId} send failed: ${err instanceof Error ? err.message : String(err)}`);
-      return "failed";
-    }
-    await ack(brokerClient, ids);
-    return "sent";
-  }
+  const prompt = buildForwardingPrompt(formatForwardedMessages(pending, await senderMap(sessionId, brokerClient)));
+  const ids = pending.map((m) => m.id);
+  log(LOG_PREFIX, `Forwarding ${pending.length} message(s) to codex slot ${slotId}`);
 
   if (state.driver.activeTurnId) {
     try {
@@ -108,6 +96,39 @@ export async function deliverPendingMessages(
       state.busy = false;
     });
   return "replied";
+}
+
+/**
+ * Claude reads queued stdin at its next tool-call boundary and echoes a message
+ * only then — minutes later during a long tool call. The ack waits for that
+ * echo; meanwhile the ids are in flight so no tick writes them again, and a
+ * host that exits first leaves them unacked for its successor.
+ */
+async function deliverToClaude(
+  sessionId: string,
+  slotId: number,
+  state: Extract<DriverSlot, { kind: "claude" }>,
+  pending: Message[],
+  brokerClient: BrokerClient,
+): Promise<DeliveryOutcome> {
+  const inflight = (state.inflight ??= new Set<number>());
+  const messages = pending.filter((m) => !inflight.has(m.id));
+  if (messages.length === 0) return "in_flight";
+
+  const prompt = buildForwardingPrompt(formatForwardedMessages(messages, await senderMap(sessionId, brokerClient)));
+  const ids = messages.map((m) => m.id);
+  if (!state.driver.alive) return "dead";
+  log(LOG_PREFIX, `Forwarding ${messages.length} message(s) to claude slot ${slotId}`);
+
+  for (const id of ids) inflight.add(id);
+  state.driver.send(prompt, { echoTimeoutMs: Infinity })
+    .then(async (echoed) => {
+      if (echoed) await ack(brokerClient, ids);
+      else log(LOG_PREFIX, `Claude slot ${slotId} exited before reading ${ids.length} message(s) — left for its successor`);
+    })
+    .catch((err) => log(LOG_PREFIX, `Claude slot ${slotId} send failed (messages stay unacked): ${err instanceof Error ? err.message : String(err)}`))
+    .finally(() => { for (const id of ids) inflight.delete(id); });
+  return "sent";
 }
 
 async function ack(brokerClient: BrokerClient, ids: number[]): Promise<void> {

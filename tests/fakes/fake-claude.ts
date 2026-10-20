@@ -40,7 +40,7 @@ function announceInit(): void {
 }
 
 const queue: any[] = [];
-let absorbed: string[] = [];
+let absorbed: any[] = [];
 let inTurn = false;
 let ended = false;
 let turns = 0;
@@ -52,9 +52,16 @@ function contentText(message: any): string {
   return "";
 }
 
+// Like the real host, a message is echoed when it is read: at the start of the
+// turn it begins, or at the next tool-call boundary when it arrived mid-turn.
+function echo(msg: any): void {
+  if (replay) out({ type: "user", message: msg.message, session_id: sessionId, parent_tool_use_id: null, isReplay: true });
+}
+
 async function runTurn(msg: any): Promise<void> {
   inTurn = true;
   turns++;
+  echo(msg);
   const text = contentText(msg.message);
   out({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `working on: ${text}` }] } });
 
@@ -63,13 +70,14 @@ async function runTurn(msg: any): Promise<void> {
     out({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: `sleep ${sleep[1]}` } }] } });
     await new Promise((r) => setTimeout(r, parseInt(sleep[1]!, 10)));
     out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] } });
+    for (const m of absorbed) echo(m);
   }
 
   if (process.env.FAKE_CLAUDE_CRASH === "mid-turn") {
     process.exit(3);
   }
 
-  const summary = `done: ${text}${absorbed.length > 0 ? ` | absorbed:${absorbed.join("|")}` : ""}`;
+  const summary = `done: ${text}${absorbed.length > 0 ? ` | absorbed:${absorbed.map((m) => contentText(m.message)).join("|")}` : ""}`;
   absorbed = [];
   out({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: summary }] } });
   out({
@@ -104,9 +112,8 @@ process.stdin.on("data", (chunk) => {
     if (msg.type !== "user") continue;
     announceInit();
     if (process.env.FAKE_CLAUDE_CRASH === "after-init") process.exit(3);
-    if (replay) out({ type: "user", message: msg.message, session_id: sessionId, parent_tool_use_id: null, isReplay: true });
     if (inTurn) {
-      absorbed.push(contentText(msg.message));
+      absorbed.push(msg);
     } else {
       queue.push(msg);
       void pump();

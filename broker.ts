@@ -13,7 +13,6 @@
 import { Database } from "bun:sqlite";
 import { normalize } from "node:path";
 import {
-  DEFAULT_BROKER_PORT,
   DEFAULT_DB_PATH,
   DEFAULT_LOCK_TIMEOUT_MS,
   MAX_LOCK_TIMEOUT_MS,
@@ -22,6 +21,7 @@ import {
   CLEANUP_INTERVAL,
 } from "./shared/constants.ts";
 import { generatePeerId } from "./shared/utils.ts";
+import { resolveBrokerPort } from "./shared/broker-url.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -66,7 +66,7 @@ import type {
 
 // --- Configuration ---
 
-const PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
+const PORT = resolveBrokerPort();
 
 const DB_PATH = process.env.MULTIAGENTS_DB ?? DEFAULT_DB_PATH;
 

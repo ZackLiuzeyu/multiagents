@@ -1,6 +1,18 @@
 import type { Subprocess } from "bun";
+import * as fs from "node:fs";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
+
+async function drainStderr(proc: Subprocess<"pipe", "pipe", "pipe">, logPath?: string): Promise<void> {
+  const reader = proc.stderr.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (logPath) fs.appendFileSync(logPath, Buffer.from(value));
+    }
+  } catch { /* process gone */ }
+}
 
 /**
  * Minimal MCP client over stdio for driving a real adapter process in tests
@@ -16,8 +28,10 @@ export class McpStdioClient {
     this.readLoop();
   }
 
-  static async spawn(cmd: string[], opts: { cwd: string; env: Record<string, string | undefined> }): Promise<McpStdioClient> {
+  /** `stderrLog` keeps the server's stderr in a file; it is always drained so a chatty server cannot block on a full pipe. */
+  static async spawn(cmd: string[], opts: { cwd: string; env: Record<string, string | undefined>; stderrLog?: string }): Promise<McpStdioClient> {
     const proc = Bun.spawn(cmd, { cwd: opts.cwd, env: opts.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    void drainStderr(proc, opts.stderrLog);
     const client = new McpStdioClient(proc);
     await client.request("initialize", {
       protocolVersion: "2025-06-18",

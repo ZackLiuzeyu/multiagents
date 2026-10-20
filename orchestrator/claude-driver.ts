@@ -202,8 +202,9 @@ export class ClaudeDriver {
    * Write a user message. The first message also waits for the session's init
    * event. Resolves true once the host echoed the message back — Claude echoes
    * it when it reads it, which during a long tool call can be much later — or
-   * false if no echo arrived within the grace period; with `awaitEcho: false`
-   * it resolves right after the write. Throws if the process is gone or never
+   * false if no echo arrived within `echoTimeoutMs` (`Infinity` waits for the
+   * echo or the exit) or the host exited first; with `awaitEcho: false` it
+   * resolves right after the write. Throws if the process is gone or never
    * initializes.
    */
   async send(text: string, opts: { priority?: "next" | "later" | "now"; echoTimeoutMs?: number; awaitEcho?: boolean } = {}): Promise<boolean> {
@@ -223,13 +224,16 @@ export class ClaudeDriver {
 
     if (!this._sessionId) await this.waitForInit();
 
-    setTimeout(() => {
-      const idx = this._awaitingEcho.indexOf(entry);
-      if (idx !== -1) {
-        this._awaitingEcho.splice(idx, 1);
-        settle(false);
-      }
-    }, opts.echoTimeoutMs ?? 10_000);
+    const echoTimeoutMs = opts.echoTimeoutMs ?? 10_000;
+    if (Number.isFinite(echoTimeoutMs)) {
+      setTimeout(() => {
+        const idx = this._awaitingEcho.indexOf(entry);
+        if (idx !== -1) {
+          this._awaitingEcho.splice(idx, 1);
+          settle(false);
+        }
+      }, echoTimeoutMs);
+    }
     if (opts.awaitEcho === false) return true;
     return echoed;
   }

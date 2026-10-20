@@ -117,7 +117,7 @@ describe("formatForwardedMessages", () => {
 });
 
 describe("Claude driver delivery", () => {
-  test("pending messages are written to the session as one user message and acked once written", async () => {
+  test("pending messages are written to the session as one user message and acked once the host echoes them", async () => {
     const { sessionId, slot, send, unacked } = await slotWithSender("claude");
     const { driver, stdinTexts } = await fakeClaude();
     await send("use port 8080");
@@ -126,11 +126,51 @@ describe("Claude driver delivery", () => {
 
     expect(await deliverPendingMessages(sessionId, slot.id, state, brokerClient)).toBe("sent");
 
+    await waitFor(() => stdinTexts().length === 1);
     const texts = stdinTexts();
-    expect(texts).toHaveLength(1);
     expect(texts[0]!).toContain("use port 8080");
     expect(texts[0]!).toMatch(/\[feedback\] Reviewer \(Code Reviewer\) \[id cx-[a-z0-9]+\]: and add tests/);
-    expect(await unacked()).toBe(0);
+    await waitFor(async () => (await unacked()) === 0);
+  });
+
+  test("messages stay in flight until the host reads them and are not written again meanwhile", async () => {
+    const { sessionId, slot, send, unacked } = await slotWithSender("claude");
+    const { driver, stdinTexts } = await fakeClaude();
+    await driver.send("SLEEP:1500", { awaitEcho: false });
+    await waitFor(() => driver.busy);
+    await send("while you were busy");
+    const state: DriverSlot = { kind: "claude", driver, busy: false, lastNudge: 0 };
+
+    expect(await deliverPendingMessages(sessionId, slot.id, state, brokerClient)).toBe("sent");
+    expect(await unacked()).toBe(1);
+    expect(await deliverPendingMessages(sessionId, slot.id, state, brokerClient)).toBe("in_flight");
+    expect(stdinTexts().filter((t) => t.includes("while you were busy"))).toHaveLength(1);
+
+    await waitFor(async () => (await unacked()) === 0);
+    expect(await deliverPendingMessages(sessionId, slot.id, state, brokerClient)).toBe("none");
+  });
+
+  test("a host that exits before reading a message leaves it for its successor", async () => {
+    const { sessionId, slot, send, unacked, log } = await slotWithSender("claude");
+    const { driver } = await fakeClaude();
+    await driver.send("SLEEP:5000", { awaitEcho: false });
+    await waitFor(() => driver.busy);
+    await send("did you get this?");
+    const state: DriverSlot = { kind: "claude", driver, busy: false, lastNudge: 0 };
+    expect(await deliverPendingMessages(sessionId, slot.id, state, brokerClient)).toBe("sent");
+
+    driver.process.kill("SIGKILL");
+    await driver.process.exited;
+    await Bun.sleep(50);
+    expect(await unacked()).toBe(1);
+    expect((await log())[0]!.acked_at).toBeNull();
+
+    const successor = await fakeClaude();
+    const next: DriverSlot = { kind: "claude", driver: successor.driver, busy: false, lastNudge: 0 };
+    expect(await deliverPendingMessages(sessionId, slot.id, next, brokerClient)).toBe("sent");
+    await waitFor(() => successor.stdinTexts().length === 1);
+    expect(successor.stdinTexts()[0]!).toContain("did you get this?");
+    await waitFor(async () => (await unacked()) === 0);
   });
 
   test("nothing pending is a no-op", async () => {
