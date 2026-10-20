@@ -211,7 +211,7 @@ Session monitoring stats and enforced limits:
 | Messages Per Agent | Monitor | Per agent | Observe |
 | Longest Idle | Monitor | Per agent | Observe |
 
-Adjustable from the TUI dashboard (+/- keys), the web dashboard, or the `adjust_guardrail` tool.
+Adjustable from the TUI dashboard (+/- keys) or via the `adjust_guardrail` tool; the web dashboard shows them read-only (its `/api/guardrail` endpoint exists but has no UI yet).
 
 ## Web Dashboard
 
