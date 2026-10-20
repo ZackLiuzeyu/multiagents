@@ -237,6 +237,17 @@ describe("messages follow the slot", () => {
   });
 });
 
+describe("health", () => {
+  test("reports the broker's pid and version so an updater can restart it without lsof", async () => {
+    const health = (await (await fetch(`${BROKER_URL}/health`)).json()) as { status: string; peers: number; pid: number; version: string };
+    const pkg = await Bun.file(new URL("../package.json", import.meta.url)).json();
+    expect(health.status).toBe("ok");
+    expect(typeof health.peers).toBe("number");
+    expect(health.pid).toBe(brokerProc!.pid);
+    expect(health.version).toBe(pkg.version);
+  });
+});
+
 describe("schema", () => {
   test("a fresh database gets the slot token columns on first start", async () => {
     const { slotA } = await sessionWithTwoPeers();

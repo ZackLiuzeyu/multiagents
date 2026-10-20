@@ -246,6 +246,7 @@ multiagents peers                     List connected agents
 multiagents status                    Broker health + peers
 multiagents broker start|stop|status  Manage broker daemon
 multiagents install-mcp               Configure MCP servers
+multiagents update [--check|--dry-run] Update to the latest version on npm
 multiagents help [command]            Detailed help
 ```
 
