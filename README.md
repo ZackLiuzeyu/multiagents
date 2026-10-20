@@ -14,7 +14,7 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 │ Claude Code  │     │  Codex CLI  │     │ Gemini CLI  │
 │ (Engineer)   │     │ (Reviewer)  │     │ (Designer)  │
 └──────┬───────┘     └──────┬──────┘     └──────┬──────┘
-       │   MCP (stdio)      │  CodexDriver       │
+       │ ClaudeDriver + MCP │ CodexDriver + MCP  │ MCP (stdio)
        └────────────┬───────┴────────────────────┘
                     │
             ┌───────▼────────┐
@@ -23,9 +23,9 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
             └───────┬────────┘
                     │
             ┌───────▼────────┐
-            │  Orchestrator   │  MCP server for Claude Desktop
-            │  (team manager) │  Spawns agents, forwards messages,
-            └────────────────┘  monitors progress, auto-restarts
+            │  Orchestrator   │  MCP server for Claude Code (or Claude Desktop)
+            │  (team manager) │  Spawns agents, delivers messages,
+            └────────────────┘  monitors progress, respawns crashes
 ```
 
 - **Peer discovery**: agents find each other via `list_peers`
@@ -36,9 +36,10 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 - **Review loops**: `signal_done → submit_feedback → fix → re-review → approve`
 - **Shared knowledge**: persistent key-value store for architectural decisions, discovered patterns, and project context — prevents context drift across agents
 - **Persistent sessions**: survive agent restarts, full message history
-- **TUI dashboard**: real-time monitoring with 5 tabs (agents, messages, stats, plan, files)
-- **Auto-restart**: crashed agents respawn with handoff context
-- **Graceful shutdown**: broker and orchestrator kill all managed processes on exit
+- **Dashboards**: a web dashboard on `localhost:7900` with live WebSocket updates and a 5-tab TUI
+- **Auto-restart**: crashed agents respawn with handoff context — a Claude agent resumes its session, a Codex agent its thread
+- **Graceful shutdown**: released agents are closed once idle; broker and orchestrator kill all managed processes on exit
+- **Self-update**: `multiagents update` upgrades the installation with whichever package manager installed it
 
 ## Quick Start
 
@@ -53,22 +54,25 @@ multiagents setup
 
 # Monitor
 multiagents dashboard
+
+# Later: upgrade to the latest release
+multiagents update
 ```
 
-### From Claude Desktop (Orchestrator)
+### From Claude Code (Orchestrator)
 
-Ask Claude to create a team:
+`multiagents setup` registers two MCP servers in Claude Code (`~/.claude.json`): `multiagents` (the agent tools) and `multiagents-orch` (the orchestrator). Claude Desktop or any other MCP client can run the orchestrator too (`multiagents orchestrator`). Ask Claude to create a team:
 
 > "Create a team of 3 agents: a Claude engineer, a Codex reviewer, and a Gemini designer.
 > Build a calculator web app in TypeScript."
 
-The orchestrator handles everything: spawning agents, assigning roles, creating slots, launching the dashboard, and forwarding messages between agents.
+The orchestrator handles everything: spawning agents, assigning roles, creating slots, launching the dashboards, delivering messages between agents, and respawning agents that crash.
 
 ## Agent Support
 
 | Agent | Delivery Mechanism | Latency | Config |
 |-------|-------------------|---------|--------|
-| Claude Code | ClaudeDriver (`claude -p --input-format stream-json`): messages injected as user messages, read mid-turn. Interactive sessions additionally get channel notifications. | ≤3s | `~/.claude/settings.json` |
+| Claude Code | ClaudeDriver (`claude -p --input-format stream-json`): messages written as user messages, read mid-turn. Interactive sessions additionally get channel notifications. | ≤3s | `~/.claude.json` (driver-launched agents get an inline `--mcp-config`) |
 | Codex CLI | CodexDriver (`codex app-server`): `turn/steer` mid-turn, new turn when idle | <3s mid-turn, 3-9s between turns | `~/.codex/config.toml` |
 | Gemini CLI | Prepended to MCP tool results + file inbox | next tool call | `~/.gemini/settings.json` |
 
@@ -81,11 +85,15 @@ Codex CLI uses the **app-server protocol** — a JSON-RPC stdio interface with t
 1. Spawns a persistent `codex app-server` process with JSON-RPC handshake
 2. Creates a thread (`thread/start`) and drives turns (`turn/start`) for task execution
 3. Injects messages mid-turn via `turn/steer` — no waiting for the current turn to finish
-4. Interrupts stuck turns via `turn/interrupt` when agents go idle for >60s
-5. Auto-approves all server-initiated requests (command execution, file changes, MCP elicitations)
-6. Tracks token usage from `turn/completed` notifications
+4. Interrupts a turn that has produced nothing for >60s with no command running (`turn/interrupt`) and asks the agent to signal done
+5. Answers server-initiated requests unattended: command execution, file changes and permission requests are approved for the session; elicitations and user-input questions are declined; dynamic tool calls are refused
+6. Reads token usage from `thread/tokenUsage/updated` (cumulative per thread) and, after a crash, resumes the same thread (`thread/resume`)
 
-The orchestrator **drives Codex turns**: the forwarding loop polls the broker every 3s. If Codex has an active turn, messages are steered in instantly. If idle, a new turn is started via `driver.reply()`.
+The orchestrator **drives Codex turns**: the delivery loop polls the broker every 3s. If Codex has an active turn, messages are steered in and acked at once. If idle, a new turn is started via `driver.reply()` and the messages are acked when it completes.
+
+### Claude Integration (ClaudeDriver)
+
+Headless `claude -p` sessions drop MCP channel notifications, so orchestrator-launched Claude agents run inside a **ClaudeDriver**: one long-lived `claude -p --input-format stream-json --output-format stream-json --replay-user-messages` process per agent, with the team MCP server passed inline (`--mcp-config`). Teammate messages are written to its stdin as user messages, which Claude reads at its next tool-call boundary — even in the middle of a long turn. A message is acked only when Claude echoes it back (`isReplay`); until then it stays in flight so no tick writes it again, and if the process dies first the message stays queued for the respawned agent, which resumes the same session (`--resume`). Input and cache tokens are metered per API call from `assistant` events; output tokens at the turn's `result`. A released agent is closed gracefully (stdin EOF) once it goes idle.
 
 ## Task State Machine
 
@@ -131,7 +139,7 @@ Agents **cannot disconnect** until explicitly released. This ensures the review 
 | `query_knowledge` | Query knowledge entries by key or category |
 | `remove_knowledge` | Remove outdated knowledge entries |
 
-## Orchestrator Tools (Claude Desktop)
+## Orchestrator Tools
 
 | Tool | Description |
 |------|-------------|
@@ -158,6 +166,8 @@ multiagents session create "Auth Feature"    # Create session
 multiagents session list                     # List all sessions
 multiagents session resume auth-feature      # Resume (respawns agents)
 multiagents session pause                    # Pause all agents
+multiagents session archive auth-feature     # Archive a finished session
+multiagents session export auth-feature      # Export the transcript as JSON
 multiagents session delete auth-feature      # Permanently delete
 ```
 
@@ -198,9 +208,10 @@ Session monitoring stats and enforced limits:
 | Session Duration | Monitor | Session | Observe |
 | Total Messages | Monitor | Session | Observe |
 | Active Agents | Monitor | Session | Observe |
+| Messages Per Agent | Monitor | Per agent | Observe |
 | Longest Idle | Monitor | Per agent | Observe |
 
-Adjustable from the TUI dashboard (+/- keys) or via `adjust_guardrail` tool.
+Adjustable from the TUI dashboard (+/- keys), the web dashboard, or the `adjust_guardrail` tool.
 
 ## Web Dashboard
 
@@ -240,15 +251,18 @@ Keys: `1-5` switch tabs, `j/k` scroll, `p` pause all, `r` resume all, `+/-` adju
 multiagents setup                     Interactive setup wizard
 multiagents web [session-id]         Web dashboard (localhost:7900)
 multiagents dashboard [session-id]    TUI dashboard
-multiagents session <sub>             Session management (create/list/resume/pause/delete)
+multiagents session <sub>             Session management (create/list/resume/pause/archive/delete/export)
 multiagents send <target> <msg>       Send message to agent
 multiagents peers                     List connected agents
 multiagents status                    Broker health + peers
 multiagents broker start|stop|status  Manage broker daemon
 multiagents install-mcp               Configure MCP servers
 multiagents update [--check|--dry-run] Update to the latest version on npm
+multiagents version                   Print the installed version
 multiagents help [command]            Detailed help
 ```
+
+`multiagents mcp-server --agent-type <claude|codex|gemini>` and `multiagents orchestrator` are the MCP server entry points the agent CLIs and the orchestrator host run; `multiagents setup` configures them.
 
 ## Architecture
 
@@ -257,9 +271,12 @@ multiagents/
 ├── broker.ts               SQLite broker daemon (sessions, slots, locks, messages, knowledge, guardrails)
 ├── server.ts               MCP server entry point (dispatches to adapter by --agent-type)
 ├── cli.ts                  CLI entry point
+├── index.ts                Library entry (types, BrokerClient, constants)
+├── noop-mcp.ts             No-op MCP server that neutralizes unwanted global MCP entries in Codex's config
 ├── shared/
 │   ├── types.ts            Type definitions (Peer, Slot, Session, Message, TaskState...)
 │   ├── broker-client.ts    HTTP client for broker API
+│   ├── broker-url.ts       The one place MULTIAGENTS_PORT is resolved
 │   ├── constants.ts        Ports, intervals, thresholds
 │   ├── summarize.ts        Git-based activity summary (no API calls)
 │   └── utils.ts            Shared utilities
@@ -279,22 +296,50 @@ multiagents/
 │   ├── launcher.ts         Agent spawning (drivers, MCP configs, prompts)
 │   ├── monitor.ts          Process/driver monitoring (event parsing, token tracking)
 │   ├── recovery.ts         Crash recovery (flap detection, respawn with context)
+│   ├── respawn-guard.ts    One respawn per slot at a time
 │   ├── supervision.ts      Driver registry, loop tick guard, release/watchdog verdicts
 │   ├── progress.ts         Team status aggregation
 │   ├── session-control.ts  Pause/resume/broadcast
 │   ├── guardrails.ts       Guardrail enforcement
 │   └── guide.ts            Built-in documentation
-└── cli/
-    ├── commands.ts         CLI command router
-    ├── dashboard.ts        TUI dashboard (ANSI, no dependencies)
-    ├── session.ts          Session management commands
-    ├── setup.ts            Interactive setup wizard
-    └── install-mcp.ts      MCP server configuration
+├── cli/
+│   ├── commands.ts         CLI command router
+│   ├── dashboard.ts        TUI dashboard (ANSI, no dependencies)
+│   ├── session.ts          Session management commands
+│   ├── setup.ts            Interactive setup wizard
+│   ├── install-mcp.ts      MCP server configuration
+│   └── update.ts           `multiagents update`
+├── dashboard/
+│   ├── server.ts           Web dashboard (Bun.serve + WebSocket, localhost:7900)
+│   └── index.html          Web dashboard UI
+└── scripts/
+    ├── version.ts          Version bump + release commit/tag
+    ├── postinstall.ts      Configures MCP servers after install
+    ├── preuninstall.ts     Removes MCP configuration on uninstall
+    └── launch-calculator-team.ts  Example team launched without the orchestrator
 ```
 
 ## Process Lifecycle
 
-### Releasing
+### Delivery and Supervision
+
+- The orchestrator's delivery loop runs every 3s (one tick at a time): unacked messages for each driver-managed slot are handed to its driver and acked only on confirmed hand-off; a released slot's driver is closed once it is idle (a Codex driver is judged by its notifications, not heartbeats, with a 10-minute hard cap).
+- Agents launched as plain processes (Gemini) get messages in their next tool result; a watchdog respawns one whose actionable messages stay unclaimed for more than 2 minutes, and respawns disconnected slots with pending messages.
+- Every component resolves the broker port through `MULTIAGENTS_PORT`, and the orchestrator forwards it to the agents it spawns.
+
+### Graceful Shutdown
+- **Broker** (`SIGINT`/`SIGTERM`): kills all registered peer processes, closes SQLite cleanly
+- **Orchestrator** (`SIGINT`/`SIGTERM`): kills all managed agent processes and drivers
+- **Adapters** (`SIGINT`/`SIGTERM`): unregister from broker, release file locks
+
+### Recovery and Orphan Prevention
+- Broker's `cleanStalePeers` runs every 30s: detaches slots whose process died (their messages are kept for the respawned agent, which inherits its predecessor's inbox), releases their file locks, kills orphan adapters without a session
+- Crashed agents are respawned with a handoff prompt — a Claude agent resumes its session, a Codex agent its thread — one respawn per slot at a time, never for a released slot
+- Flap detection stops auto-restart after 3 crashes in 5 minutes
+- `.multiagents/.driver-mode` tells a Codex agent's internal MCP adapter that the orchestrator owns delivery, so it registers against the launcher's slot instead of creating a ghost one
+- Session end/delete handlers stop drivers and processes before anything else can respawn them
+
+## Releasing
 
 ```bash
 bun run version:minor      # bumps package.json, commits "release: vX.Y.Z", tags vX.Y.Z
@@ -312,28 +357,32 @@ from the Actions tab with "dry run" enabled to pack the tarball without publishi
 Every pull request runs `.github/workflows/ci.yml` (`bun install --frozen-lockfile`,
 `bunx tsc --noEmit`, `bun test`).
 
-## Graceful Shutdown
-- **Broker** (`SIGINT`/`SIGTERM`): kills all registered peer processes, closes SQLite cleanly
-- **Orchestrator** (`SIGINT`/`SIGTERM`): kills all managed agent processes and CodexDriver instances
-- **Adapters** (`SIGINT`/`SIGTERM`): unregister from broker, release file locks
-
-### Orphan Prevention
-- Broker's `cleanStalePeers` runs every 30s: removes dead peer records, kills orphan processes without sessions
-- CodexDriver uses `.multiagents/.driver-mode` sentinel file to prevent internal MCP adapters from creating ghost slots
-- Session delete/end handlers kill both regular processes and CodexDriver instances
-- Flap detection stops auto-restart after 3 crashes in 5 minutes
-
 ## Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MULTIAGENTS_PORT` | `7899` | Broker HTTP port |
+| `MULTIAGENTS_PORT` | `7899` | Broker HTTP port; every component resolves it the same way and the orchestrator forwards it to spawned agents (an invalid value falls back to the default with a warning) |
 | `MULTIAGENTS_DB` | `~/.multiagents/peers.db` | SQLite database path |
-| `MULTIAGENTS_SESSION` | - | Session ID (set by orchestrator) |
-| `MULTIAGENTS_SLOT` | - | Slot ID (set by orchestrator) |
-| `MULTIAGENTS_ROLE` | - | Agent role (set by orchestrator) |
-| `MULTIAGENTS_NAME` | - | Agent display name (set by orchestrator) |
-| `MULTIAGENTS_DRIVER_MODE` | - | Skip adapter registration (set by CodexDriver) |
+| `MULTIAGENTS_WEB_PORT` | `7900` | Web dashboard port |
+| `MULTIAGENTS_NO_OPEN` | - | Web dashboard: do not open the browser |
+| `MULTIAGENTS_NO_DASHBOARD` | - | Orchestrator: do not launch the terminal or web dashboards (tests, headless hosts) |
+| `MULTIAGENTS_CLAUDE_MODEL` | - | Model for driver-launched Claude agents (e.g. `haiku`) |
+| `MULTIAGENTS_CLAUDE_COMMAND` / `MULTIAGENTS_CODEX_COMMAND` | `claude` / `codex app-server` | Override the CLI binaries the drivers run |
+| `MULTIAGENTS_CLEANUP_INTERVAL_MS` | `30000` | Broker stale-peer sweep interval |
+| `MULTIAGENTS_LIVE_TESTS` | - | `1` runs the live tests against the real CLIs (costs API usage) |
+| `MULTIAGENTS_SESSION` / `MULTIAGENTS_SLOT` / `MULTIAGENTS_ROLE` / `MULTIAGENTS_NAME` | - | Agent identity, set by the orchestrator (also passed as `--session/--slot/--role/--name` args) |
+| `MULTIAGENTS_DRIVER_MODE` | - | Set by the orchestrator for driver-managed agents: the adapter stops polling and leaves delivery to the driver |
+
+## Development
+
+```bash
+HOME=$(mktemp -d) bun test          # unit + integration suite (the launcher tests write ~/.codex/config.toml otherwise)
+bunx tsc --noEmit
+MULTIAGENTS_PORT=17910 bun tests/e2e-team.ts --timeout 600   # real Claude + Codex team on an isolated broker
+MULTIAGENTS_LIVE_TESTS=1 bun test tests/live-orchestrator.test.ts   # real team through the orchestrator server
+```
+
+Driver tests run against protocol fakes in `tests/fakes/`; adapters are exercised as real processes over MCP stdio. The e2e and live tests launch real CLIs and rewrite `~/.codex/config.toml` for the run's broker port — back it up first (the live tests restore it themselves). Every pull request runs the unit/integration suite in CI.
 
 ## Requirements
 
