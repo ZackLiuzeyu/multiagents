@@ -34,6 +34,14 @@ async function spawnFake(extra: Partial<Parameters<typeof ClaudeDriver.spawn>[0]
   return { driver, dir, entries };
 }
 
+async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("timeout waiting for condition");
+    await Bun.sleep(25);
+  }
+}
+
 describe("ClaudeDriver launch contract", () => {
   test("buildClaudeArgs produces a long-lived stream-json session with the MCP config", () => {
     const args = buildClaudeArgs({ mcpConfig: MCP, appendSystemPrompt: "PROTOCOL", model: "haiku", maxTurns: 50 });
@@ -71,8 +79,7 @@ describe("ClaudeDriver launch contract", () => {
   test("a session that never reports init is killed and the first send rejects", async () => {
     const { driver } = await spawnFake({ initTimeoutMs: 1500 }, { FAKE_CLAUDE_NO_INIT: "1" });
     await expect(driver.send("hello?")).rejects.toThrow(/init event/);
-    await Bun.sleep(300);
-    expect(driver.alive).toBe(false);
+    await waitFor(() => !driver.alive);
   });
 });
 
@@ -89,7 +96,8 @@ describe("ClaudeDriver turns", () => {
   test("a message sent mid-turn is absorbed into the running turn", async () => {
     const { driver, entries } = await spawnFake();
     const turn = driver.prompt("SLEEP:1200 first task");
-    await Bun.sleep(300);
+    // the fake announces init from the same stdin read that starts the turn
+    await waitFor(() => driver.sessionId !== null);
     expect(driver.busy).toBe(true);
     await driver.send("teammate says: use port 8080");
     const result = await turn;

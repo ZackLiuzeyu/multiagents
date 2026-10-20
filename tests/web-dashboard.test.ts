@@ -221,35 +221,21 @@ describe("Web Dashboard — WebSocket", () => {
       category: "decision",
     });
 
-    // Connect WebSocket and check knowledge is included
-    const ws = new WebSocket(`ws://127.0.0.1:${DASHBOARD_PORT}/ws`);
-
-    const statePromise = new Promise<any>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Timeout")), 5000);
-      ws.onmessage = (e) => {
-        clearTimeout(timeout);
-        resolve(JSON.parse(e.data as string));
-      };
+    // The dashboard refreshes from the broker every DASHBOARD_REFRESH ms; reconnect until the entry shows up
+    const firstState = () => new Promise<any>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${DASHBOARD_PORT}/ws`);
+      const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 5000);
+      ws.onmessage = (e) => { clearTimeout(timeout); ws.close(); resolve(JSON.parse(e.data as string)); };
       ws.onerror = (e) => { clearTimeout(timeout); reject(e); };
     });
-
-    // Wait a refresh cycle for knowledge to appear
-    await new Promise(r => setTimeout(r, 600));
-    // Reconnect to get fresh state
-    ws.close();
-
-    const ws2 = new WebSocket(`ws://127.0.0.1:${DASHBOARD_PORT}/ws`);
-    const statePromise2 = new Promise<any>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Timeout")), 5000);
-      ws2.onmessage = (e) => {
-        clearTimeout(timeout);
-        resolve(JSON.parse(e.data as string));
-      };
-      ws2.onerror = (e) => { clearTimeout(timeout); reject(e); };
-    });
-
-    const msg = await statePromise2;
-    ws2.close();
+    let msg: any;
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      msg = await firstState();
+      if (msg.data?.knowledge?.some((k: any) => k.key === "test-key")) break;
+      if (Date.now() > deadline) throw new Error("knowledge never appeared in the dashboard state");
+      await new Promise((r) => setTimeout(r, 200));
+    }
 
     expect(msg.data.knowledge.length).toBeGreaterThanOrEqual(1);
     const entry = msg.data.knowledge.find((k: any) => k.key === "test-key");
