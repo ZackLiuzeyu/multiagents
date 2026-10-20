@@ -20,7 +20,8 @@ jobs:
       - run: bunx tsc --noEmit
       - run: bun test
 
-  # The publish job's toolchain and packaging, minus the OIDC publish itself
+  # The publish job's toolchain and packaging, minus the publish itself (a dry-run
+  # publish would refuse the already-published version on every branch)
   package:
     runs-on: ubuntu-latest
     steps:
@@ -36,4 +37,4 @@ jobs:
       - run: |
           npm install -g npm@latest
           npm --version
-      - run: npm publish --ignore-scripts --dry-run
+      - run: npm pack --ignore-scripts
