@@ -329,3 +329,36 @@ describe("session ids", () => {
     expect(res.ok).toBe(false);
   });
 });
+
+describe("project files over HTTP", () => {
+  test("list, raw, resolve and check stay inside the project", async () => {
+    const proj = path.join(tmpDir, "proj");
+    fs.mkdirSync(path.join(proj, "out"), { recursive: true });
+    fs.writeFileSync(path.join(proj, "out", "result.csv"), "a,b\n1,2\n");
+    fs.writeFileSync(path.join(proj, "page.html"), "<script>alert(1)</script>");
+    const q = (op: string, params: Record<string, string>) =>
+      fetch(`${DASHBOARD_URL}/api/fs/${op}?${new URLSearchParams({ session_id: SESSION, ...params })}`);
+
+    const list = await (await q("list", { path: "" })).json() as any;
+    expect(list.result.entries.some((e: any) => e.name === "out" && e.type === "dir")).toBe(true);
+
+    const raw = await q("raw", { path: "out/result.csv" });
+    expect(await raw.text()).toBe("a,b\n1,2\n");
+
+    // An HTML file is sandboxed so it cannot script the dashboard
+    const html = await q("raw", { path: "page.html" });
+    expect(html.headers.get("content-security-policy")).toContain("sandbox");
+
+    expect((await q("raw", { path: "../peers.db" })).status).toBe(403);
+    expect((await q("raw", { path: "nope.txt" })).status).toBe(404);
+
+    const resolved = await (await q("resolve", { path: "result.csv" })).json() as any;
+    expect(resolved.result.path).toBe("out/result.csv");
+    expect(resolved.result.size).toBe(8);
+
+    const checked = await (await fetch(`${DASHBOARD_URL}/api/fs/check?session_id=${SESSION}&ref=result.csv&ref=ghost.md`)).json() as any;
+    expect(checked.result).toEqual({ "result.csv": "out/result.csv", "ghost.md": null });
+
+    expect((await fetch(`${DASHBOARD_URL}/api/fs/list?path=`)).status).toBe(400);
+  });
+});
