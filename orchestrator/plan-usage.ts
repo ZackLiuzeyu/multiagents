@@ -301,7 +301,15 @@ async function probeGemini(): Promise<PlanUsage> {
     metadata: { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" },
   });
   const project = load.cloudaicompanionProject ?? process.env.GOOGLE_CLOUD_PROJECT;
-  if (!project) return result("gemini", { plan: load.currentTier?.name ?? null, note: "Gemini did not report a Code Assist project for this login." });
+  if (!project) {
+    const isAntigravity = Array.isArray(load.ineligibleTiers) && load.ineligibleTiers.some((t: any) => /antigravity/i.test(t.reasonMessage ?? ""));
+    const tierName = isAntigravity ? "Antigravity" : (load.currentTier?.name ?? load.allowedTiers?.[0]?.name ?? null);
+    return result("gemini", {
+      plan: tierName,
+      windows: [],
+      note: isAntigravity ? "Antigravity 订阅：由 Google Workspace/内部认证驱动，不设 5 小时/每周窗口限制。" : "Gemini did not report a Code Assist project for this login.",
+    });
+  }
   const quota = await post("retrieveUserQuota", { project });
   const windows = geminiWindows(quota);
   log(LOG_PREFIX, `Gemini quota: ${windows.length} bucket(s)`);
