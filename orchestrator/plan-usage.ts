@@ -307,7 +307,7 @@ async function probeGemini(): Promise<PlanUsage> {
     return result("gemini", {
       plan: tierName,
       windows: [],
-      note: isAntigravity ? "Antigravity 订阅：由 Google Workspace/内部认证驱动，不设 5 小时/每周窗口限制。" : "Gemini did not report a Code Assist project for this login.",
+      note: isAntigravity ? "Antigravity subscription: workspace internal auth, no window limits." : "Gemini did not report a Code Assist project for this login.",
     });
   }
   const quota = await post("retrieveUserQuota", { project });

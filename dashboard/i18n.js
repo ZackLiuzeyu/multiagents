@@ -481,6 +481,8 @@ const ZH = {
   "Sign in to Gemini CLI with Google to see its quota (an Antigravity login is separate): run `npx @google/gemini-cli` once and choose Login with Google.": "需要用 Google 账号登录 Gemini CLI 才能看到额度（Antigravity 的登录和它是分开的）：在终端运行一次 `npx @google/gemini-cli`，选择 Login with Google。",
   "The Gemini login has expired; it refreshes the next time Gemini CLI runs.": "Gemini 登录凭据已过期，下次运行 Gemini CLI 时会自动刷新。",
   "Gemini did not report a Code Assist project for this login.": "Gemini 没有返回此登录对应的 Code Assist 项目。",
+  "Antigravity subscription: workspace internal auth, no window limits.": "Antigravity 订阅：由 Google Workspace/内部认证驱动，不设窗口限制。",
+  "This permanently removes the seat and clears this card from the board.": "此操作将永久删除此席位并从版面上清除该卡片。",
   "Gemini reported no quota buckets for this login.": "Gemini 没有返回此登录的额度信息。",
 
   // --- Agent settings ---

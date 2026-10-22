@@ -1695,7 +1695,7 @@ function renderAgents() {
     const id = slot.id;
     const tokens = usageLine(slot);
     const actions = released || archived
-      ? `<button class="btn small danger" data-agent="remove" data-slot="${id}" ${archived ? "disabled" : ""}>${tr("Remove")}</button>`
+      ? `<button class="btn small danger" data-agent="remove" data-slot="${id}" ${archived ? "disabled" : ""}>${tr(released ? "Delete" : "Remove")}</button>`
       : `<button class="btn small primary" data-agent="message" data-slot="${id}">${tr("Message")}</button>
         ${paused ? `<button class="btn small success" data-agent="resume" data-slot="${id}">${tr("Resume")}</button>` : `<button class="btn small warn" data-agent="pause" data-slot="${id}">${tr("Pause")}</button>`}
         <button class="btn small" data-agent="settings" data-slot="${id}">${tr("Settings")}</button>
@@ -1823,12 +1823,15 @@ async function agentAction(kind, slot, btn) {
       return;
     }
     case "remove": {
+      const isReleased = slot.task_state === "released";
       const ok = await confirmDialog({
-        title: tr("Remove {name}?", { name }), sid,
-        message: `<p>${tr("Remove stops the agent now (if this dashboard runs it), marks it released and tells the team it left. Unlike <b>Release</b>, it does not wait for the agent to finish.")}</p>`,
-        confirmLabel: "Remove", danger: true,
+        title: isReleased ? tr("Delete \"{name}\" permanently?", { name }) : tr("Remove {name}?", { name }), sid,
+        message: isReleased
+          ? `<p>${tr("This permanently removes the seat and clears this card from the board.")}</p>`
+          : `<p>${tr("Remove stops the agent now (if this dashboard runs it), marks it released and tells the team it left. Unlike <b>Release</b>, it does not wait for the agent to finish.")}</p>`,
+        confirmLabel: isReleased ? "Delete forever" : "Remove", danger: true,
       });
-      if (ok) return run(btn, "Remove", () => api("agents/remove", { session_id: sid, slot_id: slot.id }));
+      if (ok) return run(btn, isReleased ? "Delete" : "Remove", () => api("agents/remove", { session_id: sid, slot_id: slot.id }));
       return;
     }
   }

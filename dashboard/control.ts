@@ -437,6 +437,10 @@ const handlers: Record<string, Handler> = {
   async "agents/remove"(ctx, body) {
     const session = await requireSession(ctx, body);
     const slot = await requireSlot(ctx, session, body);
+    if (slot.task_state === "released") {
+      await ctx.broker.deleteSlot(slot.id);
+      return { message: `Slot ${slot.id} (${slot.display_name ?? slot.role ?? "agent"}) permanently removed.` };
+    }
     return await tool("remove_agent", { session_id: session.id, target: String(slot.id) });
   },
 
