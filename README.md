@@ -225,7 +225,22 @@ Web control center on `localhost:7900` with live WebSocket updates. Auto-opens i
 - **Center: the team chat.** Your messages sit on the right, the agents' on the left with avatar, role and message type (feedback, task complete, approval…). System notices are folded into small centered lines. Send to one agent or the whole team (Enter sends, Shift+Enter starts a new line, IME-safe). File names that agents mention become links once the file is found in the project.
 - **Right: file preview** (Markdown, code with line numbers, images, PDF, Word `.docx`, CSV, HTML in a sandbox, audio/video). It follows the open file as agents edit it. The **Team** tab lists every agent with quick actions.
 
-Light, dark, or follow the system: pick it from the theme button in the top bar.
+Light, dark, or follow the system: pick it from the theme button in the top bar. The language button switches between English and 中文 (Chinese is the default for a Chinese-language browser). Text the agents write stays as they wrote it.
+
+**Making it yours.** Agents show their CLI's icon (Claude, Gemini; Codex gets a neutral terminal glyph because OpenAI's logo isn't redistributable). Click an avatar on an agent card or in its settings to use initials, a color or your own image instead. The **Appearance** button in the top bar sets a background image under the whole page, how strongly it shows, how see-through the panels are, and your own avatar. These choices are kept in the browser (localStorage), not on the server.
+
+**Watching and approving each step.** The **Activity** tab is a live timeline of what every agent does: its thinking, the files it reads, each edit as a diff, every command with its output, and the cost of each turn. Claude and Codex report every step; Gemini reports its tool calls. Each agent has an approval mode (**Settings** on its card, or when you add it):
+
+| Mode | Claude | Codex |
+|---|---|---|
+| Fully autonomous (default) | `bypassPermissions` | approval policy `never` |
+| Auto review — the CLI's reviewer passes safe steps, risky ones come to you | `auto` | `on-request` |
+| Auto-approve edits — commands and other tools ask | `acceptEdits` | `untrusted` |
+| Ask me every step | `default` | `untrusted` |
+
+A step that needs you shows up as a card with the exact command or diff: **Allow**, **Always allow** (this tool, or this shell program, for the rest of the agent's session), or **Deny** with a note the agent reads. Team-protocol tools (`check_messages`, `send_message`…) never ask. Gemini runs unattended (yolo), so it is always fully autonomous.
+
+**Models, usage and limit locks.** The same Settings dialog switches an agent's model (an alias such as `opus`/`sonnet`, or a full name) and its effort. Claude switches live via `set_model`; Codex switches at its next turn; Gemini and Claude's effort switch at the agent's next start. The **Usage** tab shows tokens (input, output, cache reads) and Claude's reported cost per agent. There you can set limits per agent or for the whole session, in tokens or USD. An agent that reaches a limit is paused and its running turn is interrupted; raise the limit, then resume it.
 
 The tabs in the center hold everything else:
 
@@ -234,7 +249,8 @@ The tabs in the center hold everything else:
 - **Plan**: add, edit, reassign, change status (pending / in progress / blocked / done), delete
 - **Knowledge**: add, edit, delete entries by category
 - **Locks**: locks with holder and expiry, force unlock, reserve a file for an agent, assign ownership zones
-- **Stats**: session metrics and guardrail steppers (changes logged as "Adjusted via web dashboard")
+- **Activity**: the step-by-step timeline and pending approvals (see above)
+- **Usage**: tokens and cost per agent, limit locks, and guardrail steppers (changes logged as "Adjusted via web dashboard")
 
 **Human gate.** A team started from the browser can wait for you once every agent is approved: instead of ending itself, the session shows *Waiting for human approval* with **Approve & Release** and **Send back for revision** (actionable feedback to a worker, which restarts the review loop). Toggle it per session with the `human gate` chip; MCP's `create_team` takes `human_gate: true`.
 
@@ -304,6 +320,7 @@ multiagents/
 ├── orchestrator/
 │   ├── orchestrator-server.ts  Orchestrator MCP server (stdio host of runtime.ts)
 │   ├── runtime.ts          Orchestrator runtime: tools, agent processes, supervision loops (shared with the web dashboard)
+│   ├── activity.ts         Activity timeline from each CLI's stream; tool approvals through the broker
 │   ├── claude-driver.ts    ClaudeDriver: long-lived `claude -p --input-format stream-json` session
 │   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
 │   ├── delivery.ts         Hands unacked messages to drivers, acks on confirmed hand-off
@@ -329,6 +346,7 @@ multiagents/
 │   ├── files.ts            Read-only project files for the explorer and preview (GET /api/fs/*)
 │   ├── index.html          Web dashboard layout
 │   ├── app.js              Web dashboard UI logic
+│   ├── i18n.js             Web dashboard translations (English / 中文)
 │   └── styles.css          Web dashboard themes and layout
 └── scripts/
     ├── version.ts          Version bump + release commit/tag

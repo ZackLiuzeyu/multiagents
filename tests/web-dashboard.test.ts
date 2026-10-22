@@ -252,6 +252,16 @@ describe("Web Dashboard — UI assets", () => {
     expect(html).toContain('id="preview-body"');
     expect(html).toContain('src="/app.js"');
     expect(html).toContain('href="/styles.css"');
+    // Translations load first: app.js calls tr() while it boots
+    expect(html.indexOf('src="/i18n.js"')).toBeGreaterThan(-1);
+    expect(html.indexOf('src="/i18n.js"')).toBeLessThan(html.indexOf('src="/app.js"'));
+  });
+
+  test("serves the translations", async () => {
+    const res = await fetch(`${DASHBOARD_URL}/i18n.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("javascript");
+    expect(await res.text()).toContain("function tr(");
   });
 
   test("serves the script with the WebSocket logic", async () => {

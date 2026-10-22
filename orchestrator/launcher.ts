@@ -10,7 +10,7 @@
 // ============================================================================
 
 import type { Subprocess } from "bun";
-import type { AgentType, AgentLaunchConfig, Slot } from "../shared/types.ts";
+import type { AgentType, AgentLaunchConfig, ApprovalMode, Slot } from "../shared/types.ts";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import { log } from "../shared/utils.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
@@ -19,6 +19,7 @@ import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 import { getStructuredRolePractices } from "../adapters/role-practices.ts";
 import { ClaudeDriver } from "./claude-driver.ts";
 import { CodexDriver } from "./codex-driver.ts";
+import { CODEX_APPROVAL_POLICY, parseApprovalMode } from "./activity.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
@@ -76,6 +77,8 @@ export interface LaunchResult {
   codexDriver?: CodexDriver;
   /** Present for Claude agents (driven over stream-json stdin). */
   claudeDriver?: ClaudeDriver;
+  /** Model, effort and approval mode the agent was launched with */
+  settings?: { model?: string; effort?: string; approvalMode?: ApprovalMode };
 }
 
 /** CLI binary name for each agent type. */
@@ -295,6 +298,33 @@ interface AgentIdentity {
   name: string;
   role: string;
   roleDescription: string;
+  /** Per-agent settings, kept in the slot snapshot so respawns reuse them */
+  model?: string;
+  effort?: string;
+  approvalMode?: ApprovalMode;
+}
+
+/** Model, effort and approval mode stored in a slot's snapshot. */
+export function slotSettings(slot: Pick<Slot, "context_snapshot">): { model?: string; effort?: string; approvalMode: ApprovalMode; tokenLimit?: number } {
+  let snap: Record<string, unknown> = {};
+  try { snap = JSON.parse(slot.context_snapshot ?? "{}") ?? {}; } catch { /* no snapshot */ }
+  const text = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const limit = Number(snap.token_limit);
+  return {
+    model: text(snap.model),
+    effort: text(snap.effort),
+    approvalMode: parseApprovalMode(snap.approval_mode),
+    tokenLimit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+  };
+}
+
+function launchSettings(identity: AgentIdentity): NonNullable<LaunchResult["settings"]> {
+  return { model: identity.model, effort: identity.effort, approvalMode: identity.approvalMode ?? "bypass" };
+}
+
+/** The mode a Claude session is launched in; "auto" is switched to once it runs. */
+function claudeLaunchMode(mode: ApprovalMode): "bypassPermissions" | "acceptEdits" | "default" {
+  return mode === "bypass" ? "bypassPermissions" : mode === "accept_edits" ? "acceptEdits" : "default";
 }
 
 /** Env for a spawned agent: enriched PATH, session/slot identity, no nested-Claude marker. */
@@ -477,7 +507,9 @@ async function spawnClaudeAgent(
     mcpConfig: claudeMcpConfig(identity, { driverMode: true }),
     appendSystemPrompt: claudeSystemPromptAppend(identity.role, identity.roleDescription),
     maxTurns: CLAUDE_MAX_TURNS,
-    model: process.env.MULTIAGENTS_CLAUDE_MODEL || undefined,
+    model: identity.model || process.env.MULTIAGENTS_CLAUDE_MODEL || undefined,
+    effort: identity.effort,
+    permissionMode: claudeLaunchMode(identity.approvalMode ?? "bypass"),
   };
 
   // The session reports init only after its first message, so the prompt goes
@@ -506,7 +538,7 @@ async function spawnClaudeAgent(
 
   log(LOG_PREFIX, `Claude ${identity.name} (pid ${driver.pid}, session ${driver.sessionId}) started`);
 
-  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver };
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver, settings: launchSettings(identity) };
 }
 
 /**
@@ -535,6 +567,7 @@ async function spawnCodexAgent(
   env.MULTIAGENTS_DRIVER_MODE = "1";
 
   const driver = await CodexDriver.spawn(identity.projectDir, env);
+  driver.settings = { approvalPolicy: CODEX_APPROVAL_POLICY[identity.approvalMode ?? "bypass"], model: identity.model, effort: identity.effort };
   log(LOG_PREFIX, `CodexDriver spawned for ${identity.name} in slot ${identity.slotId}`);
 
   await brokerClient.updateSlot({ id: identity.slotId, status: "connected" });
@@ -548,6 +581,7 @@ async function spawnCodexAgent(
         cwd: identity.projectDir,
         sandbox: "workspace-write",
         developerInstructions: codexDeveloperInstructions(identity),
+        model: identity.model,
       });
       log(LOG_PREFIX, `${identity.name} bootstrap complete: thread=${bootstrap.threadId} (${bootstrap.content.slice(0, 50)})`);
 
@@ -578,7 +612,7 @@ async function spawnCodexAgent(
     }
   })();
 
-  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, codexDriver: driver };
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, codexDriver: driver, settings: launchSettings(identity) };
 }
 
 /** Spawn a one-shot Gemini (or custom) process; messages reach it through tool results. */
@@ -587,7 +621,7 @@ function spawnProcessAgent(agentType: AgentType, identity: AgentIdentity, taskPr
   if (!cmd) {
     throw new Error(`No CLI command configured for agent type: ${agentType}`);
   }
-  const proc = Bun.spawn([cmd, ...buildCliArgs(agentType, taskPrompt)], {
+  const proc = Bun.spawn([cmd, ...buildCliArgs(agentType, taskPrompt, { model: identity.model })], {
     cwd: identity.projectDir,
     stdin: "pipe",
     stdout: "pipe",
@@ -636,6 +670,12 @@ export async function launchAgent(
 
   log(LOG_PREFIX, `Created slot ${slot.id} for ${config.name} (${config.agent_type})`);
 
+  const approvalMode = parseApprovalMode(config.approval_mode);
+  await brokerClient.updateSlot({
+    id: slot.id,
+    context_patch: { model: config.model ?? null, effort: config.effort ?? null, approval_mode: approvalMode },
+  });
+
   if (config.file_ownership && config.file_ownership.length > 0) {
     await brokerClient.assignOwnership({
       session_id: sessionId,
@@ -663,6 +703,9 @@ export async function launchAgent(
     name: config.name,
     role: config.role,
     roleDescription: enrichedDescription,
+    model: config.model || undefined,
+    effort: config.effort || undefined,
+    approvalMode,
   };
 
   switch (config.agent_type) {
@@ -720,6 +763,7 @@ export async function relaunchIntoSlot(
       role_description: slot.role_description ?? "",
       initial_task: handoffTask,
     }, projectDir),
+    ...slotSettings(slot),
   };
 
   switch (slot.agent_type) {
@@ -746,7 +790,7 @@ export async function relaunchIntoSlot(
  * Build CLI arguments for the process-based agent types. Claude and Codex are
  * driven over their session protocols instead (see ClaudeDriver/CodexDriver).
  */
-export function buildCliArgs(agentType: AgentType, task: string): string[] {
+export function buildCliArgs(agentType: AgentType, task: string, opts: { model?: string } = {}): string[] {
   switch (agentType) {
     case "gemini": {
       // Gemini CLI is invoked via npx. MCP is configured at user level
@@ -759,6 +803,7 @@ export function buildCliArgs(agentType: AgentType, task: string): string[] {
         "--approval-mode", "yolo",
         "--output-format", "stream-json",
         "--allowed-mcp-server-names", "multiagents-peer",
+        ...(opts.model ? ["--model", opts.model] : []),
         "-p", task,
       ];
     }

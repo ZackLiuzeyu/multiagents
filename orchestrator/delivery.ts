@@ -14,9 +14,32 @@ import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "delivery";
 
+/** Settings last applied to a running driver (compared with the slot's to apply changes live). */
+export interface AppliedSettings {
+  model?: string;
+  effort?: string;
+  approvalMode: string;
+}
+
+/** The settings an agent was launched with ("launch" for Claude's auto mode, which is switched to once running). */
+export function launchedSettings(kind: "claude" | "codex", s: { model?: string; effort?: string; approvalMode?: string }): AppliedSettings {
+  const mode = s.approvalMode ?? "bypass";
+  return { model: s.model, effort: s.effort, approvalMode: kind === "claude" && mode === "auto" ? "launch" : mode };
+}
+
+/** Supervision state kept next to every driver. */
+interface DriverSupervision {
+  busy: boolean;
+  lastNudge: number;
+  releasedAt?: number;
+  applied?: AppliedSettings;
+  /** The running turn was interrupted because the slot got paused */
+  pauseInterrupted?: boolean;
+}
+
 export type DriverSlot =
-  | { kind: "codex"; driver: CodexDriver; threadId: string | null; busy: boolean; lastNudge: number; releasedAt?: number }
-  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number; inflight?: Set<number> };
+  | ({ kind: "codex"; driver: CodexDriver; threadId: string | null } & DriverSupervision)
+  | ({ kind: "claude"; driver: ClaudeDriver; inflight?: Set<number> } & DriverSupervision);
 
 export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "in_flight" | "steered" | "replied" | "sent" | "failed";
 

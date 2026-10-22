@@ -62,6 +62,9 @@ import type {
   KnowledgeListRequest,
   KnowledgeGetRequest,
   KnowledgeDeleteRequest,
+  ActivityAddRequest,
+  ActivityEntry,
+  ApprovalRequest,
   AddPlanItemRequest,
   EditPlanItemRequest,
 } from "./shared/types.ts";
@@ -231,6 +234,37 @@ db.run(`
 `);
 
 db.run(`
+  CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    slot_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT,
+    data TEXT,
+    ts INTEGER NOT NULL
+  )
+`);
+db.run("CREATE INDEX IF NOT EXISTS idx_activity_session ON activity (session_id, id)");
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    slot_id INTEGER NOT NULL,
+    tool TEXT NOT NULL,
+    title TEXT NOT NULL,
+    input TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    always INTEGER NOT NULL DEFAULT 0,
+    note TEXT,
+    decided_by TEXT,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+  )
+`);
+
+db.run(`
   CREATE TABLE IF NOT EXISTS knowledge (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -271,6 +305,7 @@ for (const stmt of [
   "ALTER TABLE slots ADD COLUMN input_tokens INTEGER DEFAULT 0",
   "ALTER TABLE slots ADD COLUMN output_tokens INTEGER DEFAULT 0",
   "ALTER TABLE slots ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE slots ADD COLUMN cost_usd REAL DEFAULT 0",
 ]) {
   addColumn(stmt);
 }
@@ -886,8 +921,10 @@ function handleDeleteSession(body: { id: string }): { ok: boolean; deleted: { sl
   db.run("DELETE FROM guardrail_overrides WHERE session_id = ?", [body.id]);
   db.run("DELETE FROM guardrail_events WHERE session_id = ?", [body.id]);
 
-  // Delete knowledge entries
+  // Delete knowledge entries, the activity timeline and approvals
   db.run("DELETE FROM knowledge WHERE session_id = ?", [body.id]);
+  db.run("DELETE FROM activity WHERE session_id = ?", [body.id]);
+  db.run("DELETE FROM approvals WHERE session_id = ?", [body.id]);
 
   db.run("DELETE FROM sessions WHERE id = ?", [body.id]);
 
@@ -969,6 +1006,7 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
   if (body.input_tokens !== undefined) { fields.push("input_tokens = input_tokens + ?"); values.push(body.input_tokens); }
   if (body.output_tokens !== undefined) { fields.push("output_tokens = output_tokens + ?"); values.push(body.output_tokens); }
   if (body.cache_read_tokens !== undefined) { fields.push("cache_read_tokens = cache_read_tokens + ?"); values.push(body.cache_read_tokens); }
+  if (body.cost_usd !== undefined) { fields.push("cost_usd = COALESCE(cost_usd, 0) + ?"); values.push(body.cost_usd); }
 
   if (fields.length > 0) {
     values.push(body.id);
@@ -1415,6 +1453,84 @@ function handleReleaseHeld(body: { session_id: string; slot_id: number }) {
   return { messages };
 }
 
+// --- Activity timeline ---
+
+const ACTIVITY_KEEP_PER_SLOT = 3000;
+const ACTIVITY_TEXT_MAX = 20_000;
+
+function clip(s: unknown, max = ACTIVITY_TEXT_MAX): string | null {
+  if (s === undefined || s === null) return null;
+  const str = typeof s === "string" ? s : JSON.stringify(s);
+  return str.length > max ? str.slice(0, max) + `\n… (${str.length - max} more characters)` : str;
+}
+
+function handleActivityAdd(body: ActivityAddRequest): { ok: boolean; added: number } {
+  if (!body.session_id || !Number.isInteger(body.slot_id)) throw new Error("session_id and slot_id required");
+  const entries = Array.isArray(body.entries) ? body.entries.slice(0, 500) : [];
+  const insert = db.prepare("INSERT INTO activity (session_id, slot_id, kind, title, detail, data, ts) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  db.transaction(() => {
+    for (const e of entries) {
+      insert.run(body.session_id, body.slot_id, String(e.kind), clip(e.title, 500) ?? "", clip(e.detail), e.data === undefined ? null : clip(e.data, 60_000), e.ts ?? Date.now());
+    }
+    // Keep the timeline bounded per agent
+    const cutoff = db.query("SELECT id FROM activity WHERE slot_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?").get(body.slot_id, ACTIVITY_KEEP_PER_SLOT) as { id: number } | null;
+    if (cutoff) db.run("DELETE FROM activity WHERE slot_id = ? AND id <= ?", [body.slot_id, cutoff.id]);
+  })();
+  return { ok: true, added: entries.length };
+}
+
+/** Oldest first; `after_id` pages forward, otherwise the latest `limit` entries. */
+function handleActivityList(body: { session_id: string; slot_id?: number; after_id?: number; limit?: number }): ActivityEntry[] {
+  const limit = Math.min(Math.max(body.limit ?? 300, 1), 2000);
+  const cond = ["session_id = ?"];
+  const params: any[] = [body.session_id];
+  if (body.slot_id !== undefined && body.slot_id !== null) { cond.push("slot_id = ?"); params.push(body.slot_id); }
+  if (body.after_id) {
+    cond.push("id > ?"); params.push(body.after_id);
+    return db.query(`SELECT * FROM activity WHERE ${cond.join(" AND ")} ORDER BY id ASC LIMIT ?`).all(...params, limit) as ActivityEntry[];
+  }
+  const rows = db.query(`SELECT * FROM activity WHERE ${cond.join(" AND ")} ORDER BY id DESC LIMIT ?`).all(...params, limit) as ActivityEntry[];
+  return rows.reverse();
+}
+
+// --- Approvals: a tool call waiting for a person ---
+
+function handleApprovalCreate(body: { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }): ApprovalRequest {
+  if (!body.session_id || !Number.isInteger(body.slot_id) || !body.tool) throw new Error("session_id, slot_id and tool required");
+  const now = Date.now();
+  const res = db.run(
+    "INSERT INTO approvals (session_id, slot_id, tool, title, input, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+    [body.session_id, body.slot_id, body.tool, clip(body.title, 500) ?? body.tool, body.input === undefined ? null : clip(body.input, 60_000), now],
+  );
+  return db.query("SELECT * FROM approvals WHERE id = ?").get(Number(res.lastInsertRowid)) as ApprovalRequest;
+}
+
+function handleApprovalGet(body: { id: number }): ApprovalRequest | null {
+  return (db.query("SELECT * FROM approvals WHERE id = ?").get(body.id) as ApprovalRequest) ?? null;
+}
+
+function handleApprovalList(body: { session_id: string; status?: string; limit?: number }): ApprovalRequest[] {
+  const limit = Math.min(Math.max(body.limit ?? 100, 1), 500);
+  if (body.status) {
+    return db.query("SELECT * FROM approvals WHERE session_id = ? AND status = ? ORDER BY id ASC LIMIT ?").all(body.session_id, body.status, limit) as ApprovalRequest[];
+  }
+  return (db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY id DESC LIMIT ?").all(body.session_id, limit) as ApprovalRequest[]).reverse();
+}
+
+/** Decide a pending request; a request already decided or cancelled is not changed. */
+function handleApprovalDecide(body: { id: number; session_id: string; decision: "allow" | "deny" | "cancel"; note?: string; always?: boolean; decided_by?: string }): ApprovalRequest | null {
+  const status = body.decision === "allow" ? "allowed" : body.decision === "deny" ? "denied" : body.decision === "cancel" ? "cancelled" : null;
+  if (!status) throw new Error(`Invalid decision "${body.decision}"`);
+  const res = db.run(
+    "UPDATE approvals SET status = ?, always = ?, note = ?, decided_by = ?, decided_at = ? WHERE id = ? AND session_id = ? AND status = 'pending'",
+    [status, body.always ? 1 : 0, body.note ?? null, body.decided_by ?? null, Date.now(), body.id, body.session_id],
+  );
+  const row = handleApprovalGet({ id: body.id });
+  if (!row || row.session_id !== body.session_id) return null;
+  if (res.changes === 0 && body.decision !== "cancel") throw new Error(`Request ${body.id} is already ${row.status}`);
+  return row;
+}
+
 // --- Agent event ---
 
 function handleAgentEvent(body: { session_id: string; event_type: string; slot_id?: number; metadata?: unknown; data?: unknown }) {
@@ -1548,6 +1664,24 @@ Bun.serve({
           return Response.json(handleGetPlan(body as { session_id: string }));
         case "/plan/update-item":
           return Response.json(handleUpdatePlanItem(body as { item_id: number; status: string; session_id?: string }));
+        // --- Activity & approvals ---
+        case "/activity/add":
+          return Response.json(handleActivityAdd(body as ActivityAddRequest));
+        case "/activity/list":
+          return Response.json(handleActivityList(body as { session_id: string; slot_id?: number; after_id?: number; limit?: number }));
+        case "/approvals/create":
+          return Response.json(handleApprovalCreate(body as { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }));
+        case "/approvals/get": {
+          const row = handleApprovalGet(body as { id: number });
+          return row ? Response.json(row) : Response.json({ error: "Approval not found" }, { status: 404 });
+        }
+        case "/approvals/list":
+          return Response.json(handleApprovalList(body as { session_id: string; status?: string; limit?: number }));
+        case "/approvals/decide": {
+          const row = handleApprovalDecide(body as { id: number; session_id: string; decision: "allow" | "deny" | "cancel"; note?: string; always?: boolean; decided_by?: string });
+          return row ? Response.json(row) : Response.json({ error: "Approval not found in session" }, { status: 404 });
+        }
+
         case "/plan/add-item":
           return Response.json(handleAddPlanItem(body as AddPlanItemRequest));
         case "/plan/edit-item": {

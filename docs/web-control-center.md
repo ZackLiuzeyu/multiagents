@@ -60,6 +60,18 @@ belongs to the named session. Human actions are sent as `human`.
 | Broker status | `GET /api/broker` | `BrokerClient` | `multiagents status` |
 | CLI availability | `GET /api/agents/available` | `detectAgent` (cached 5 min) | — |
 
+## Activity, approvals, models and limits
+
+| Feature | API | Implementation |
+|---|---|---|
+| Activity timeline | `GET /api/activity?session_id=&slot_id=&after_id=&limit=` | broker `/activity/list`, written by `ActivityRecorder` in the host that runs the agent |
+| Decide a pending step | `approvals/decide` `{approval_id, decision: allow\|deny, always, note}` | broker `/approvals/decide`; the waiting host polls `/approvals/get` |
+| Model / effort / approval mode / token limit | `agents/settings` `{slot_id, model, effort, approval_mode, token_limit}` | slot snapshot via `context_patch`; `reconcileDriver` applies it to the running driver |
+| Limit locks | `session/limits` `{limits: {agent_tokens, agent_cost_usd, session_tokens, session_cost_usd}}` | session `config.limits`; `enforceUsageLimits` pauses and interrupts |
+
+Pending approvals are pushed with the dashboard state (`state.approvals`). A decision can be
+made only once; a request whose agent exits is cancelled.
+
 ## Project files (explorer and preview)
 
 Read-only, scoped to the session's `project_dir`, all `GET` with `session_id`:

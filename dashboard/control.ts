@@ -9,7 +9,7 @@
 // ============================================================================
 
 import type { BrokerClient } from "../shared/broker-client.ts";
-import type { AgentLaunchConfig, AgentType, KnowledgeCategory, Session, Slot } from "../shared/types.ts";
+import type { AgentLaunchConfig, AgentType, ApprovalMode, KnowledgeCategory, Session, Slot } from "../shared/types.ts";
 import { safeJsonParse } from "../shared/utils.ts";
 import { createSessionRecord, exportSessionData } from "../shared/session-ops.ts";
 import { callOrchestratorTool, type ToolResult } from "../orchestrator/runtime.ts";
@@ -135,6 +135,7 @@ function parseAgentConfig(raw: unknown, index: number): AgentLaunchConfig {
   const ownership = Array.isArray(a.file_ownership)
     ? a.file_ownership.filter((p): p is string => typeof p === "string" && p.trim() !== "").map((p) => p.trim())
     : [];
+  const settings = parseSettings(a, agentType, `Agent ${index + 1}: `);
   return {
     agent_type: agentType,
     name,
@@ -142,7 +143,51 @@ function parseAgentConfig(raw: unknown, index: number): AgentLaunchConfig {
     role_description: str(a, "role_description", { optional: true }).trim() || role,
     initial_task: str(a, "initial_task", { optional: true }).trim(),
     ...(ownership.length ? { file_ownership: ownership } : {}),
+    ...(settings.model ? { model: settings.model } : {}),
+    ...(settings.effort ? { effort: settings.effort } : {}),
+    ...(settings.approval_mode ? { approval_mode: settings.approval_mode } : {}),
   };
+}
+
+const APPROVAL_MODES: ApprovalMode[] = ["bypass", "auto", "accept_edits", "ask"];
+const EFFORTS: Record<AgentType, string[]> = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["minimal", "low", "medium", "high"],
+  gemini: [],
+  custom: [],
+};
+
+/** Model, effort and approval mode from a request; "" clears a value (null). */
+function parseSettings(body: Body, agentType: AgentType, prefix = ""): { model?: string | null; effort?: string | null; approval_mode?: ApprovalMode } {
+  const out: { model?: string | null; effort?: string | null; approval_mode?: ApprovalMode } = {};
+  if (body.model !== undefined) {
+    const model = body.model === null ? "" : str(body, "model", { allowEmpty: true, optional: true }).trim();
+    if (model && !/^[\w.:\/\[\]@-]{1,100}$/.test(model)) throw new ApiError(`${prefix}"${model}" is not a model name`);
+    out.model = model || null;
+  }
+  if (body.effort !== undefined) {
+    const effort = body.effort === null ? "" : str(body, "effort", { allowEmpty: true, optional: true }).trim();
+    if (effort && !EFFORTS[agentType].includes(effort)) {
+      throw new ApiError(`${prefix}${agentType} ${EFFORTS[agentType].length ? `effort must be one of ${EFFORTS[agentType].join(", ")}` : "has no effort setting"}`);
+    }
+    out.effort = effort || null;
+  }
+  if (body.approval_mode !== undefined && body.approval_mode !== null && body.approval_mode !== "") {
+    const mode = str(body, "approval_mode") as ApprovalMode;
+    if (!APPROVAL_MODES.includes(mode)) throw new ApiError(`${prefix}approval_mode must be one of ${APPROVAL_MODES.join(", ")}`);
+    if (agentType === "gemini" && mode !== "bypass") throw new ApiError(`${prefix}Gemini agents run unattended (yolo); step approvals need Claude or Codex`);
+    out.approval_mode = mode;
+  }
+  return out;
+}
+
+function positiveOrNull(body: Body, key: string): number | null | undefined {
+  const v = body[key];
+  if (v === undefined) return undefined;
+  if (v === null || v === "" || v === 0) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new ApiError(`${key} must be a positive number`);
+  return n;
 }
 
 // --- Handlers ---
@@ -325,6 +370,50 @@ const handlers: Record<string, Handler> = {
     return { message: `Sent back to ${slot.display_name ?? `slot ${slot.id}`} (${result.task_state})` };
   },
 
+  /** Model, effort, approval mode and token limit; a running agent picks them up within seconds. */
+  async "agents/settings"(ctx, body) {
+    const session = await requireSession(ctx, body);
+    const slot = await requireSlot(ctx, session, body);
+    const patch: Record<string, unknown> = parseSettings(body, slot.agent_type);
+    const limit = positiveOrNull(body, "token_limit");
+    if (limit !== undefined) patch.token_limit = limit === null ? null : Math.round(limit);
+    if (!Object.keys(patch).length) throw new ApiError("Nothing to change");
+    await ctx.broker.updateSlot({ id: slot.id, context_patch: patch });
+    const live = slot.agent_type === "gemini" && (patch.model !== undefined)
+      ? " The model applies when the agent next starts."
+      : slot.agent_type === "claude" && patch.effort !== undefined ? " Effort applies when the agent next starts." : "";
+    return { message: `Updated ${slot.display_name ?? `slot ${slot.id}`}.${live}` };
+  },
+
+  /** Usage limits: an agent over its limit, or every agent of a session over the session limit, is paused. */
+  async "session/limits"(ctx, body) {
+    const session = await requireSession(ctx, body);
+    const raw = (body.limits ?? {}) as Body;
+    const limits: Record<string, number> = {};
+    for (const key of ["agent_tokens", "agent_cost_usd", "session_tokens", "session_cost_usd"]) {
+      const v = positiveOrNull(raw, key);
+      if (v) limits[key] = key.endsWith("tokens") ? Math.round(v) : v;
+    }
+    await ctx.broker.updateSession({ id: session.id, config_patch: { limits } });
+    return { message: Object.keys(limits).length ? "Usage limits saved" : "Usage limits removed", limits };
+  },
+
+  /** Answer an agent's tool call that waits for a person. */
+  async "approvals/decide"(ctx, body) {
+    const session = await requireSession(ctx, body);
+    const decision = str(body, "decision");
+    if (decision !== "allow" && decision !== "deny") throw new ApiError(`decision must be allow or deny`);
+    const row = await ctx.broker.decideApproval({
+      id: int(body, "approval_id"),
+      session_id: session.id,
+      decision,
+      always: body.always === true,
+      note: str(body, "note", { optional: true }).trim() || undefined,
+      decided_by: HUMAN_ID,
+    });
+    return { message: `${decision === "allow" ? (row.always ? "Always allowed" : "Approved") : "Denied"}: ${row.title}`, approval: row };
+  },
+
   // ---- Messages ----
 
   async "messages/send"(ctx, body) {
@@ -455,6 +544,14 @@ export async function handleControl(ctx: ControlContext, action: string, body: B
 }
 
 export const CONTROL_ACTIONS = Object.keys(handlers);
+
+/** GET /api/activity?session_id=&slot_id=&after_id=&limit= — the agents' steps, oldest first. */
+export async function listActivity(ctx: ControlContext, url: URL): Promise<unknown> {
+  const sessionId = url.searchParams.get("session_id");
+  if (!sessionId) throw new ApiError("session_id is required");
+  const num = (k: string) => (url.searchParams.get(k) ? Number(url.searchParams.get(k)) : undefined);
+  return await ctx.broker.listActivity({ session_id: sessionId, slot_id: num("slot_id"), after_id: num("after_id"), limit: num("limit") });
+}
 
 /** GET /api/session/export — the full session as JSON. */
 export async function exportSession(ctx: ControlContext, sessionId: string): Promise<unknown> {
