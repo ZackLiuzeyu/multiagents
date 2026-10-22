@@ -87,7 +87,7 @@ export interface LaunchResult {
 const AGENT_COMMANDS: Record<AgentType, string> = {
   claude: "claude",
   codex: "codex",
-  gemini: "npx",
+  gemini: process.env.MULTIAGENTS_ANTIGRAVITY_PATH || process.env.MULTIAGENTS_GEMINI_PATH || "agy",
   api: "",
   custom: "",
 };
@@ -96,6 +96,7 @@ const AGENT_COMMANDS: Record<AgentType, string> = {
 const COMMAND_OVERRIDES: Partial<Record<AgentType, string>> = {
   claude: "MULTIAGENTS_CLAUDE_COMMAND",
   codex: "MULTIAGENTS_CODEX_COMMAND",
+  gemini: "MULTIAGENTS_ANTIGRAVITY_PATH",
 };
 
 /**
@@ -115,8 +116,20 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
 
   const spawnEnv = { ...process.env, PATH: ENRICHED_PATH };
 
-  // Gemini is invoked via npx — check if the package is available
+  // Gemini worker is upgraded to Antigravity CLI (agy)
   if (type === "gemini") {
+    const agyCmd = (process.env.MULTIAGENTS_ANTIGRAVITY_PATH || AGENT_COMMANDS.gemini || "agy").trim();
+    const which = Bun.spawnSync(["which", agyCmd.split(/\s+/)[0]!], { env: spawnEnv });
+    const binPath = new TextDecoder().decode(which.stdout).trim();
+    if (which.exitCode === 0 && binPath) {
+      let version: string | undefined;
+      try {
+        const proc = Bun.spawnSync([binPath, "--version"], { env: spawnEnv });
+        const out = new TextDecoder().decode(proc.stdout).trim();
+        if (proc.exitCode === 0 && out) version = out.split("\n")[0];
+      } catch { /* ok */ }
+      return { available: true, version: version || "antigravity", path: binPath };
+    }
     try {
       const proc = Bun.spawnSync(["npx", "-y", "@google/gemini-cli", "--version"], {
         timeout: 15_000,
@@ -236,32 +249,70 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string, ag
     await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
   }
 
-  // --- Gemini: ~/.gemini/settings.json ---
-  const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
-  if (writeGemini) try {
-    let geminiConfig: Record<string, unknown> = {};
+  // --- Antigravity & Gemini MCP configs ---
+  if (writeGemini) {
+    const geminiMcp = mcpServerCommand("gemini");
+    const mcpEntry = {
+      command: geminiMcp.command,
+      args: geminiMcp.args,
+      ...(portOverride ? { env: { MULTIAGENTS_PORT: portOverride } } : {}),
+    };
+
+    // 1. Global Antigravity config: ~/.gemini/config/mcp_config.json
     try {
-      const existing = await Bun.file(geminiSettingsPath).text();
-      geminiConfig = JSON.parse(existing);
+      const homeDir = process.env.HOME ?? "";
+      const mcpConfigDir = path.join(homeDir, ".gemini", "config");
+      if (!fs.existsSync(mcpConfigDir)) fs.mkdirSync(mcpConfigDir, { recursive: true });
+      const mcpConfigPath = path.join(mcpConfigDir, "mcp_config.json");
+      let mcpConfig: Record<string, unknown> = {};
+      try {
+        const existing = await Bun.file(mcpConfigPath).text();
+        mcpConfig = JSON.parse(existing);
+      } catch { /* ok */ }
+
+      const mcpServers = (mcpConfig.mcpServers as Record<string, unknown>) ?? {};
+      delete mcpServers["multiagents"];
+      mcpServers["multiagents-peer"] = mcpEntry;
+      mcpConfig.mcpServers = mcpServers;
+      await Bun.write(mcpConfigPath, JSON.stringify(mcpConfig, null, 2));
     } catch { /* ok */ }
 
-    const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
-    // Remove stale "multiagents" entries from older versions
-    if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
-      delete geminiMcpServers["multiagents"];
-    }
-    if (!geminiMcpServers["multiagents-peer"]) {
-      const geminiMcp = mcpServerCommand("gemini");
-      geminiMcpServers["multiagents-peer"] = {
-        command: geminiMcp.command,
-        args: geminiMcp.args,
-        ...(portOverride ? { env: { MULTIAGENTS_PORT: portOverride } } : {}),
-      };
-      geminiConfig.mcpServers = geminiMcpServers;
-      await Bun.write(geminiSettingsPath, JSON.stringify(geminiConfig, null, 2));
-    }
-  } catch {
-    // Gemini config is optional — skip if ~/.gemini doesn't exist
+    // 2. Project-level Antigravity config: <projectDir>/.agents/mcp_config.json
+    try {
+      const agentsDir = path.join(projectDir, ".agents");
+      if (!fs.existsSync(agentsDir)) fs.mkdirSync(agentsDir, { recursive: true });
+      const projMcpConfigPath = path.join(agentsDir, "mcp_config.json");
+      let projMcpConfig: Record<string, unknown> = {};
+      try {
+        const existing = await Bun.file(projMcpConfigPath).text();
+        projMcpConfig = JSON.parse(existing);
+      } catch { /* ok */ }
+
+      const projMcpServers = (projMcpConfig.mcpServers as Record<string, unknown>) ?? {};
+      projMcpServers["multiagents-peer"] = mcpEntry;
+      projMcpConfig.mcpServers = projMcpServers;
+      await Bun.write(projMcpConfigPath, JSON.stringify(projMcpConfig, null, 2));
+    } catch { /* ok */ }
+
+    // 3. Backward-compatible ~/.gemini/settings.json
+    try {
+      const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
+      let geminiConfig: Record<string, unknown> = {};
+      try {
+        const existing = await Bun.file(geminiSettingsPath).text();
+        geminiConfig = JSON.parse(existing);
+      } catch { /* ok */ }
+
+      const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
+      if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
+        delete geminiMcpServers["multiagents"];
+      }
+      if (!geminiMcpServers["multiagents-peer"]) {
+        geminiMcpServers["multiagents-peer"] = mcpEntry;
+        geminiConfig.mcpServers = geminiMcpServers;
+        await Bun.write(geminiSettingsPath, JSON.stringify(geminiConfig, null, 2));
+      }
+    } catch { /* ok */ }
   }
 
   // --- Session file: .multiagents/session.json ---
@@ -358,6 +409,16 @@ function agentEnv(identity: AgentIdentity): Record<string, string | undefined> {
     MULTIAGENTS_NAME: identity.name,
     MULTIAGENTS_SLOT: String(identity.slotId),
   };
+  // Automatically inject proxy if available locally to ensure Google Antigravity endpoints are reachable
+  if (!env.http_proxy && !env.HTTP_PROXY) {
+    const proxyUrl = "http://127.0.0.1:3067";
+    env.http_proxy = proxyUrl;
+    env.https_proxy = proxyUrl;
+    env.HTTP_PROXY = proxyUrl;
+    env.HTTPS_PROXY = proxyUrl;
+    env.all_proxy = "socks5://127.0.0.1:3067";
+    env.ALL_PROXY = "socks5://127.0.0.1:3067";
+  }
   // A Claude Code parent marks its environment; a child session must not look nested.
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
@@ -863,19 +924,19 @@ export async function relaunchIntoSlot(
 export function buildCliArgs(agentType: AgentType, task: string, opts: { model?: string } = {}): string[] {
   switch (agentType) {
     case "gemini": {
-      // Gemini CLI is invoked via npx. MCP is configured at user level
-      // (~/.gemini/settings.json) by ensureMcpConfigs. Use --approval-mode
-      // yolo for fully autonomous operation, --sandbox for safety, and
-      // --output-format stream-json for structured output parsing.
-      return [
-        "-y", "@google/gemini-cli",
-        "--sandbox",
-        "--approval-mode", "yolo",
+      // Upgraded to Antigravity CLI (`agy`).
+      // Uses --dangerously-skip-permissions for fully autonomous operation
+      // and --output-format stream-json for structured output parsing.
+      const args = [
+        "--dangerously-skip-permissions",
         "--output-format", "stream-json",
-        "--allowed-mcp-server-names", "multiagents-peer",
-        ...(opts.model ? ["--model", opts.model] : []),
-        "-p", task,
       ];
+      const model = opts.model ?? process.env.MULTIAGENTS_ANTIGRAVITY_MODEL ?? process.env.MULTIAGENTS_GEMINI_MODEL;
+      if (model) {
+        args.push("--model", model);
+      }
+      args.push("-p", task);
+      return args;
     }
     case "custom":
       return [task];

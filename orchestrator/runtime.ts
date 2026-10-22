@@ -2001,68 +2001,70 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
     }
   }), USAGE_LIMIT_CHECK_MS);
 
-  // Stuck agent nudge loop — every 45s, nudge agents silent for >1 min
-  setInterval(async () => {
-    for (const sessionId of activeProcesses.keys()) {
-      try {
-        // Agents waiting for the person's questions are silent on purpose
-        if (await qaModeOn(sessionId, brokerClient)) continue;
-        const slots = await brokerClient.listSlots(sessionId);
-        for (const slot of slots) {
-          if (slot.status !== "connected" || !slot.peer_id) continue;
-          if (slot.paused === true || (slot.paused as unknown as number) === 1) continue;
+  // Stuck agent nudge loop (disabled by default to prevent noisy spam; set MULTIAGENTS_ENABLE_NUDGE=1 to enable)
+  if (process.env.MULTIAGENTS_ENABLE_NUDGE === "1") {
+    setInterval(async () => {
+      for (const sessionId of activeProcesses.keys()) {
+        try {
+          // Agents waiting for the person's questions are silent on purpose
+          if (await qaModeOn(sessionId, brokerClient)) continue;
+          const slots = await brokerClient.listSlots(sessionId);
+          for (const slot of slots) {
+            if (slot.status !== "connected" || !slot.peer_id) continue;
+            if (slot.paused === true || (slot.paused as unknown as number) === 1) continue;
 
-          // Skip agents in truly terminal task states — no point nudging them
-          const taskState = (slot as any).task_state;
-          if (taskState === "approved" || taskState === "released") continue;
-          // Note: done_pending_review agents are NOT skipped — they may need
-          // to respond to feedback or review requests from teammates.
+            // Skip agents in truly terminal task states — no point nudging them
+            const taskState = (slot as any).task_state;
+            if (taskState === "approved" || taskState === "released") continue;
+            // Note: done_pending_review agents are NOT skipped — they may need
+            // to respond to feedback or review requests from teammates.
 
-          // Codex driver-managed agents get nudges delivered via the
-          // forwarding loop (steer or reply). Don't skip them — they need
-          // nudges too, especially to prompt signal_done after long turns.
+            // Codex driver-managed agents get nudges delivered via the
+            // forwarding loop (steer or reply). Don't skip them — they need
+            // nudges too, especially to prompt signal_done after long turns.
 
-          // Check last_connected or context_snapshot for activity
-          const lastActivity = (() => {
-            if (slot.context_snapshot) {
-              try {
-                const snap = JSON.parse(slot.context_snapshot);
-                if (snap.updated_at) return snap.updated_at;
-              } catch { /* ok */ }
+            // Check last_connected or context_snapshot for activity
+            const lastActivity = (() => {
+              if (slot.context_snapshot) {
+                try {
+                  const snap = JSON.parse(slot.context_snapshot);
+                  if (snap.updated_at) return snap.updated_at;
+                } catch { /* ok */ }
+              }
+              return slot.last_connected ?? 0;
+            })();
+
+            const silentMs = Date.now() - lastActivity;
+            if (silentMs > 1 * 60 * 1000) {
+              const agentName = slot.display_name || `slot ${slot.id}`;
+              const silentMin = Math.round(silentMs / 60000);
+
+              // Nudge the agent
+              await brokerClient.sendMessage({
+                from_id: "orchestrator",
+                to_id: slot.peer_id,
+                text: `[NUDGE] You have been silent for ${silentMin} minutes. ` +
+                      `Check your teammates with check_team_status and check_messages. ` +
+                      `If you are done, call signal_done. If you are blocked, send a message to "orchestrator" explaining what you need.`,
+                msg_type: "system",
+                session_id: sessionId,
+              });
+
+              // Also alert the orchestrator user via pending events
+              pendingEvents.push({
+                type: "agent_silent",
+                severity: silentMs > 5 * 60 * 1000 ? "warning" : "info",
+                slotId: slot.id,
+                sessionId,
+                message: `${agentName} (${slot.role || "unknown"}) silent for ${silentMin}m — task_state: ${(slot as any).task_state || "idle"}. May need intervention.`,
+              });
+              log(LOG_PREFIX, `Nudged silent agent ${agentName} (${silentMin}m silent)`);
             }
-            return slot.last_connected ?? 0;
-          })();
-
-          const silentMs = Date.now() - lastActivity;
-          if (silentMs > 1 * 60 * 1000) {
-            const agentName = slot.display_name || `slot ${slot.id}`;
-            const silentMin = Math.round(silentMs / 60000);
-
-            // Nudge the agent
-            await brokerClient.sendMessage({
-              from_id: "orchestrator",
-              to_id: slot.peer_id,
-              text: `[NUDGE] You have been silent for ${silentMin} minutes. ` +
-                    `Check your teammates with check_team_status and check_messages. ` +
-                    `If you are done, call signal_done. If you are blocked, send a message to "orchestrator" explaining what you need.`,
-              msg_type: "system",
-              session_id: sessionId,
-            });
-
-            // Also alert the orchestrator user via pending events
-            pendingEvents.push({
-              type: "agent_silent",
-              severity: silentMs > 5 * 60 * 1000 ? "warning" : "info",
-              slotId: slot.id,
-              sessionId,
-              message: `${agentName} (${slot.role || "unknown"}) silent for ${silentMin}m — task_state: ${(slot as any).task_state || "idle"}. May need intervention.`,
-            });
-            log(LOG_PREFIX, `Nudged silent agent ${agentName} (${silentMin}m silent)`);
           }
-        }
-      } catch { /* ok */ }
-    }
-  }, 45_000);
+        } catch { /* ok */ }
+      }
+    }, 45_000);
+  }
 
   // Conflict detection loop — basic git status monitoring
   conflictTimer = setInterval(async () => {

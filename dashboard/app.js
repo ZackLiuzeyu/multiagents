@@ -3003,8 +3003,14 @@ async function loadAvailability() {
 const AGENT_TYPE_CHOICES = ["claude", "codex", "gemini", "api"];
 
 function typeOptions(selected, avail) {
+  const labels = {
+    claude: "claude",
+    codex: "codex",
+    gemini: "antigravity (gemini)",
+    api: tr("Other (OpenAI-compatible API)"),
+  };
   return AGENT_TYPE_CHOICES.map((t) => {
-    const label = t === "api" ? tr("Other (OpenAI-compatible API)") : t;
+    const label = labels[t] || t;
     const missing = avail && avail[t] === false ? tr(t === "api" ? " (add a provider)" : " (not installed)") : "";
     return `<option value="${t}" ${t === selected ? "selected" : ""}>${label}${missing}</option>`;
   }).join("");
@@ -3067,7 +3073,7 @@ function newSessionModal() {
 
 const TEAM_PRESETS = {
   "Worker + Reviewer": [
-    { agent_type: "gemini", name: "Gemini Worker", role: "Software Engineer", initial_task: "" },
+    { agent_type: "gemini", name: "Antigravity Worker", role: "Software Engineer", initial_task: "" },
     { agent_type: "claude", name: "Claude Reviewer", role: "Code Reviewer", initial_task: "" },
   ],
   "Engineer + Reviewer + QA": [
