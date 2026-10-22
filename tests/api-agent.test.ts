@@ -8,6 +8,7 @@ import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { realThroughExistingAncestor } from "../orchestrator/api-driver.ts";
 
 const BROKER_PORT = 17941;
 const DASHBOARD_PORT = 17942;
@@ -162,6 +163,10 @@ describe("an API agent at work", () => {
     expect(steps.some((e) => e.title === "Read notes.md")).toBe(true);
     expect(steps.find((e) => e.kind === "tool_result" && /cohort/.test(e.detail ?? ""))).toBeTruthy();
 
+    // Its team-tools process registers under the agent's own type
+    const peers = await post("/list-peers", { scope: "machine", cwd: dir, git_root: null, agent_type: "api" });
+    expect(peers.some((p: any) => p.slot_id === slotId)).toBe(true);
+
     // Team tools reach the model under their own names, next to the local ones
     const names = requests[0]!.tools.map((t: any) => t.function.name);
     expect(names).toEqual(expect.arrayContaining(["Read", "Bash", "send_message", "signal_done"]));
@@ -188,6 +193,16 @@ describe("an API agent at work", () => {
     await waitFor(async () => (await activity(sid)).some((e) => e.kind === "tool_result" && /denied: A person denied this tool call: not now/.test(e.detail ?? "")));
   }, 40_000);
 
+  test("the model can be cleared only when the provider has a default", async () => {
+    const base = `http://127.0.0.1:${fakeApi!.port}/v1`;
+    await api("providers/save", { id: "fake-ai", name: "Fake AI", base_url: base, default_model: "", input_price: 1, output_price: 2 });
+    const refused = await api("agents/settings", { session_id: sid, slot_id: slotId, model: "" });
+    expect(refused.status).toBe(400);
+    expect(refused.error).toContain("no default model");
+    await api("providers/save", { id: "fake-ai", name: "Fake AI", base_url: base, default_model: "fake-chat", input_price: 1, output_price: 2 });
+    expect((await api("agents/settings", { session_id: sid, slot_id: slotId, model: "" })).ok).toBe(true);
+  });
+
   test("a model switch applies to the next request", async () => {
     expect((await api("agents/settings", { session_id: sid, slot_id: slotId, model: "fake-reasoner", approval_mode: "bypass" })).ok).toBe(true);
     await Bun.sleep(3_500);
@@ -197,4 +212,17 @@ describe("an API agent at work", () => {
     expect(requests.at(-1)!.model).toBe("fake-reasoner");
     expect((await api("session/end", { session_id: sid })).ok).toBe(true);
   }, 30_000);
+});
+
+describe("local tools stay in the project", () => {
+  test("a new file under a symlinked directory resolves to where it would really land", () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "api-root-")));
+    const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "api-outside-")));
+    fs.symlinkSync(outside, path.join(root, "link"));
+    // Neither link/new nor link/new/file exists: the symlink still decides
+    expect(realThroughExistingAncestor(path.join(root, "link", "new", "file.md"))).toBe(path.join(outside, "new", "file.md"));
+    expect(realThroughExistingAncestor(path.join(root, "plain", "new.md"))).toBe(path.join(root, "plain", "new.md"));
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
 });

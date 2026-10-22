@@ -469,11 +469,10 @@ export class ApiDriver implements ClaudeSession {
   private resolve(p: unknown, mustExist = true): string {
     if (typeof p !== "string" || !p.trim()) throw new Error("A path is required");
     const abs = path.resolve(this.root, p);
-    let real = abs;
+    let real: string;
     try { real = fs.realpathSync(abs); } catch {
       if (mustExist) throw new Error(`${p} does not exist`);
-      // A new file: its directory decides
-      try { real = path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs)); } catch { real = abs; }
+      real = realThroughExistingAncestor(abs);
     }
     if (real !== this.root && !real.startsWith(this.root + path.sep)) throw new Error(`${p} is outside the project directory`);
     return real;
@@ -621,6 +620,26 @@ export class ApiDriver implements ClaudeSession {
     this._lastActivity = Date.now();
     if (this.history.length < 500 && event.type !== "stream_event") this.history.push(event);
     for (const l of this.listeners) { try { l(event); } catch { /* listener errors must not break the loop */ } }
+  }
+}
+
+/**
+ * Where a path that does not exist yet would land: the nearest existing
+ * ancestor resolved through its symlinks, plus the missing rest. A symlinked
+ * directory higher up cannot smuggle a new file out of the project.
+ */
+export function realThroughExistingAncestor(abs: string): string {
+  const missing: string[] = [];
+  let dir = abs;
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(dir), ...missing.reverse());
+    } catch {
+      const parent = path.dirname(dir);
+      if (parent === dir) return abs;
+      missing.push(path.basename(dir));
+      dir = parent;
+    }
   }
 }
 

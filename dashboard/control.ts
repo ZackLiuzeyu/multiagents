@@ -480,6 +480,12 @@ const handlers: Record<string, Handler> = {
     const session = await requireSession(ctx, body);
     const slot = await requireSlot(ctx, session, body);
     const patch: Record<string, unknown> = parseSettings(body, slot.agent_type);
+    if (slot.agent_type === "api" && patch.model === null) {
+      // Without a model a restarted agent could not launch: fall back to the provider's default, or refuse
+      const providerId = safeJsonParse<Record<string, unknown>>(slot.context_snapshot, {}).provider_id;
+      const p = getProvider(typeof providerId === "string" ? providerId : null);
+      if (!p?.default_model) throw new ApiError(`${p?.name ?? "This provider"} has no default model; keep a model set`);
+    }
     const limit = positiveOrNull(body, "token_limit");
     if (limit !== undefined) patch.token_limit = limit === null ? null : Math.round(limit);
     if (!Object.keys(patch).length) throw new ApiError("Nothing to change");

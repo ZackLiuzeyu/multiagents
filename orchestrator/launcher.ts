@@ -472,8 +472,8 @@ function buildHandoffPrompt(identity: AgentIdentity, handoffTask: string, delive
  * `alwaysLoad` keeps the team tools out of tool-search deferral, and
  * `--driver-mode` tells the adapter the orchestrator delivers messages.
  */
-export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boolean }): Record<string, unknown> {
-  const claudeMcp = mcpServerCommand("claude");
+export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boolean; agentType?: AgentType }): Record<string, unknown> {
+  const claudeMcp = mcpServerCommand(opts.agentType ?? "claude");
   const args = [
     ...claudeMcp.args,
     "--session", identity.sessionId,
@@ -583,7 +583,7 @@ async function spawnApiAgent(identity: AgentIdentity, firstPrompt: string, broke
   if (!provider) throw new Error(`API provider "${identity.providerId ?? ""}" is not configured — add it under API providers first`);
   const model = identity.model || provider.default_model;
   if (!model) throw new Error(`Pick a model for ${provider.name} (no default model is set)`);
-  const server = claudeMcpConfig(identity, { driverMode: true }).mcpServers as Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
+  const server = claudeMcpConfig(identity, { driverMode: true, agentType: "api" }).mcpServers as Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
   const driver = await ApiDriver.spawn({
     cwd: identity.projectDir,
     env: agentEnv(identity),
