@@ -409,15 +409,17 @@ function agentEnv(identity: AgentIdentity): Record<string, string | undefined> {
     MULTIAGENTS_NAME: identity.name,
     MULTIAGENTS_SLOT: String(identity.slotId),
   };
-  // Automatically inject proxy if available locally to ensure Google Antigravity endpoints are reachable
-  if (!env.http_proxy && !env.HTTP_PROXY) {
-    const proxyUrl = "http://127.0.0.1:3067";
+  // In non-CI environments, inject proxy if needed and preserve localhost loopback
+  if (!process.env.CI && !env.http_proxy && !env.HTTP_PROXY) {
+    const proxyUrl = process.env.MULTIAGENTS_PROXY || "http://127.0.0.1:3067";
     env.http_proxy = proxyUrl;
     env.https_proxy = proxyUrl;
     env.HTTP_PROXY = proxyUrl;
     env.HTTPS_PROXY = proxyUrl;
     env.all_proxy = "socks5://127.0.0.1:3067";
     env.ALL_PROXY = "socks5://127.0.0.1:3067";
+    env.no_proxy = "localhost,127.0.0.1,::1";
+    env.NO_PROXY = "localhost,127.0.0.1,::1";
   }
   // A Claude Code parent marks its environment; a child session must not look nested.
   delete env.CLAUDECODE;
