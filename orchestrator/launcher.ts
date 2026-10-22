@@ -17,9 +17,11 @@ import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import { resolveBrokerPort } from "../shared/broker-url.ts";
 import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 import { getStructuredRolePractices } from "../adapters/role-practices.ts";
-import { ClaudeDriver } from "./claude-driver.ts";
+import { ClaudeDriver, type ClaudeSession } from "./claude-driver.ts";
+import { ApiDriver } from "./api-driver.ts";
+import { getProvider, loadProviders } from "../shared/providers.ts";
 import { CodexDriver } from "./codex-driver.ts";
-import { CODEX_APPROVAL_POLICY, parseApprovalMode } from "./activity.ts";
+import { CODEX_APPROVAL_POLICY, CLAUDE_PERMISSION_MODE, parseApprovalMode } from "./activity.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
@@ -75,8 +77,8 @@ export interface LaunchResult {
   process: Subprocess;
   /** Present for Codex agents (driven over `codex app-server`). */
   codexDriver?: CodexDriver;
-  /** Present for Claude agents (driven over stream-json stdin). */
-  claudeDriver?: ClaudeDriver;
+  /** Present for Claude agents (driven over stream-json stdin) and API agents (same events). */
+  claudeDriver?: ClaudeSession;
   /** Model, effort and approval mode the agent was launched with */
   settings?: { model?: string; effort?: string; approvalMode?: ApprovalMode };
 }
@@ -86,6 +88,7 @@ const AGENT_COMMANDS: Record<AgentType, string> = {
   claude: "claude",
   codex: "codex",
   gemini: "npx",
+  api: "",
   custom: "",
 };
 
@@ -100,6 +103,11 @@ const COMMAND_OVERRIDES: Partial<Record<AgentType, string>> = {
  * Handles both direct binaries (claude, codex) and npx-based tools (gemini).
  */
 export async function detectAgent(type: AgentType): Promise<AgentDetection> {
+  // API agents run in-process: available once a provider is configured
+  if (type === "api") {
+    const providers = loadProviders();
+    return providers.length ? { available: true, version: providers.map((p) => p.name).join(", "), path: "api" } : { available: false };
+  }
   const cmd = AGENT_COMMANDS[type];
   if (!cmd) {
     return { available: false };
@@ -312,10 +320,12 @@ interface AgentIdentity {
   model?: string;
   effort?: string;
   approvalMode?: ApprovalMode;
+  /** API agents: the provider to call */
+  providerId?: string;
 }
 
 /** Model, effort and approval mode stored in a slot's snapshot. */
-export function slotSettings(slot: Pick<Slot, "context_snapshot">): { model?: string; effort?: string; approvalMode: ApprovalMode; tokenLimit?: number } {
+export function slotSettings(slot: Pick<Slot, "context_snapshot">): { model?: string; effort?: string; approvalMode: ApprovalMode; tokenLimit?: number; providerId?: string } {
   let snap: Record<string, unknown> = {};
   try { snap = JSON.parse(slot.context_snapshot ?? "{}") ?? {}; } catch { /* no snapshot */ }
   const text = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
@@ -325,6 +335,7 @@ export function slotSettings(slot: Pick<Slot, "context_snapshot">): { model?: st
     effort: text(snap.effort),
     approvalMode: parseApprovalMode(snap.approval_mode),
     tokenLimit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+    providerId: text(snap.provider_id),
   };
 }
 
@@ -461,8 +472,8 @@ function buildHandoffPrompt(identity: AgentIdentity, handoffTask: string, delive
  * `alwaysLoad` keeps the team tools out of tool-search deferral, and
  * `--driver-mode` tells the adapter the orchestrator delivers messages.
  */
-export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boolean }): Record<string, unknown> {
-  const claudeMcp = mcpServerCommand("claude");
+export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boolean; agentType?: AgentType }): Record<string, unknown> {
+  const claudeMcp = mcpServerCommand(opts.agentType ?? "claude");
   const args = [
     ...claudeMcp.args,
     "--session", identity.sessionId,
@@ -548,6 +559,47 @@ async function spawnClaudeAgent(
 
   log(LOG_PREFIX, `Claude ${identity.name} (pid ${driver.pid}, session ${driver.sessionId}) started`);
 
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver, settings: launchSettings(identity) };
+}
+
+/** System prompt of an API agent: who it is, how its tools work, the team protocol. */
+export function apiSystemPrompt(identity: AgentIdentity, providerName: string): string {
+  return [
+    `You are "${identity.name}", role: ${identity.role}, a member of a multi-agent team. You run on ${providerName}.`,
+    identity.roleDescription,
+    "",
+    `Your working directory is ${identity.projectDir}; file tools (Read, Write, Edit, LS, Glob, Grep) and Bash work inside it. WebFetch reads web pages.`,
+    "Team tools (send_message, check_messages, set_summary, signal_done, check_team_status, get_plan, update_plan, submit_feedback, approve, store_knowledge, query_knowledge…) are how you talk to teammates and the person — they only see what you send with them.",
+    "Teammate messages arrive as user messages starting with [Teammate messages]. To answer the person, use send_message with to_id \"human\".",
+    "Work in small steps: call a tool, read its result, decide the next step. Keep replies short; put details in files or messages.",
+    "",
+    claudeSystemPromptAppend(identity.role, identity.roleDescription),
+  ].join("\n");
+}
+
+/** Start an API agent (OpenAI-compatible provider) in-process; its first turn runs in the background. */
+async function spawnApiAgent(identity: AgentIdentity, firstPrompt: string, brokerClient: BrokerClient): Promise<LaunchResult> {
+  const provider = getProvider(identity.providerId);
+  if (!provider) throw new Error(`API provider "${identity.providerId ?? ""}" is not configured — add it under API providers first`);
+  const model = identity.model || provider.default_model;
+  if (!model) throw new Error(`Pick a model for ${provider.name} (no default model is set)`);
+  const server = claudeMcpConfig(identity, { driverMode: true, agentType: "api" }).mcpServers as Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
+  const driver = await ApiDriver.spawn({
+    cwd: identity.projectDir,
+    env: agentEnv(identity),
+    provider,
+    model,
+    effort: identity.effort,
+    mcpServer: server["multiagents-peer"]!,
+    systemPrompt: apiSystemPrompt(identity, provider.name),
+    firstPrompt,
+    permissionMode: CLAUDE_PERMISSION_MODE[identity.approvalMode ?? "bypass"],
+  });
+  await brokerClient.updateSlot({
+    id: identity.slotId,
+    context_patch: { provider_name: provider.name, last_summary: `Starting: ${firstPrompt.slice(0, 100)}`, last_status: "working", updated_at: Date.now() },
+  });
+  log(LOG_PREFIX, `API agent ${identity.name} on ${provider.name} (${model}) started`);
   return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver, settings: launchSettings(identity) };
 }
 
@@ -683,7 +735,10 @@ export async function launchAgent(
   const approvalMode = parseApprovalMode(config.approval_mode);
   await brokerClient.updateSlot({
     id: slot.id,
-    context_patch: { model: config.model ?? null, effort: config.effort ?? null, approval_mode: approvalMode },
+    context_patch: {
+      model: config.model ?? null, effort: config.effort ?? null, approval_mode: approvalMode,
+      ...(config.agent_type === "api" ? { provider_id: config.provider ?? null, provider_name: getProvider(config.provider)?.name ?? null } : {}),
+    },
   });
 
   if (config.file_ownership && config.file_ownership.length > 0) {
@@ -716,9 +771,12 @@ export async function launchAgent(
     model: config.model || undefined,
     effort: config.effort || undefined,
     approvalMode,
+    providerId: config.provider || undefined,
   };
 
   switch (config.agent_type) {
+    case "api":
+      return spawnApiAgent(identity, buildTaskPrompt(identity, config.initial_task, "driver"), brokerClient);
     case "claude": {
       const result = await spawnClaudeAgent(identity, buildTaskPrompt(identity, config.initial_task, "driver"), brokerClient);
       log(LOG_PREFIX, `Launched ${config.name} (PID ${result.pid}) in slot ${slot.id}`);
@@ -788,6 +846,8 @@ export async function relaunchIntoSlot(
     }
     case "codex":
       return spawnCodexAgent(identity, buildHandoffPrompt(identity, handoffTask, "driver"), brokerClient);
+    case "api":
+      return spawnApiAgent(identity, buildHandoffPrompt(identity, handoffTask, "driver"), brokerClient);
     default: {
       const result = spawnProcessAgent(slot.agent_type, identity, buildHandoffPrompt(identity, handoffTask, "inbox"));
       log(LOG_PREFIX, `Relaunched ${identity.name} (PID ${result.pid}) into existing slot ${slot.id}`);

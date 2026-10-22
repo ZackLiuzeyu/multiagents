@@ -8,7 +8,7 @@
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentEvent } from "./monitor.ts";
 import type { CodexDriver } from "./codex-driver.ts";
-import type { ClaudeDriver } from "./claude-driver.ts";
+import type { ClaudeSession } from "./claude-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
 import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH, codexDeveloperInstructions, slotSettings } from "./launcher.ts";
@@ -127,7 +127,7 @@ export interface RespawnResult {
   pid: number;
   process: import("bun").Subprocess;
   codexDriver?: CodexDriver;
-  claudeDriver?: ClaudeDriver;
+  claudeDriver?: ClaudeSession;
   settings?: { model?: string; effort?: string; approvalMode?: string };
 }
 

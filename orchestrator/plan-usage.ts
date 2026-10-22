@@ -278,11 +278,11 @@ async function probeGemini(): Promise<PlanUsage> {
   const file = Bun.file(join(process.env.GEMINI_CLI_HOME ?? homedir(), ".gemini", "oauth_creds.json"));
   if (!(await file.exists())) {
     return result("gemini", {
-      note: process.env.GEMINI_API_KEY ? "Gemini runs on an API key; Google does not report its quota." : "Sign in to Gemini CLI with Google to see its quota.",
+      note: process.env.GEMINI_API_KEY ? "Gemini runs on an API key; Google does not report its quota." : "Sign in to Gemini CLI with Google to see its quota (an Antigravity login is separate): run `npx @google/gemini-cli` once and choose Login with Google.",
     });
   }
   const creds = await file.json().catch(() => null) as { access_token?: string; expiry_date?: number } | null;
-  if (!creds?.access_token) return result("gemini", { note: "Sign in to Gemini CLI with Google to see its quota." });
+  if (!creds?.access_token) return result("gemini", { note: "Sign in to Gemini CLI with Google to see its quota (an Antigravity login is separate): run `npx @google/gemini-cli` once and choose Login with Google." });
   if (typeof creds.expiry_date === "number" && creds.expiry_date < Date.now() + 30_000) {
     return result("gemini", { note: "The Gemini login has expired; it refreshes the next time Gemini CLI runs." });
   }

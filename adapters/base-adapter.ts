@@ -79,7 +79,7 @@ const TOOLS = [
         },
         agent_type: {
           type: "string" as const,
-          enum: ["claude", "codex", "gemini", "custom", "all"],
+          enum: ["claude", "codex", "gemini", "api", "custom", "all"],
           description: "Optional filter by agent type. Defaults to all.",
         },
       },

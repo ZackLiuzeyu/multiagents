@@ -16,6 +16,7 @@ import { callOrchestratorTool, restartBroker, missingBrokerFeatures, type ToolRe
 import { controlSession, broadcastToTeam } from "../orchestrator/session-control.ts";
 import { detectAgent } from "../orchestrator/launcher.ts";
 import { HUMAN_SENDER } from "../shared/constants.ts";
+import { loadProviders, getProvider, saveProvider, deleteProvider, maskProvider, fetchProviderModels, normalizeBaseUrl, type ApiProvider } from "../shared/providers.ts";
 
 /** Sender id of everything a person does from the browser. */
 export const HUMAN_ID = HUMAN_SENDER;
@@ -28,7 +29,7 @@ const QA_HOLD_TEXT =
 const QA_RESUME_TEXT =
   "[RESUME] The person ended Q&A mode. Continue your task where you left off; messages your teammates sent meanwhile arrive now.";
 
-const AGENT_TYPES: AgentType[] = ["claude", "codex", "gemini"];
+const AGENT_TYPES: AgentType[] = ["claude", "codex", "gemini", "api"];
 const KNOWLEDGE_CATEGORIES: KnowledgeCategory[] = ["decision", "convention", "discovery", "blocker", "context"];
 const PLAN_STATUSES = ["pending", "in_progress", "blocked", "done"] as const;
 
@@ -145,6 +146,13 @@ function parseAgentConfig(raw: unknown, index: number): AgentLaunchConfig {
     ? a.file_ownership.filter((p): p is string => typeof p === "string" && p.trim() !== "").map((p) => p.trim())
     : [];
   const settings = parseSettings(a, agentType, `Agent ${index + 1}: `);
+  let provider: string | undefined;
+  if (agentType === "api") {
+    provider = str(a, "provider", { optional: true }).trim();
+    const p = getProvider(provider);
+    if (!p) throw new ApiError(`Agent ${index + 1}: pick an API provider (add one under API providers first)`);
+    if (!settings.model && !p.default_model) throw new ApiError(`Agent ${index + 1}: pick a model for ${p.name}`);
+  }
   return {
     agent_type: agentType,
     name,
@@ -155,6 +163,7 @@ function parseAgentConfig(raw: unknown, index: number): AgentLaunchConfig {
     ...(settings.model ? { model: settings.model } : {}),
     ...(settings.effort ? { effort: settings.effort } : {}),
     ...(settings.approval_mode ? { approval_mode: settings.approval_mode } : {}),
+    ...(provider ? { provider } : {}),
   };
 }
 
@@ -163,6 +172,8 @@ const EFFORTS: Record<AgentType, string[]> = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["minimal", "low", "medium", "high"],
   gemini: [],
+  // Sent as reasoning_effort; providers without it ignore or reject the field
+  api: ["minimal", "low", "medium", "high"],
   custom: [],
 };
 
@@ -222,6 +233,65 @@ const handlers: Record<string, Handler> = {
     const missing = await missingBrokerFeatures();
     if (missing.length) throw new ApiError(`The broker still lacks: ${missing.join(", ")}`, 500);
     return { message: "Broker restarted" };
+  },
+
+  // ---- API providers ("Other" agents: any OpenAI-compatible API) ----
+
+  async "providers/list"() {
+    return loadProviders().map(maskProvider);
+  },
+
+  async "providers/save"(_ctx, body) {
+    const name = str(body, "name").trim();
+    const base = str(body, "base_url").trim();
+    if (!name || !base) throw new ApiError("Name and base URL are required");
+    let extra: Record<string, unknown> | undefined;
+    const rawExtra = typeof body.extra_body === "string" ? body.extra_body.trim() : "";
+    if (rawExtra) {
+      try { extra = JSON.parse(rawExtra); } catch { throw new ApiError("Extra request fields must be a JSON object"); }
+      if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new ApiError("Extra request fields must be a JSON object");
+    }
+    try {
+      const saved = saveProvider({
+        id: str(body, "id", { optional: true }).trim() || undefined,
+        name, base_url: base,
+        api_key: str(body, "api_key", { optional: true, allowEmpty: true }),
+        default_model: str(body, "default_model", { optional: true, allowEmpty: true }),
+        extra_body: extra ?? {},
+        input_price: body.input_price as number | undefined,
+        output_price: body.output_price as number | undefined,
+        context_tokens: body.context_tokens as number | undefined,
+      });
+      availability = null; // "api" becomes available
+      return { message: `Saved ${saved.name}`, provider: maskProvider(saved) };
+    } catch (e) {
+      throw new ApiError(e instanceof Error ? e.message : String(e));
+    }
+  },
+
+  async "providers/delete"(_ctx, body) {
+    const id = str(body, "id");
+    if (!deleteProvider(id)) throw new ApiError("No such provider", 404);
+    availability = null;
+    return { message: "Provider removed" };
+  },
+
+  /** Check a provider (saved, or the form's unsaved values) by listing its models. */
+  async "providers/models"(_ctx, body) {
+    const id = str(body, "id", { optional: true }).trim();
+    const stored = id ? getProvider(id) : null;
+    const base = str(body, "base_url", { optional: true }).trim();
+    const key = str(body, "api_key", { optional: true, allowEmpty: true }).trim();
+    const p: ApiProvider | null = base
+      ? { id: stored?.id ?? "unsaved", name: str(body, "name", { optional: true }).trim() || stored?.name || "Provider", base_url: normalizeBaseUrl(base), api_key: key || stored?.api_key || "" }
+      : stored;
+    if (!p) throw new ApiError("Give a base URL or a saved provider");
+    try {
+      const models = await fetchProviderModels(p);
+      return { message: `${p.name}: ${models.length} model(s)`, models };
+    } catch (e) {
+      throw new ApiError(e instanceof Error ? e.message : String(e), 502);
+    }
   },
 
   // ---- Sessions ----
@@ -410,6 +480,12 @@ const handlers: Record<string, Handler> = {
     const session = await requireSession(ctx, body);
     const slot = await requireSlot(ctx, session, body);
     const patch: Record<string, unknown> = parseSettings(body, slot.agent_type);
+    if (slot.agent_type === "api" && patch.model === null) {
+      // Without a model a restarted agent could not launch: fall back to the provider's default, or refuse
+      const providerId = safeJsonParse<Record<string, unknown>>(slot.context_snapshot, {}).provider_id;
+      const p = getProvider(typeof providerId === "string" ? providerId : null);
+      if (!p?.default_model) throw new ApiError(`${p?.name ?? "This provider"} has no default model; keep a model set`);
+    }
     const limit = positiveOrNull(body, "token_limit");
     if (limit !== undefined) patch.token_limit = limit === null ? null : Math.round(limit);
     if (!Object.keys(patch).length) throw new ApiError("Nothing to change");

@@ -10,7 +10,8 @@
 export type PeerId = string;
 
 /** Supported agent CLI types */
-export type AgentType = "claude" | "codex" | "gemini" | "custom";
+/** "api": an OpenAI-compatible API provider (DeepSeek, Qwen, …) driven in-process, see orchestrator/api-driver.ts */
+export type AgentType = "claude" | "codex" | "gemini" | "api" | "custom";
 
 /** Message types for routing and formatting */
 export type MessageType =
@@ -458,6 +459,8 @@ export interface AgentLaunchConfig {
   effort?: string;
   /** Who approves the agent's tool calls; default "bypass" (fully autonomous). */
   approval_mode?: ApprovalMode;
+  /** For agent_type "api": the configured provider's id (shared/providers.ts) */
+  provider?: string;
 }
 
 /**

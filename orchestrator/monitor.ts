@@ -8,7 +8,7 @@
 import type { Subprocess } from "bun";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { CodexDriver, CodexNotification } from "./codex-driver.ts";
-import type { ClaudeDriver, ClaudeEvent } from "./claude-driver.ts";
+import type { ClaudeSession, ClaudeEvent } from "./claude-driver.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "monitor";
@@ -357,7 +357,7 @@ export async function processEvent(
  * as a plain Claude process (summaries, token usage, working transition).
  */
 export function monitorClaudeDriver(
-  driver: ClaudeDriver,
+  driver: ClaudeSession,
   slotId: number,
   sessionId: string,
   brokerClient: BrokerClient,

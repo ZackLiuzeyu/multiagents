@@ -9,7 +9,7 @@
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { Message } from "../shared/types.ts";
 import type { CodexDriver } from "./codex-driver.ts";
-import type { ClaudeDriver } from "./claude-driver.ts";
+import type { ClaudeSession } from "./claude-driver.ts";
 import { log } from "../shared/utils.ts";
 import { HUMAN_SENDER, HUMAN_SENDER_LABEL } from "../shared/constants.ts";
 
@@ -40,7 +40,8 @@ interface DriverSupervision {
 
 export type DriverSlot =
   | ({ kind: "codex"; driver: CodexDriver; threadId: string | null } & DriverSupervision)
-  | ({ kind: "claude"; driver: ClaudeDriver; inflight?: Set<number> } & DriverSupervision);
+  // Claude CLI sessions and API agents (both speak Claude's stream-json events)
+  | ({ kind: "claude"; driver: ClaudeSession; inflight?: Set<number> } & DriverSupervision);
 
 export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "in_flight" | "steered" | "replied" | "sent" | "failed";
 

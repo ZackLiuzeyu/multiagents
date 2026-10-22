@@ -18,6 +18,7 @@ export const POLL_INTERVALS: Record<AgentType, number> = {
   claude: 1000, // Also pushes a channel notification; headless sessions drop those
   codex: 300, // Aggressive: piggyback delivery depends on fast buffering
   gemini: 300, // Same as Codex — no push capability
+  api: 1000, // Driver-managed (the adapter runs in driver mode)
   custom: 500, // Reasonable default for unknown agents
 };
 
@@ -48,6 +49,7 @@ export const AGENT_ID_PREFIXES: Record<AgentType, string> = {
   claude: "cl",
   codex: "cx",
   gemini: "gm",
+  api: "ap",
   custom: "cu",
 };
 
