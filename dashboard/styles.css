@@ -687,3 +687,42 @@ html.has-bg .pane.center { background: color-mix(in srgb, var(--bg) var(--panel-
 html.has-bg .session-bar, html.has-bg .tabs, html.has-bg .chat-toolbar,
 html.has-bg .composer, html.has-bg #act-approvals, html.has-bg .day-sep span { background: transparent; }
 html.has-bg.bg-blur .topbar, html.has-bg.bg-blur .pane { backdrop-filter: blur(14px) saturate(1.1); -webkit-backdrop-filter: blur(14px) saturate(1.1); }
+
+/* --- Subscription plan limits --- */
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+.plan-block { border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 10px; background: var(--surface); }
+.plan-title { display: flex; align-items: center; gap: 8px; }
+.plan-title .avatar { width: 24px; height: 24px; border-radius: 7px; font-size: 10px; }
+.plan-windows { display: flex; flex-direction: column; gap: 10px; }
+.plan-window-head { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 3px; }
+.plan-meter { display: inline-flex; gap: 6px; cursor: pointer; }
+.plan-meter[hidden] { display: none; }
+.plan-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; padding: 1px 7px 1px 3px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface2); }
+.plan-chip.warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, var(--border)); }
+.plan-chip.over { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+.plan-chip .avatar.mini { width: 16px; height: 16px; border-radius: 50%; }
+
+/* --- Q&A mode and "interrupt and ask" --- */
+.banner.qa { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.banner.qa .banner-title { color: var(--accent); }
+.composer-interrupt { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); cursor: pointer; user-select: none; }
+.composer-interrupt[hidden] { display: none; }
+.composer-interrupt input { margin: 0; accent-color: var(--orange); }
+.composer-interrupt:has(input:checked) { color: var(--orange); font-weight: 600; }
+
+/* --- Live: an agent working right now --- */
+#chat-live:empty { display: none; }
+.live-row .bubble.live-bubble { background: var(--bubble-other); border-style: dashed; min-width: 180px; max-width: 100%; }
+.live-status { display: flex; align-items: center; gap: 8px; color: var(--text-dim); font-size: 13px; }
+.live-time { color: var(--text-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.typing-dots { display: inline-flex; gap: 3px; align-items: center; }
+.typing-dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: 0.25; animation: typing-dot 1.2s infinite ease-in-out; }
+.typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+.typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes typing-dot { 0%, 80%, 100% { opacity: 0.25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+@media (prefers-reduced-motion: reduce) { .typing-dots i { animation: none; opacity: 0.7; } }
+.live-text-wrap { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
+.live-text-wrap[hidden] { display: none; }
+.live-text-head { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--text-muted); }
+.live-text { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.5; color: var(--text-dim); font-style: italic; max-height: 4.6em; overflow: hidden; }
+.live-text-wrap.expanded .live-text { max-height: 40vh; overflow-y: auto; }

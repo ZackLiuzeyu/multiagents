@@ -29,6 +29,7 @@
       <div class="topbar-right">
         <span class="topbar-stat" id="agent-count"></span>
         <span class="topbar-stat" id="uptime"></span>
+        <span class="plan-meter" id="plan-meter" title="Plan limits" hidden></span>
         <span class="pill" id="broker-pill" title="Broker status"><span class="dot" id="broker-dot"></span><span id="broker-label">Broker</span></span>
         <span class="topbar-stat" id="ws-status"></span>
         <button class="icon-btn lang-btn" id="lang-btn" title="Language">EN</button>
@@ -71,12 +72,14 @@
           <div class="toolbar" id="session-toolbar">
             <button class="btn warn" data-action="session-pause">&#10074;&#10074; Pause</button>
             <button class="btn success" data-action="session-resume">&#9654; Resume</button>
+            <button class="btn" data-action="toggle-qa" id="qa-btn" title="Hold the team's work and ask agents questions one at a time">&#9995; Q&amp;A mode</button>
             <button class="btn" data-action="add-agent">+ Add Agent</button>
             <button class="btn" data-action="release-menu">Release &#9662;</button>
             <button class="btn" data-action="session-menu">More &#9662;</button>
           </div>
         </div>
         <div id="gate-banner" class="hidden"></div>
+        <div id="qa-banner" class="hidden"></div>
         <div id="approval-banner" class="hidden"></div>
 
         <div class="tabs" id="tab-bar">
@@ -105,6 +108,7 @@
                 <span>To</span>
                 <select id="composer-to"></select>
                 <span id="composer-target-hint"></span>
+                <label class="composer-interrupt" id="composer-interrupt-wrap" title="Stop what this agent is doing so it answers you first"><input type="checkbox" id="composer-interrupt"><span>Interrupt</span></label>
                 <span style="flex:1"></span>
                 <button class="btn ghost small" id="composer-presets" title="Quick messages">&#9889; Quick</button>
               </div>

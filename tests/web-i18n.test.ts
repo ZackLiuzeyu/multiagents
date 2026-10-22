@@ -38,6 +38,19 @@ describe("dashboard i18n", () => {
     expect(missing).toEqual([]);
   });
 
+  test("plan-limit notes and window labels from the server are translated", async () => {
+    const { tr } = await loadI18n("zh");
+    const src = await Bun.file(join(DIR, "..", "orchestrator", "plan-usage.ts")).text();
+    const texts = [
+      ...[...src.matchAll(/note: (?:[^"\n]*\? )?"([^"]+)"/g)].map((m) => m[1]!),
+      ...[...src.matchAll(/\["\w+", "([A-Z0-9][^"]+)"\]/g)].map((m) => m[1]!),
+      "Weekly · Fable", "Daily · gemini-2.5-pro", "8-hour window", "42 / 100 left",
+    ];
+    expect(texts.length).toBeGreaterThan(15);
+    const untranslated = texts.filter((t) => tr(t) === t);
+    expect(untranslated).toEqual([]);
+  });
+
   test("placeholders survive translation and English passes through", async () => {
     const zh = await loadI18n("zh");
     expect(zh.tr("Release {name}?", { name: "Claude" })).toBe("释放 Claude？");

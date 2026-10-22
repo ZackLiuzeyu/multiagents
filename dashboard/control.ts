@@ -15,9 +15,18 @@ import { createSessionRecord, exportSessionData } from "../shared/session-ops.ts
 import { callOrchestratorTool, type ToolResult } from "../orchestrator/runtime.ts";
 import { controlSession, broadcastToTeam } from "../orchestrator/session-control.ts";
 import { detectAgent } from "../orchestrator/launcher.ts";
+import { HUMAN_SENDER } from "../shared/constants.ts";
 
 /** Sender id of everything a person does from the browser. */
-export const HUMAN_ID = "human";
+export const HUMAN_ID = HUMAN_SENDER;
+
+const QA_HOLD_TEXT =
+  "[HOLD — Q&A MODE] The person has put the team's work on hold to ask questions. Stop your current task now: " +
+  "do not edit files, run commands or builds, or message teammates. Wait for the person's questions and answer each one " +
+  "with send_message(to_id=\"human\"), briefly and directly; you may read files to answer. " +
+  "Do not resume work until a [RESUME] message arrives.";
+const QA_RESUME_TEXT =
+  "[RESUME] The person ended Q&A mode. Continue your task where you left off; messages your teammates sent meanwhile arrive now.";
 
 const AGENT_TYPES: AgentType[] = ["claude", "codex", "gemini"];
 const KNOWLEDGE_CATEGORIES: KnowledgeCategory[] = ["decision", "convention", "discovery", "blocker", "context"];
@@ -254,6 +263,24 @@ const handlers: Record<string, Handler> = {
     return await tool("delete_session", { session_id: session.id });
   },
 
+  /**
+   * Q&A mode: hold the team's work so the person can ask agents questions one
+   * at a time. Running turns stop, agents only hear the person (and the
+   * orchestrator) and may only read; teammates' messages wait until it ends.
+   */
+  async "session/qa"(ctx, body) {
+    const session = await requireSession(ctx, body);
+    const enabled = body.enabled === true;
+    const wasOn = !!safeJsonParse<Record<string, unknown>>(session.config, {}).qa_mode;
+    if (enabled === wasOn) return { message: enabled ? "Q&A mode is already on" : "Q&A mode is already off" };
+    await ctx.broker.updateSession({ id: session.id, config_patch: { qa_mode: enabled ? { since: Date.now() } : null } });
+    const slots = (await ctx.broker.listSlots(session.id)).filter((s) => s.task_state !== "released");
+    for (const slot of slots) {
+      await ctx.broker.sendMessage({ from_id: "orchestrator", to_slot_id: slot.id, text: enabled ? QA_HOLD_TEXT : QA_RESUME_TEXT, msg_type: "system", session_id: session.id });
+    }
+    return { message: enabled ? "Q&A mode on: the team's work is on hold" : "Q&A mode off: the team resumes its work" };
+  },
+
   async "session/human-gate"(ctx, body) {
     const session = await requireSession(ctx, body);
     const enabled = body.enabled === true;
@@ -428,6 +455,11 @@ const handlers: Record<string, Handler> = {
     const slot = await requireSlot(ctx, session, body);
     const result = await ctx.broker.sendMessage({ from_id: HUMAN_ID, to_slot_id: slot.id, text, msg_type: "chat", session_id: session.id });
     if (!result.ok) throw new ApiError(result.error ?? "Broker refused the message", 422);
+    // "Interrupt and ask": the host running the agent stops its current turn, so the question is answered next
+    if (body.interrupt === true) {
+      await ctx.broker.updateSlot({ id: slot.id, context_patch: { interrupt_at: Date.now() } });
+      return { message: `Interrupted ${slot.display_name ?? `slot ${slot.id}`} and asked`, warning: result.warning };
+    }
     return { message: result.warning ?? `Sent to ${slot.display_name ?? `slot ${slot.id}`}`, warning: result.warning };
   },
 

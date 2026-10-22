@@ -10,6 +10,17 @@
 
 "use strict";
 
+// A dashboard server started before an update serves the new page but not
+// files it doesn't know yet (i18n.js): run in English instead of stopping here.
+const STALE_SERVER = typeof tr !== "function";
+if (STALE_SERVER) {
+  const en = (s, vars) => String(s ?? "").replace(/\{(\w+)\}/g, (all, k) => (vars && k in vars ? String(vars[k] ?? "") : all));
+  Object.assign(window, {
+    tr: en, LANGS: { en: "English" }, getLang: () => "en", setLang: () => {}, locale: () => "en-US",
+    translateStatic: () => {}, translateTree: () => {},
+  });
+}
+
 let state = null;
 let activeTab = "chat";
 let ws = null;
@@ -274,6 +285,7 @@ function switchTab(tab) {
   document.querySelectorAll("#tab-bar .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   for (const t of TABS) $(`panel-${t}`).classList.toggle("hidden", t !== tab);
   store.set("ma-tab", tab);
+  if (tab === "stats" && (!planUsage.data || Date.now() - planUsage.loadedAt > 60_000)) { planUsage.loadedAt = Date.now(); loadPlanUsage(); }
   if (state) render(true);
   if (tab === "chat") $("composer-text").focus();
 }
@@ -325,14 +337,18 @@ function render(force = false) {
   renderSidebar();
   renderSessionBar();
   renderGateBanner();
+  renderQaBanner();
   renderApprovals();
   renderBadges();
   refreshAgentSelects();
   renderRoster();
   explorerSync();
 
+  if (state.live && (state.sessionId !== liveView.sid || !liveView.at || Date.now() - liveView.at > 2_000)) {
+    liveView.data = state.live; liveView.sid = state.sessionId; liveView.at = Date.now();
+  }
   switch (activeTab) {
-    case "chat": renderChat(force); break;
+    case "chat": renderChat(force); renderLive(); break;
     case "agents": renderAgents(); break;
     case "plan": renderPlan(); break;
     case "knowledge": renderKnowledge(); break;
@@ -1283,6 +1299,9 @@ function systemText(m) {
     if (m.msg_type === "role_assignment" && j.role) return tr("role set to {role}", { role: j.role });
     if (m.msg_type === "rename" && j.display_name) return tr("renamed to {name}", { name: j.display_name });
   } catch { /* plain text */ }
+  // Q&A mode announcements are long instructions for the agents; people get the gist
+  if (t.startsWith("[HOLD — Q&A MODE]")) return tr("Q&A mode started — work is on hold");
+  if (t.startsWith("[RESUME]")) return tr("Q&A mode ended — work resumes");
   return t.replace(/\s+/g, " ");
 }
 
@@ -1370,6 +1389,7 @@ function renderChat(force) {
   }
   feed.innerHTML = html;
   hydrateFileRefs(feed);
+  renderLive();
 
   if (atBottom || force || firstRender) {
     feed.scrollTop = feed.scrollHeight;
@@ -1378,6 +1398,81 @@ function renderChat(force) {
     $("jump-new").classList.remove("hidden");
   }
 }
+
+// --- Live: agents working right now (typing dots, thinking as it streams) ---
+
+const liveView = { data: {}, sid: null, el: document.createElement("div"), expanded: store.get("ma-live-expanded", true), polling: false };
+liveView.el.id = "chat-live";
+
+const LIVE_PHASE = { waiting: "Working", thinking: "Thinking", writing: "Writing a reply", tool: "Running a tool" };
+
+function renderLive() {
+  const feed = $("msg-feed");
+  const el = liveView.el;
+  if (!state?.session) { el.replaceChildren(); return; }
+  if (el.parentNode !== feed || feed.lastElementChild !== el) feed.appendChild(el);
+  const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 120;
+  const busy = Object.entries(liveView.sid === state.sessionId ? liveView.data : {})
+    .map(([id, l]) => ({ slot: slotById(Number(id)), l }))
+    .filter(({ slot, l }) => slot && l.busy);
+  const keep = new Set(busy.map(({ slot }) => String(slot.id)));
+  for (const row of [...el.children]) if (!keep.has(row.dataset.slot)) row.remove();
+  for (const { slot, l } of busy) {
+    let row = el.querySelector(`[data-slot="${slot.id}"]`);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "msg live-row";
+      row.dataset.slot = String(slot.id);
+      row.innerHTML = `${slotAvatar(slot)}<div class="msg-body">
+        <div class="msg-head"><span class="msg-name"></span><span class="msg-role"></span></div>
+        <div class="bubble live-bubble"><div class="live-status"><span class="live-label"></span><span class="typing-dots"><i></i><i></i><i></i></span><span class="live-time"></span></div>
+          <div class="live-text-wrap"><div class="live-text-head"><span class="live-text-label"></span><button type="button" class="btn ghost small" data-live-toggle></button></div><div class="live-text"></div></div></div>
+      </div>`;
+      el.appendChild(row);
+    }
+    row.querySelector(".msg-name").textContent = slotName(slot);
+    row.querySelector(".msg-role").textContent = slot.role ?? "";
+    const label = l.phase === "tool" && l.tool ? tr("Running {tool}", { tool: tr(l.tool) }) : tr(LIVE_PHASE[l.phase] ?? "Working");
+    row.querySelector(".live-label").textContent = label;
+    row.querySelector(".live-time").textContent = l.since ? fmtDuration(Date.now() - l.since) : "";
+    const wrap = row.querySelector(".live-text-wrap");
+    const hasText = !!l.text && (l.phase === "thinking" || l.phase === "writing");
+    wrap.hidden = !hasText;
+    if (hasText) {
+      wrap.classList.toggle("expanded", liveView.expanded);
+      row.querySelector(".live-text-label").textContent = tr(l.phase === "thinking" ? "Thinking" : "Reply so far");
+      row.querySelector("[data-live-toggle]").textContent = tr(liveView.expanded ? "Collapse" : "Expand");
+      const box = row.querySelector(".live-text");
+      const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+      if (box.textContent !== l.text) box.textContent = l.text;
+      if (stick) box.scrollTop = box.scrollHeight;
+    }
+  }
+  if (atBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+liveView.el.addEventListener("click", (e) => {
+  if (!e.target.closest("[data-live-toggle]")) return;
+  liveView.expanded = !liveView.expanded;
+  store.set("ma-live-expanded", liveView.expanded);
+  renderLive();
+});
+
+/** Fast poll while the chat is open and someone is working (state pushes cover the rest). */
+async function pollLive() {
+  if (liveView.polling || !state?.sessionId || document.hidden || activeTab !== "chat") return;
+  const anyBusy = Object.values(liveView.data).some((l) => l.busy);
+  if (!anyBusy && Date.now() - (liveView.at ?? 0) < 3_000) return;
+  liveView.polling = true;
+  const sid = state.sessionId;
+  try {
+    const data = await api(`live?session_id=${encodeURIComponent(sid)}`);
+    if (sid === state?.sessionId) { liveView.data = data ?? {}; liveView.sid = sid; liveView.at = Date.now(); renderLive(); }
+  } catch { /* next tick */ } finally {
+    liveView.polling = false;
+  }
+}
+setInterval(pollLive, 800);
 
 $("msg-feed").addEventListener("click", (e) => {
   const b = e.target.closest(".bubble.collapsed");
@@ -1409,6 +1504,8 @@ function refreshAgentSelects() {
     ? `${taskLabel(slot.task_state)}${isPaused(slot) ? tr(" · paused (held until resume)") : ""}`
     : tr("{n} online", { n: live.filter((s) => s.status === "connected" && !isPaused(s)).length });
   $("composer-send").disabled = !state.session || state.session.status === "archived";
+  // Interrupting is for one agent; in Q&A mode nobody is working anyway
+  $("composer-interrupt-wrap").hidden = !slot || state.qaMode;
 }
 
 function fillSelect(id, html) {
@@ -1433,7 +1530,8 @@ async function sendComposer() {
   const text = ta.value.trim();
   if (!text) return;
   const to = $("composer-to").value;
-  const r = await run($("composer-send"), "Send", () => api("messages/send", { session_id: sid, slot_id: to === "all" ? "all" : parseInt(to, 10), text }));
+  const interrupt = to !== "all" && $("composer-interrupt").checked;
+  const r = await run($("composer-send"), "Send", () => api("messages/send", { session_id: sid, slot_id: to === "all" ? "all" : parseInt(to, 10), text, interrupt }));
   if (r) {
     ta.value = "";
     autosize();
@@ -1483,6 +1581,17 @@ function renderSessionBar() {
   tb.querySelector('[data-action="add-agent"]').disabled = !has || archived;
   tb.querySelector('[data-action="release-menu"]').disabled = !has;
   tb.querySelector('[data-action="session-menu"]').disabled = !has;
+}
+
+function renderQaBanner() {
+  const el = $("qa-banner");
+  $("qa-btn").innerHTML = state.qaMode ? `&#9654; ${esc(tr("End Q&A"))}` : `&#9995; ${esc(tr("Q&A mode"))}`;
+  $("qa-btn").classList.toggle("primary", !!state.qaMode);
+  if (!state.qaMode || !state.session) { el.className = "hidden"; el.innerHTML = ""; return; }
+  el.className = "banner qa";
+  el.innerHTML = `<span class="banner-title">&#9995; ${tr("Q&A mode — work is on hold")}</span>
+    <span class="dim">${tr("Agents stopped their tasks and only answer you. Pick an agent under To and ask; teammates' messages wait until you end Q&A.")}</span>
+    <span class="toolbar"><button class="btn primary" data-action="toggle-qa">${tr("End Q&A, resume work")}</button></span>`;
 }
 
 function renderGateBanner() {
@@ -1952,7 +2061,7 @@ function renderStats() {
     </div>`).join("");
 
   const lim = (k) => (limits[k] ? String(limits[k]) : "");
-  el.innerHTML = `<div class="stats-grid">${cardsHtml}</div>
+  el.innerHTML = `${planCardHtml()}<div class="stats-grid">${cardsHtml}</div>
     <div class="card"><div class="card-header">${tr("Usage per agent")} <span style="text-transform:none;letter-spacing:0;font-weight:400">${tr("tokens as the CLIs report them; cost only where the CLI reports it")}</span></div>
       <div class="table-wrap"><table class="table"><thead><tr><th>${tr("Agent")}</th><th class="num">${tr("Input")}</th><th class="num">${tr("Output")}</th><th class="num">${tr("Cache reads")}</th><th class="num">${tr("Cost")}</th><th>${tr("Limit")}</th><th></th></tr></thead>
       <tbody>${rows || `<tr><td colspan="7" class="muted">${tr("No agents yet")}</td></tr>`}</tbody></table></div></div>
@@ -1969,6 +2078,81 @@ function renderStats() {
       </div></div>
     ${guardrails ? `<div class="card"><div class="card-header">${tr("Guardrails")}</div><div class="card-body">${guardrails}</div></div>` : ""}`;
 }
+
+// --- Subscription plan limits (5-hour / weekly / daily windows of each CLI) ---
+
+const planUsage = { data: null, loading: false, error: null };
+const PLAN_NAMES = { claude: "Claude", codex: "Codex (ChatGPT)", gemini: "Gemini" };
+
+async function loadPlanUsage(refresh = false) {
+  if (planUsage.loading) return;
+  planUsage.loading = true;
+  if (activeTab === "stats" && state) renderStats();
+  try {
+    planUsage.data = await api(`plan-usage${refresh ? "?refresh=1" : ""}`);
+    planUsage.error = null;
+  } catch (e) {
+    planUsage.error = e.message;
+  } finally {
+    planUsage.loading = false;
+  }
+  renderPlanMeter();
+  if (activeTab === "stats" && state) renderStats();
+}
+
+function pctBar(p) {
+  const v = Math.max(0, Math.min(100, p ?? 0));
+  return `<div class="usage-bar${v >= 95 ? " over" : v >= 80 ? " warn" : ""}" title="${Math.round(v)}%"><div style="width:${v}%"></div></div>`;
+}
+
+/** "resets in 2h 13m · Fri 14:00" */
+function resetText(ms) {
+  if (!ms) return "";
+  const left = ms - Date.now();
+  if (left <= 0) return tr("resets now");
+  const when = new Date(ms).toLocaleString(locale(), left > 20 * 3600_000 ? { weekday: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+  return tr("resets in {time} · {when}", { time: fmtDuration(left), when });
+}
+
+function planCardHtml() {
+  const data = planUsage.data;
+  const head = `<div class="card-header" style="justify-content:flex-start">${tr("Plan limits")} <span style="text-transform:none;letter-spacing:0;font-weight:400">${tr("subscription quota as each CLI reports it")}</span>
+    <button class="btn small" data-plan-refresh style="margin-left:auto" ${planUsage.loading ? "disabled" : ""}>${planUsage.loading ? tr("Loading…") : tr("Refresh")}</button></div>`;
+  if (!data) {
+    return `<div class="card">${head}<div class="card-body muted">${planUsage.error ? esc(tr(planUsage.error)) : tr("Loading…")}</div></div>`;
+  }
+  const blocks = data.map((p) => {
+    const icon = avatarHtml(null, { type: p.provider, name: PLAN_NAMES[p.provider], color: "#6e7781" }, "", "", "plan-icon");
+    const windows = p.windows.map((w) => `<div class="plan-window">
+        <div class="plan-window-head"><span>${esc(tr(w.label))}</span><b>${w.usedPercent == null ? "—" : `${Math.round(w.usedPercent)}%`}</b></div>
+        ${pctBar(w.usedPercent)}
+        <div class="field-hint">${[w.detail ? esc(tr(w.detail)) : "", resetText(w.resetsAt)].filter(Boolean).join(" · ")}</div>
+      </div>`).join("");
+    const note = p.note || p.error ? `<div class="field-hint">${esc(tr(p.note ?? p.error))}</div>` : "";
+    return `<div class="plan-block">
+      <div class="plan-title">${icon}<b>${esc(PLAN_NAMES[p.provider])}</b>${p.plan ? `<span class="badge badge-mode">${esc(p.plan)}</span>` : ""}</div>
+      ${windows ? `<div class="plan-windows">${windows}</div>` : ""}${note}
+    </div>`;
+  }).join("");
+  return `<div class="card">${head}<div class="card-body plan-grid">${blocks}</div></div>`;
+}
+
+/** Top bar: the fullest window of each provider that has any. */
+function renderPlanMeter() {
+  const el = $("plan-meter");
+  const shown = (planUsage.data ?? []).filter((p) => p.ok && p.windows.length);
+  if (!shown.length) { el.innerHTML = ""; el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = shown.map((p) => {
+    const top = p.windows.filter((w) => w.usedPercent != null).sort((a, b) => b.usedPercent - a.usedPercent)[0] ?? p.windows[0];
+    const v = Math.round(top.usedPercent ?? 0);
+    const tip = p.windows.map((w) => `${tr(w.label)}: ${w.usedPercent == null ? "—" : `${Math.round(w.usedPercent)}%`}`).join("\n");
+    return `<span class="plan-chip${v >= 95 ? " over" : v >= 80 ? " warn" : ""}" title="${esc(`${PLAN_NAMES[p.provider]}\n${tip}`)}">${avatarHtml(null, { type: p.provider, name: p.provider, color: "#6e7781" }, "", "", "mini")}${v}%</span>`;
+  }).join("");
+}
+
+$("plan-meter").addEventListener("click", () => switchTab("stats"));
+$("panel-stats").addEventListener("click", (e) => { if (e.target.closest("[data-plan-refresh]")) loadPlanUsage(true); });
 
 function limitBar(used, limit) {
   const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
@@ -2372,6 +2556,15 @@ async function globalAction(action, btn) {
     case "release-menu": return openMenu(btn, releaseMenuItems(sid));
     case "session-menu": return openMenu(btn, sessionMenuItems(state.session));
     case "toggle-gate": return run(btn, "Human gate", () => api("session/human-gate", { session_id: sid, enabled: !state.humanGate }));
+    case "toggle-qa": {
+      if (state.qaMode) return run(btn, "Q&A mode", () => api("session/qa", { session_id: sid, enabled: false }));
+      const ok = await confirmDialog({
+        title: "Put the team's work on hold?", sid, confirmLabel: "Start Q&A",
+        message: `<p>${tr("Every agent stops its current turn and waits. Then ask one agent at a time (pick it under <b>To</b>); it answers you in the chat and may read files, but not edit or run commands. Teammates' messages wait until you end Q&A, and then everyone resumes.")}</p>`,
+      });
+      if (ok) return run(btn, "Q&A mode", () => api("session/qa", { session_id: sid, enabled: true }));
+      return;
+    }
     case "gate-release": return releaseAll(sid, true, btn);
     case "gate-sendback": return sendBackModal(sid, null);
   }
@@ -2781,8 +2974,10 @@ function fmtBytes(n) {
 }
 function fmtDuration(ms) {
   const t = Math.max(0, Math.round(ms / 1000));
-  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
-  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+  const d = Math.floor(t / 86400), h = Math.floor((t % 86400) / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  if (d >= 2) return tr("{d}d {h}h", { d, h });
+  if (d > 0 || h > 0) return tr("{h}h {m}m", { h: d * 24 + h, m });
+  return m > 0 ? tr("{m}m {s}s", { m, s }) : tr("{s}s", { s });
 }
 function fmtTime(iso) {
   try { return new Date(iso).toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" }); } catch { return ""; }
@@ -2873,3 +3068,6 @@ switchRightTab(store.get("ma-rtab", "preview"));
 closePreview();
 renderTree();
 connectWs();
+loadPlanUsage();
+setInterval(() => { if (!document.hidden) loadPlanUsage(); }, 5 * 60_000);
+if (STALE_SERVER) toast("This dashboard server is older than the page: stop the old dashboard process and start it again. / 网页服务是旧版本：请结束旧的 dashboard 进程后重新启动。", "error");

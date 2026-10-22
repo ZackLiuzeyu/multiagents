@@ -35,6 +35,7 @@ import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget, pauseAgent } from "./session-control.ts";
 import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox, limitVerdict, type UsageLimits } from "./supervision.ts";
+import { LiveTracker } from "./live.ts";
 import { ActivityRecorder, awaitApproval, claudeActivity, codexActivity, geminiActivity, describeTool, isTeamTool, CLAUDE_PERMISSION_MODE, CODEX_APPROVAL_POLICY } from "./activity.ts";
 
 const LOG_PREFIX = "orchestrator";
@@ -48,6 +49,25 @@ const pendingEvents: AgentEvent[] = [];
 const activeDrivers = new DriverRegistry();
 // One respawn per slot at a time, whichever path (crash, code-0 exit, watchdog, resume) triggers it
 const respawnGuard = new RespawnGuard();
+
+// --- Q&A mode: the person put the team's work on hold to ask questions ---
+// Session config `qa_mode` is set from a dashboard. The broker then hands agents
+// only the person's and the orchestrator's messages; here running turns are
+// interrupted, edits and commands are refused, and nudges / respawns wait.
+const qaCache = new Map<string, { on: boolean; at: number }>();
+
+async function qaModeOn(sessionId: string, brokerClient: BrokerClient): Promise<boolean> {
+  const hit = qaCache.get(sessionId);
+  if (hit && Date.now() - hit.at < 2_500) return hit.on;
+  const session = await brokerClient.getSession(sessionId).catch(() => null);
+  const on = !!safeJsonParse<Record<string, unknown>>(session?.config ?? "{}", {}).qa_mode;
+  qaCache.set(sessionId, { on, at: Date.now() });
+  return on;
+}
+
+/** Tools an agent may still use in Q&A mode: reading, to answer questions about its work. */
+const QA_READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRead", "TodoWrite", "WebSearch", "WebFetch"]);
+const QA_DENIAL = "Work is on hold (Q&A mode): the person is asking questions. Do not edit files or run commands — answer with send_message(to_id=\"human\") and wait for [RESUME].";
 
 interface LaunchedAgent {
   pid: number;
@@ -117,8 +137,12 @@ function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, b
       : null;
   if (!state) {
     const recorder = new ActivityRecorder(sessionId, slotId, brokerClient);
-    monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent, (event) => recorder.push(...geminiActivity(event)));
-    result.process.exited.then(() => recorder.flush());
+    const live = new LiveTracker(sessionId, slotId, brokerClient);
+    monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent, (event) => {
+      recorder.push(...geminiActivity(event));
+      live.gemini(event as Record<string, any>);
+    });
+    result.process.exited.then(() => { live.dispose(); return recorder.flush(); });
     return;
   }
 
@@ -151,7 +175,10 @@ function superviseDriver(sessionId: string, slotId: number, state: DriverSlot, b
   const recorder = new ActivityRecorder(sessionId, slotId, brokerClient);
   const stillWanted = () => state.driver.alive && activeDrivers.get(sessionId, slotId) === state;
   const alwaysAllowed = new Set<string>();
+  const live = new LiveTracker(sessionId, slotId, brokerClient, () =>
+    state.driver.alive && (state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null));
   state.driver.onExit((code) => {
+    live.dispose();
     recorder.push({ kind: "status", title: `Agent process exited (code ${code})` });
     void recorder.flush();
   });
@@ -171,9 +198,17 @@ function superviseDriver(sessionId: string, slotId: number, state: DriverSlot, b
 
   if (state.kind === "claude") {
     const tools = new Map<string, { name: string; title: string }>();
-    state.driver.onEvent((event) => recorder.push(...claudeActivity(event as Record<string, any>, tools)), { replay: true });
+    state.driver.onEvent((event) => {
+      live.claude(event as Record<string, any>);
+      if ((event as { type?: string }).type !== "stream_event") recorder.push(...claudeActivity(event as Record<string, any>, tools));
+    }, { replay: true });
     state.driver.onPermissionRequest(async (req) => {
       if (isTeamTool(req.toolName)) return { behavior: "allow" };
+      if (await qaModeOn(sessionId, brokerClient)) {
+        if (QA_READ_ONLY_TOOLS.has(req.toolName)) return { behavior: "allow" };
+        recorder.push({ kind: "approval", title: `Refused in Q&A mode · ${describeTool(req.toolName, req.input)}` });
+        return { behavior: "deny", message: QA_DENIAL };
+      }
       const key = approvalKey(req.toolName, req.input);
       if (alwaysAllowed.has(key)) return { behavior: "allow" };
       const outcome = await ask(req.toolName, describeTool(req.toolName, req.input), req.input);
@@ -190,9 +225,15 @@ function superviseDriver(sessionId: string, slotId: number, state: DriverSlot, b
         items.set((params.item as { id: string }).id, params.item as Record<string, any>);
       }
       if (method === "item/completed" && params.item) items.delete((params.item as { id?: string }).id ?? "");
+      live.codex(method, params as Record<string, any>);
       recorder.push(...codexActivity(method, params as Record<string, any>));
     });
     state.driver.onApprovalRequest(async ({ kind, params }) => {
+      // Q&A mode runs Codex with "untrusted": reads go through, anything else is refused
+      if (await qaModeOn(sessionId, brokerClient)) {
+        recorder.push({ kind: "approval", title: `Refused in Q&A mode · ${kind === "command" ? "shell command" : "file change"}` });
+        return "decline";
+      }
       const item = items.get(String(params.itemId ?? ""));
       const command = Array.isArray(params.command) ? params.command.join(" ") : (params.command as string | undefined) ?? (item?.command as string | undefined);
       const changes = (item?.changes as Array<{ path?: string }> | undefined) ?? [];
@@ -221,8 +262,10 @@ function recorderOf(state: DriverSlot): ActivityRecorder | undefined {
  * mode edited in a dashboard apply live (Claude: control requests; Codex: the
  * next turn), and a paused slot's running turn is interrupted.
  */
-async function reconcileDriver(slot: Slot, state: DriverSlot): Promise<void> {
+async function reconcileDriver(slot: Slot, state: DriverSlot, qa = false): Promise<void> {
   const want = slotSettings(slot);
+  // Q&A mode: every tool goes through the handler, which only lets reads pass
+  if (qa) want.approvalMode = "ask";
   const recorder = recorderOf(state);
   // A driver launched without a record of its settings is taken to run the slot's current ones
   state.applied ??= launchedSettings(state.kind, want);
@@ -252,10 +295,34 @@ async function reconcileDriver(slot: Slot, state: DriverSlot): Promise<void> {
       recorder?.push({ kind: "status", title: `Effort → ${want.effort ?? "default"} (applies when the agent restarts)` });
     }
   } else {
-    if (applied.model !== want.model || applied.effort !== want.effort || applied.approvalMode !== want.approvalMode) {
-      state.driver.settings = { approvalPolicy: CODEX_APPROVAL_POLICY[want.approvalMode], model: want.model, effort: want.effort };
+    const qaApplied = (state as DriverSlot & { qaSandbox?: boolean }).qaSandbox === true;
+    if (applied.model !== want.model || applied.effort !== want.effort || applied.approvalMode !== want.approvalMode || qaApplied !== qa) {
+      (state as DriverSlot & { qaSandbox?: boolean }).qaSandbox = qa;
+      state.driver.settings = { approvalPolicy: CODEX_APPROVAL_POLICY[want.approvalMode], model: want.model, effort: want.effort, ...(qa ? { sandbox: "read-only" as const } : {}) };
       recorder?.push({ kind: "status", title: `Settings for the next turn: model ${want.model ?? "default"} · effort ${want.effort ?? "default"} · approvals ${want.approvalMode}` });
       Object.assign(applied, { model: want.model, effort: want.effort, approvalMode: want.approvalMode });
+    }
+  }
+
+  // Q&A mode starting, or the person asked to interrupt ("interrupt and ask"), stops the running turn
+  const snap = safeJsonParse<Record<string, unknown>>(slot.context_snapshot, {});
+  const interruptAt = typeof snap.interrupt_at === "number" ? snap.interrupt_at : 0;
+  const ext = state as DriverSlot & { qaInterrupted?: boolean; interruptSeen?: number };
+  ext.interruptSeen ??= interruptAt; // requests from before this driver started are old
+  const wantInterrupt = (qa && !ext.qaInterrupted) || interruptAt > ext.interruptSeen;
+  ext.interruptSeen = Math.max(ext.interruptSeen, interruptAt);
+  if (!qa) ext.qaInterrupted = false;
+  if (wantInterrupt) {
+    if (qa) ext.qaInterrupted = true;
+    const running = state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null;
+    if (running) {
+      try {
+        if (state.kind === "claude") await state.driver.interrupt();
+        else await state.driver.interrupt(state.threadId ?? state.driver.threadId ?? "");
+        recorder?.push({ kind: "status", title: qa ? "Q&A mode — the running turn was interrupted" : "Interrupted to answer the person" });
+      } catch (err) {
+        log(LOG_PREFIX, `Interrupt failed for slot ${slot.id}: ${err}`);
+      }
     }
   }
 
@@ -1841,12 +1908,13 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
   setInterval(nonOverlapping(async () => {
     for (const [sessionId, drivers] of activeDrivers.sessions()) {
       const slots = new Map((await brokerClient.listSlots(sessionId).catch(() => [] as Slot[])).map((s) => [s.id, s]));
+      const qa = await qaModeOn(sessionId, brokerClient);
       for (const [slotId, state] of drivers) {
         if (!state.driver.alive) continue;
 
         const slot = slots.get(slotId);
         if (slot) {
-          try { await reconcileDriver(slot, state); } catch (err) { log(LOG_PREFIX, `Settings sync failed for slot ${slotId}: ${err}`); }
+          try { await reconcileDriver(slot, state, qa); } catch (err) { log(LOG_PREFIX, `Settings sync failed for slot ${slotId}: ${err}`); }
         }
 
         if (state.kind === "codex") {
@@ -1876,6 +1944,8 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
   setInterval(async () => {
     for (const sessionId of activeProcesses.keys()) {
       try {
+        // Agents waiting for the person's questions are silent on purpose
+        if (await qaModeOn(sessionId, brokerClient)) continue;
         const slots = await brokerClient.listSlots(sessionId);
         for (const slot of slots) {
           if (slot.status !== "connected" || !slot.peer_id) continue;
@@ -2018,6 +2088,8 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
   setInterval(async () => {
     for (const sessionId of activeProcesses.keys()) {
       try {
+        // The person is talking to the team: never end the session under them
+        if (await qaModeOn(sessionId, brokerClient)) { sessionCompletionTimers.delete(sessionId); continue; }
         const slots = await brokerClient.listSlots(sessionId);
         if (slots.length === 0) continue;
 
@@ -2125,6 +2197,8 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
   setInterval(async () => {
     for (const sessionId of activeProcesses.keys()) {
       try {
+        // Teammates' messages held during Q&A mode are no reason to respawn anyone
+        if (await qaModeOn(sessionId, brokerClient)) continue;
         const slots = await brokerClient.listSlots(sessionId);
         for (const slot of slots) {
           const taskState = (slot as any).task_state;

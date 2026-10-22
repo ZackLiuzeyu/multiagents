@@ -11,6 +11,7 @@ import type { Message } from "../shared/types.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import type { ClaudeDriver } from "./claude-driver.ts";
 import { log } from "../shared/utils.ts";
+import { HUMAN_SENDER, HUMAN_SENDER_LABEL } from "../shared/constants.ts";
 
 const LOG_PREFIX = "delivery";
 
@@ -48,6 +49,7 @@ type SenderInfo = { display_name: string | null; role: string | null };
 /** One line per message: type, sender name/role and the peer id to reply to. */
 export function formatForwardedMessages(messages: Message[], senders: Map<number, SenderInfo>): string {
   return messages.map((m) => {
+    if (m.from_id === HUMAN_SENDER) return `[${m.msg_type}] ${HUMAN_SENDER_LABEL}: ${m.text}`;
     const sender = m.from_slot_id !== null ? senders.get(m.from_slot_id) : undefined;
     const name = sender?.display_name ?? (m.from_slot_id !== null ? `slot ${m.from_slot_id}` : m.from_id);
     const role = sender?.role ? ` (${sender.role})` : "";
