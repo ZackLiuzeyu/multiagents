@@ -41,6 +41,8 @@ import type {
   KnowledgeGetRequest,
   KnowledgeDeleteRequest,
   KnowledgeCategory,
+  AddPlanItemRequest,
+  EditPlanItemRequest,
 } from "./types.ts";
 
 /** HTTP client for the multiagents broker API. */
@@ -250,6 +252,20 @@ export class BrokerClient {
 
   updatePlanItem(req: { item_id: number; status: string; session_id?: string }): Promise<PlanState | { ok: boolean }> {
     return this.post("/plan/update-item", req);
+  }
+
+  /** Append an item to the session's plan (creating the plan if needed). */
+  addPlanItem(req: AddPlanItemRequest): Promise<PlanState> {
+    return this.post("/plan/add-item", req);
+  }
+
+  /** Edit an item of the session's plan; fails if the item belongs to another session. */
+  editPlanItem(req: EditPlanItemRequest): Promise<PlanState> {
+    return this.post("/plan/edit-item", req);
+  }
+
+  deletePlanItem(sessionId: string, itemId: number): Promise<PlanState> {
+    return this.post("/plan/delete-item", { session_id: sessionId, item_id: itemId });
   }
 
   // --- Slot management ---

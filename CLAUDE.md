@@ -16,6 +16,8 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `orchestrator/claude-driver.ts` — Long-lived `claude -p --input-format stream-json` session; teammate messages are written to stdin and read mid-turn. `system/init` only arrives after the first message; closing stdin ends the session.
 - `orchestrator/codex-driver.ts` — `codex app-server` JSON-RPC client (shapes verified against the 0.156.1 schema).
 - `orchestrator/delivery.ts` — Hands unacked messages to a driver (`retain` poll) and acks them on confirmed hand-off.
+- `orchestrator/runtime.ts` — The orchestrator itself: launched processes and drivers, background supervision loops, and the tool implementations (`ORCHESTRATOR_TOOLS`, `callOrchestratorTool`). Hosted by `orchestrator-server.ts` (MCP stdio) and by `dashboard/server.ts`; each host supervises only the agents it launched.
+- `dashboard/control.ts` — Web control API (`POST /api/<action>`). Every mutation names its `session_id` and checks the slot belongs to it; lifecycle actions call `callOrchestratorTool`, record edits go to the broker. Human actions use sender id `human`. A session with `config.human_gate` is not auto-ended while agents sit in `approved`.
 - `orchestrator/supervision.ts` — Driver registry (one driver per slot), non-overlapping loop ticks, release and watchdog verdicts; pure enough to unit-test.
 - `orchestrator/monitor.ts` — Slot summaries and token accounting. Claude's `result.usage` is per turn (added as is); Codex's `thread/tokenUsage/updated.total` is cumulative (diffed).
 - `shared/types.ts` — Shared TypeScript types for broker API.

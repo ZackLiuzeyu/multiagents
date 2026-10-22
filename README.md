@@ -211,7 +211,7 @@ Session monitoring stats and enforced limits:
 | Messages Per Agent | Monitor | Per agent | Observe |
 | Longest Idle | Monitor | Per agent | Observe |
 
-Adjustable from the TUI dashboard (+/- keys) or via the `adjust_guardrail` tool; the web dashboard shows them read-only (its `/api/guardrail` endpoint exists but has no UI yet).
+Adjustable from the TUI dashboard (+/- keys), the web dashboard's Stats tab, or the `adjust_guardrail` tool.
 
 ## Web Dashboard
 
@@ -219,16 +219,21 @@ Adjustable from the TUI dashboard (+/- keys) or via the `adjust_guardrail` tool;
 multiagents web [session-id]
 ```
 
-Real-time web dashboard on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator. 6-tab interface:
+Web control center on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator, and starts the broker itself when it is not running. Besides watching, you can run a team from the browser:
 
-- **Agents**: agent cards with connection status, task state, role, summaries, token usage
-- **Messages**: live message feed with type badges and sender names
-- **Plan**: task progress with completion bar and assignee labels
-- **Knowledge**: shared knowledge entries with categories and provenance
-- **Files**: file locks and ownership zones
-- **Stats**: session metrics (connected agents, working, tokens) and guardrail bars
+- **Sessions** (sidebar): New Team, empty session, open, pause/resume, relaunch disconnected agents, export JSON, archive, end, delete (typed confirmation)
+- **Agents**: message, pause/resume, change role, rename, send back for revision, release, remove; Add Agent; Release all approved / Release all
+- **Messages**: live feed (`Human → agent` for what you send) with a composer for one agent or a broadcast to the team
+- **Plan**: add, edit, reassign, change status (pending / in progress / blocked / done), delete
+- **Knowledge**: add, edit, delete entries by category
+- **Files**: locks with holder and expiry, force unlock, reserve a file for an agent, assign ownership zones
+- **Stats**: session metrics and guardrail steppers (changes logged as "Adjusted via web dashboard")
 
-Dark theme, responsive layout, keyboard shortcuts (`1-6` to switch tabs).
+**Human gate.** A team started from the browser can wait for you once every agent is approved: instead of ending itself, the session shows *Waiting for human approval* with **Approve & Release** and **Send back for revision** (actionable feedback to a worker, which restarts the review loop). Toggle it per session with the `human gate` chip; MCP's `create_team` takes `human_gate: true`.
+
+Teams and agents launched from the browser are supervised by the dashboard process (the same orchestrator runtime the MCP server runs), so keep `multiagents web` running while they work; stopping it stops them. Agents another orchestrator launched stay under that orchestrator. See [docs/web-control-center.md](docs/web-control-center.md) for the API.
+
+Responsive layout, keyboard shortcuts (`1-6` to switch tabs).
 
 ## TUI Dashboard
 
@@ -278,6 +283,7 @@ multiagents/
 │   ├── broker-client.ts    HTTP client for broker API
 │   ├── broker-url.ts       The one place MULTIAGENTS_PORT is resolved
 │   ├── constants.ts        Ports, intervals, thresholds
+│   ├── session-ops.ts      Session create/export shared by the CLI and the web dashboard
 │   ├── summarize.ts        Git-based activity summary (no API calls)
 │   └── utils.ts            Shared utilities
 ├── adapters/
@@ -289,7 +295,8 @@ multiagents/
 │   ├── gemini-adapter.ts   Gemini adapter (tool-result delivery + file inbox)
 │   └── role-practices.ts   Role-specific best practices injection
 ├── orchestrator/
-│   ├── orchestrator-server.ts  Orchestrator MCP server (team management, driver delivery loop)
+│   ├── orchestrator-server.ts  Orchestrator MCP server (stdio host of runtime.ts)
+│   ├── runtime.ts          Orchestrator runtime: tools, agent processes, supervision loops (shared with the web dashboard)
 │   ├── claude-driver.ts    ClaudeDriver: long-lived `claude -p --input-format stream-json` session
 │   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
 │   ├── delivery.ts         Hands unacked messages to drivers, acks on confirmed hand-off
@@ -311,6 +318,7 @@ multiagents/
 │   └── update.ts           `multiagents update`
 ├── dashboard/
 │   ├── server.ts           Web dashboard (Bun.serve + WebSocket, localhost:7900)
+│   ├── control.ts          Web control API (POST /api/*)
 │   └── index.html          Web dashboard UI
 └── scripts/
     ├── version.ts          Version bump + release commit/tag
