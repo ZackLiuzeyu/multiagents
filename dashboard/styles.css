@@ -652,3 +652,38 @@ html[data-theme="dark"] .doc-page { background: var(--surface); }
   .chat-scroll { padding: 12px 10px 8px; }
   .session-switch { max-width: 150px; }
 }
+
+/* --- Avatars: official icons, initials or an uploaded image --- */
+.avatar.has-icon svg { width: 58%; height: 58%; display: block; }
+.avatar.has-img { background: var(--surface3); overflow: visible; }
+.avatar.has-img img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; display: block; }
+.avatar.clickable { cursor: pointer; transition: box-shadow 0.12s; }
+.avatar.clickable:hover { box-shadow: 0 0 0 2px var(--accent); }
+.avatar.mini { width: 18px; height: 18px; font-size: 8px; border-radius: 5px; display: inline-grid; vertical-align: -4px; }
+.avatar-editor .avatar-preview { display: flex; justify-content: center; margin-bottom: 14px; }
+.avatar-editor .avatar-preview .avatar { width: 72px; height: 72px; font-size: 26px; border-radius: 20px; }
+.seg { display: flex; flex-wrap: wrap; gap: 6px; }
+.swatches { display: flex; flex-wrap: wrap; gap: 6px; }
+.swatch { width: 22px; height: 22px; border-radius: 6px; border: 2px solid transparent; cursor: pointer; padding: 0; }
+.swatch.on { border-color: var(--text); }
+.file-btn { cursor: pointer; }
+.form-grid [hidden] { display: none !important; }
+.range-row { display: flex; align-items: center; gap: 10px; }
+.form-grid .range-row input[type=range] { flex: 1; width: auto; accent-color: var(--accent); }
+.range-row span { width: 42px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-dim); font-size: 12px; }
+.lang-btn { font-size: 11.5px; font-weight: 650; width: auto; min-width: 30px; padding: 0 6px; }
+
+/* --- Background image under the whole page --- */
+#app-bg {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background-size: cover; background-position: center; background-repeat: no-repeat;
+}
+html:not(.has-bg) #app-bg { display: none; }
+html.has-bg .app { position: relative; z-index: 1; }
+html.has-bg .topbar, html.has-bg .pane {
+  background: color-mix(in srgb, var(--surface) var(--panel-alpha, 82%), transparent);
+}
+html.has-bg .pane.center { background: color-mix(in srgb, var(--bg) var(--panel-alpha, 82%), transparent); }
+html.has-bg .session-bar, html.has-bg .tabs, html.has-bg .chat-toolbar,
+html.has-bg .composer, html.has-bg #act-approvals, html.has-bg .day-sep span { background: transparent; }
+html.has-bg.bg-blur .topbar, html.has-bg.bg-blur .pane { backdrop-filter: blur(14px) saturate(1.1); -webkit-backdrop-filter: blur(14px) saturate(1.1); }

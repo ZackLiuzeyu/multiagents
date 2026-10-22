@@ -225,7 +225,9 @@ Web control center on `localhost:7900` with live WebSocket updates. Auto-opens i
 - **Center: the team chat.** Your messages sit on the right, the agents' on the left with avatar, role and message type (feedback, task complete, approval…). System notices are folded into small centered lines. Send to one agent or the whole team (Enter sends, Shift+Enter starts a new line, IME-safe). File names that agents mention become links once the file is found in the project.
 - **Right: file preview** (Markdown, code with line numbers, images, PDF, Word `.docx`, CSV, HTML in a sandbox, audio/video). It follows the open file as agents edit it. The **Team** tab lists every agent with quick actions.
 
-Light, dark, or follow the system: pick it from the theme button in the top bar.
+Light, dark, or follow the system: pick it from the theme button in the top bar. The language button switches between English and 中文 (Chinese is the default for a Chinese-language browser). Text the agents write stays as they wrote it.
+
+**Making it yours.** Agents show their CLI's icon (Claude, Gemini; Codex gets a neutral terminal glyph because OpenAI's logo isn't redistributable). Click an avatar on an agent card or in its settings to use initials, a color or your own image instead. The **Appearance** button in the top bar sets a background image under the whole page, how strongly it shows, how see-through the panels are, and your own avatar. These choices are kept in the browser (localStorage), not on the server.
 
 **Watching and approving each step.** The **Activity** tab is a live timeline of what every agent does: its thinking, the files it reads, each edit as a diff, every command with its output, and the cost of each turn. Claude and Codex report every step; Gemini reports its tool calls. Each agent has an approval mode (**Settings** on its card, or when you add it):
 
@@ -344,6 +346,7 @@ multiagents/
 │   ├── files.ts            Read-only project files for the explorer and preview (GET /api/fs/*)
 │   ├── index.html          Web dashboard layout
 │   ├── app.js              Web dashboard UI logic
+│   ├── i18n.js             Web dashboard translations (English / 中文)
 │   └── styles.css          Web dashboard themes and layout
 └── scripts/
     ├── version.ts          Version bump + release commit/tag

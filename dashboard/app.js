@@ -41,7 +41,7 @@ function applyTheme() {
   const dark = pref === "dark" || (pref === "system" && !!darkQuery?.matches);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
   $("theme-btn").innerHTML = THEME_ICONS[pref] ?? THEME_ICONS.system;
-  $("theme-btn").title = `Theme: ${THEME_LABEL[pref] ?? pref}`;
+  $("theme-btn").title = tr("Theme: {name}", { name: tr(THEME_LABEL[pref] ?? pref) });
 }
 
 darkQuery?.addEventListener?.("change", applyTheme);
@@ -49,10 +49,47 @@ $("theme-btn").addEventListener("click", (e) => {
   e.stopPropagation();
   const pref = themePref();
   openMenu($("theme-btn"), ["system", "light", "dark"].map((t) => ({
-    label: THEME_LABEL[t], checked: t === pref,
+    label: tr(THEME_LABEL[t]), checked: t === pref,
     onClick: () => { try { localStorage.setItem("ma-theme", t); } catch {} applyTheme(); },
   })));
 });
+
+// --- Language: English / 中文 ---
+
+function applyLanguage() {
+  document.documentElement.lang = getLang() === "zh" ? "zh-CN" : "en";
+  translateStatic();
+  $("lang-btn").textContent = getLang() === "zh" ? "中" : "EN";
+  $("lang-btn").title = tr("Language");
+  applyTheme();
+}
+
+/** Drop every render cache so the next render rebuilds all regions (language, avatars). */
+function rerenderAll() {
+  lastChatSignature = "";
+  activity.filterSig = "";
+  activity.rendered = 0;
+  document.querySelectorAll("[data-html]").forEach((el) => delete el.dataset.html);
+  delete $("act-approvals").dataset.sig;
+  if (state) render(true);
+  renderTree();
+}
+
+$("lang-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  openMenu($("lang-btn"), Object.entries(LANGS).map(([code, name]) => ({
+    label: name, checked: code === getLang(),
+    onClick: () => {
+      if (code === getLang()) return;
+      setLang(code);
+      applyLanguage();
+      rerenderAll();
+      if (preview.path) openPreview(preview.path, preview.line);
+    },
+  })));
+});
+
+$("appearance-btn").addEventListener("click", () => appearanceModal());
 
 // --- Layout: collapsible, resizable side panes ---
 
@@ -135,7 +172,7 @@ function connectWs() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   ws.onopen = () => {
     wsAttempt = 0;
-    $("ws-status").textContent = "live";
+    $("ws-status").textContent = tr("live");
     $("ws-status").style.color = "var(--green)";
   };
   ws.onmessage = (e) => {
@@ -150,7 +187,7 @@ function connectWs() {
     } catch {}
   };
   ws.onclose = () => {
-    $("ws-status").textContent = "reconnecting…";
+    $("ws-status").textContent = tr("reconnecting…");
     $("ws-status").style.color = "var(--yellow)";
     const delay = Math.min(500 * Math.pow(2, wsAttempt) + Math.random() * 1000, 30000);
     wsAttempt++;
@@ -170,7 +207,7 @@ async function api(action, body) {
   try {
     res = await fetch(`/api/${action}`, opts);
   } catch {
-    throw new Error("Dashboard server unreachable");
+    throw new Error(tr("Dashboard server unreachable"));
   }
   try { data = await res.json(); } catch { data = { ok: false, error: `HTTP ${res.status}` }; }
   if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
@@ -191,10 +228,10 @@ async function run(btn, label, fn) {
   if (btn) btn.classList.add("busy");
   try {
     const result = await fn();
-    toast(result?.message ?? `${label}: done`, result?.warning ? "warn" : "ok");
+    toast(result?.message ? tr(result.message) : tr("{label}: done", { label: tr(label) }), result?.warning ? "warn" : "ok");
     return result ?? true;
   } catch (e) {
-    toast(`${label} failed: ${e.message}`, "error");
+    toast(tr("{label} failed: {error}", { label: tr(label), error: tr(e.message) }), "error");
     return null;
   } finally {
     if (btn) btn.classList.remove("busy");
@@ -212,7 +249,7 @@ function toast(text, kind = "info") {
 /** The session the user is looking at; actions need one. */
 function currentSid() {
   if (state?.sessionId == null || !state.session) {
-    toast("No session selected — pick one on the left or start a New Team", "warn");
+    toast(tr("No session selected — pick one on the left or start a New Team"), "warn");
     return null;
   }
   return state.sessionId;
@@ -311,7 +348,7 @@ function isSessionComplete() {
   return state.slots.every((s) => s.task_state === "approved" || s.task_state === "released" || s.task_state === "done_pending_review");
 }
 
-function slotName(slot) { return slot?.display_name ?? (slot ? `Slot ${slot.id}` : "?"); }
+function slotName(slot) { return slot?.display_name ?? (slot ? tr("Slot {id}", { id: slot.id }) : "?"); }
 function slotById(id) { return state?.slots.find((s) => s.id === id) ?? null; }
 function liveSlots() { return (state?.slots ?? []).filter((s) => s.task_state !== "released"); }
 function isPaused(slot) { return slot.paused === true || slot.paused === 1; }
@@ -320,7 +357,7 @@ function renderHeader() {
   const dot = $("conn-dot");
   const status = state.session?.status;
   dot.className = "dot " + (!state.brokerAlive ? "red" : status === "paused" ? "yellow" : status === "archived" || isSessionComplete() ? "" : state.session ? "green" : "");
-  $("session-name-text").textContent = state.session?.name ?? state.sessionId ?? "No session";
+  $("session-name-text").textContent = state.session?.name ?? state.sessionId ?? tr("No session");
 
   const b = sessionBadge();
   const badge = $("session-status-badge");
@@ -328,7 +365,7 @@ function renderHeader() {
   if (b) { badge.textContent = b.text; badge.className = `badge ${b.cls}`; }
 
   const connected = state.slots.filter((s) => s.status === "connected").length;
-  $("agent-count").textContent = state.session ? `${connected}/${state.slots.length} agents online` : "";
+  $("agent-count").textContent = state.session ? tr("{online}/{total} agents online", { online: connected, total: state.slots.length }) : "";
 
   if (state.session?.created_at) {
     let endTime = Date.now();
@@ -346,17 +383,17 @@ function renderHeader() {
 
   $("broker-dot").className = `dot ${state.brokerAlive ? "green" : "red"}`;
   $("broker-label").textContent = state.brokerAlive
-    ? `Broker · ${state.sessions?.length ?? 0} sessions · ${state.peerCount ?? 0} peers`
-    : "Broker down";
+    ? tr("Broker · {sessions} sessions · {peers} peers", { sessions: state.sessions?.length ?? 0, peers: state.peerCount ?? 0 })
+    : tr("Broker down");
 }
 
 function sessionBadge() {
   if (!state.session) return null;
-  if (state.session.status === "archived") return { text: "archived", cls: "badge-released" };
-  if (state.awaitingHuman) return { text: "waiting for you", cls: "badge-review" };
-  if (state.session.status === "paused") return { text: "paused", cls: "badge-paused" };
-  if (isSessionComplete()) return { text: "completed", cls: "badge-approved" };
-  return { text: "active", cls: "badge-connected" };
+  if (state.session.status === "archived") return { text: tr("archived"), cls: "badge-released" };
+  if (state.awaitingHuman) return { text: tr("waiting for you"), cls: "badge-review" };
+  if (state.session.status === "paused") return { text: tr("paused"), cls: "badge-paused" };
+  if (isSessionComplete()) return { text: tr("completed"), cls: "badge-approved" };
+  return { text: tr("active"), cls: "badge-connected" };
 }
 
 function renderBadges() {
@@ -389,20 +426,20 @@ function renderSidebar() {
   const list = $("sidebar-list");
   const sessions = sortedSessions(state.sessions);
   if (!sessions.length) {
-    list.innerHTML = `<div class="tree-empty">${state.brokerAlive ? "No sessions yet — use + to start a team." : "Broker is not running."}</div>`;
+    list.innerHTML = `<div class="tree-empty">${state.brokerAlive ? tr("No sessions yet — use + to start a team.") : tr("Broker is not running.")}</div>`;
     return;
   }
   let html = "", last = "";
   for (const s of sessions) {
     if (s.status !== last) {
       last = s.status;
-      html += `<div class="side-group">${esc(s.status)}</div>`;
+      html += `<div class="side-group">${esc(tr(s.status))}</div>`;
     }
     html += `<div class="session-row${s.id === state.sessionId ? " current" : ""}" data-sid="${esc(s.id)}" title="${esc(s.id)}\n${esc(s.project_dir)}">
       ${statusDot(s.status)}
       <span class="name">${esc(s.name || s.id)}</span>
       <span class="time">${timeSince(s.last_active_at ?? s.created_at)}</span>
-      <button class="icon-btn" data-session-menu="${esc(s.id)}" title="Session actions">&#8943;</button>
+      <button class="icon-btn" data-session-menu="${esc(s.id)}" title="${tr("Session actions")}">&#8943;</button>
     </div>`;
   }
   list.innerHTML = html;
@@ -513,7 +550,7 @@ function fileIcon(name, isDir, open) {
 function renderTree() {
   const el = $("explorer-tree");
   if (explorer.sid == null) {
-    el.innerHTML = '<div class="tree-empty">Select a session to browse its project.</div>';
+    el.innerHTML = `<div class="tree-empty">${tr("Select a session to browse its project.")}</div>`;
     return;
   }
   if (explorer.error) {
@@ -521,8 +558,8 @@ function renderTree() {
     return;
   }
   const root = explorer.children.get("");
-  if (!root) { el.innerHTML = '<div class="tree-empty">Loading…</div>'; return; }
-  if (!root.length) { el.innerHTML = '<div class="tree-empty">The project directory is empty.</div>'; return; }
+  if (!root) { el.innerHTML = `<div class="tree-empty">${tr("Loading…")}</div>`; return; }
+  if (!root.length) { el.innerHTML = `<div class="tree-empty">${tr("The project directory is empty.")}</div>`; return; }
   const locked = new Set((state?.fileLocks ?? []).map((l) => l.file_path.replace(/^\.\//, "")));
   const rows = [];
   const walk = (dir, depth) => {
@@ -536,12 +573,12 @@ function renderTree() {
         <span class="chev">${entry.type === "dir" ? "&#9662;" : ""}</span>
         ${fileIcon(entry.name, entry.type === "dir", open)}
         <span class="tree-name">${esc(entry.name)}</span>
-        ${locked.has(entry.path) ? '<span class="lock" title="Locked by an agent">&#128274;</span>' : ""}
-        ${entry.type === "file" ? '<span class="tree-actions"><button class="icon-btn" data-mention title="Mention in chat">@</button></span>' : ""}
+        ${locked.has(entry.path) ? `<span class="lock" title="${tr("Locked by an agent")}">&#128274;</span>` : ""}
+        ${entry.type === "file" ? `<span class="tree-actions"><button class="icon-btn" data-mention title="${tr("Mention in chat")}">@</button></span>` : ""}
       </div>`);
       if (open) {
         if (explorer.children.has(entry.path)) walk(entry.path, depth + 1);
-        else rows.push(`<div class="tree-empty" style="padding-left:${30 + depth * 14}px">Loading…</div>`);
+        else rows.push(`<div class="tree-empty" style="padding-left:${30 + depth * 14}px">${tr("Loading…")}</div>`);
       }
     }
   };
@@ -565,7 +602,7 @@ $("explorer-tree").addEventListener("click", async (e) => {
       explorer.children.set(p, await loadDir(sid, p));
     } catch (err) {
       explorer.expanded.delete(p);
-      toast(`Cannot open ${p}: ${err.message}`, "error");
+      toast(tr("Cannot open {path}: {error}", { path: p, error: err.message }), "error");
     }
   }
   if (sid !== explorer.sid) return;
@@ -612,7 +649,7 @@ async function openPreview(rel, line) {
   try {
     info = await api(`fs/resolve?session_id=${encodeURIComponent(sid)}&path=${encodeURIComponent(rel)}`);
   } catch (e) {
-    toast(`Cannot open ${rel}: ${e.message}`, "error");
+    toast(tr("Cannot open {path}: {error}", { path: rel, error: e.message }), "error");
     return;
   }
   Object.assign(preview, { sid, path: info.path, line: line ?? null, mtime: info.mtime, size: info.size, mode: null });
@@ -629,8 +666,8 @@ function closePreview() {
   const body = $("preview-body");
   body.className = "preview-body";
   body.innerHTML = `<div class="preview-empty"><div class="big">&#128196;</div>
-    <div><b>No file open</b></div>
-    <div style="font-size:12.5px">Click a file in the explorer, or a file name an agent mentions in the chat.</div></div>`;
+    <div><b>${tr("No file open")}</b></div>
+    <div style="font-size:12.5px">${tr("Click a file in the explorer, or a file name an agent mentions in the chat.")}</div></div>`;
   if (explorer.children.size) renderTree();
 }
 
@@ -677,7 +714,7 @@ async function renderPreview(keepScroll = false) {
         body.innerHTML = `<div class="preview-img"><img src="${rawUrl()}" alt="${esc(name)}"></div>`;
         break;
       case "pdf":
-        if (navigator.pdfViewerEnabled === false) { body.innerHTML = noPreview(name, "This browser cannot show PDFs inline."); break; }
+        if (navigator.pdfViewerEnabled === false) { body.innerHTML = noPreview(name, tr("This browser cannot show PDFs inline.")); break; }
         body.className = "preview-body fill";
         body.innerHTML = `<iframe class="pdf" src="${rawUrl()}#view=FitH" title="${esc(name)}"></iframe>`;
         break;
@@ -689,12 +726,12 @@ async function renderPreview(keepScroll = false) {
         break;
       case "docx": {
         const r = await api(`fs/docx?session_id=${encodeURIComponent(preview.sid)}&path=${encodeURIComponent(preview.path)}`);
-        body.innerHTML = `<div class="doc-view doc-page">${r.html || '<p class="dim">The document has no text.</p>'}</div>`;
+        body.innerHTML = `<div class="doc-view doc-page">${r.html || `<p class="dim">${tr("The document has no text.")}</p>`}</div>`;
         break;
       }
       case "html": {
         const mode = preview.mode ?? "render";
-        seg([["render", "Render"], ["source", "Source"]], mode, (v) => { preview.mode = v; renderPreview(); });
+        seg([["render", tr("Render")], ["source", tr("Source")]], mode, (v) => { preview.mode = v; renderPreview(); });
         if (mode === "render") {
           body.className = "preview-body fill";
           body.innerHTML = `<iframe sandbox="" src="${rawUrl()}" title="${esc(name)}"></iframe>`;
@@ -706,32 +743,32 @@ async function renderPreview(keepScroll = false) {
       }
       case "markdown": {
         const mode = preview.mode ?? "preview";
-        seg([["preview", "Preview"], ["source", "Source"]], mode, (v) => { preview.mode = v; renderPreview(); });
+        seg([["preview", tr("Preview")], ["source", tr("Source")]], mode, (v) => { preview.mode = v; renderPreview(); });
         const t = await fetchText();
         body.innerHTML = mode === "preview"
-          ? `${t.truncated ? '<div class="preview-notice">Large file — showing the first 2 MB.</div>' : ""}<div class="doc-view">${renderMarkdown(t.text ?? "", { baseDir: parts.join("/") })}</div>`
+          ? `${t.truncated ? `<div class="preview-notice">${tr("Large file — showing the first 2 MB.")}</div>` : ""}<div class="doc-view">${renderMarkdown(t.text ?? "", { baseDir: parts.join("/") })}</div>`
           : codeView(t.text ?? "", t.truncated);
         hydrateFileRefs(body);
         break;
       }
       case "csv": {
         const mode = preview.mode ?? "table";
-        seg([["table", "Table"], ["source", "Source"]], mode, (v) => { preview.mode = v; renderPreview(); });
+        seg([["table", tr("Table")], ["source", tr("Source")]], mode, (v) => { preview.mode = v; renderPreview(); });
         const t = await fetchText();
         body.innerHTML = mode === "table" ? csvView(t.text ?? "", ext === "tsv" ? "\t" : ",") : codeView(t.text ?? "", t.truncated);
         break;
       }
       case "binary":
-        body.innerHTML = noPreview(name, "This file type has no inline preview.");
+        body.innerHTML = noPreview(name, tr("This file type has no inline preview."));
         break;
       default: {
-        seg([["nowrap", "No wrap"], ["wrap", "Wrap"]], preview.wrap ? "wrap" : "nowrap", (v) => { preview.wrap = v === "wrap"; renderPreview(true); });
+        seg([["nowrap", tr("No wrap")], ["wrap", tr("Wrap")]], preview.wrap ? "wrap" : "nowrap", (v) => { preview.wrap = v === "wrap"; renderPreview(true); });
         const t = await fetchText();
-        body.innerHTML = t.binary ? noPreview(name, "This looks like a binary file.") : codeView(t.text, t.truncated);
+        body.innerHTML = t.binary ? noPreview(name, tr("This looks like a binary file.")) : codeView(t.text, t.truncated);
       }
     }
   } catch (e) {
-    body.innerHTML = noPreview(name, `Preview failed: ${e.message}`);
+    body.innerHTML = noPreview(name, tr("Preview failed: {error}", { error: e.message }));
   }
 
   if (keepScroll) body.scrollTop = scrollTop;
@@ -743,14 +780,14 @@ async function renderPreview(keepScroll = false) {
 
 function noPreview(name, why) {
   return `<div class="preview-empty"><div class="big">&#128230;</div><div><b>${esc(name)}</b></div><div style="font-size:12.5px">${esc(why)}</div>
-    <div class="flex gap-2" style="margin-top:8px"><a class="btn" href="${rawUrl({ download: 1 })}">Download</a><a class="btn" href="${rawUrl()}" target="_blank" rel="noopener">Open in browser</a></div></div>`;
+    <div class="flex gap-2" style="margin-top:8px"><a class="btn" href="${rawUrl({ download: 1 })}">${tr("Download")}</a><a class="btn" href="${rawUrl()}" target="_blank" rel="noopener">${tr("Open in browser")}</a></div></div>`;
 }
 
 function codeView(text, truncated) {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
   const shown = lines.slice(0, 20000);
-  return `${truncated || lines.length > shown.length ? '<div class="preview-notice">Large file — showing the beginning only.</div>' : ""}
+  return `${truncated || lines.length > shown.length ? `<div class="preview-notice">${tr("Large file — showing the beginning only.")}</div>` : ""}
     <div class="code-view mono${preview.wrap ? " code-wrap" : ""}">${shown.map((l, i) => `<div class="code-line" data-line="${i + 1}"><span class="ln">${i + 1}</span><span>${esc(l) || " "}</span></div>`).join("")}</div>`;
 }
 
@@ -775,11 +812,11 @@ function parseCsv(text, sep) {
 
 function csvView(text, sep) {
   const rows = parseCsv(text, sep);
-  if (!rows.length) return '<div class="preview-empty">Empty file</div>';
+  if (!rows.length) return `<div class="preview-empty">${tr("Empty file")}</div>`;
   const [head, ...rest] = rows;
   return `<div class="csv-view"><table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
     <tbody>${rest.slice(0, 1000).map((r) => `<tr>${r.map((c) => `<td title="${esc(c)}">${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>
-    ${rows.length > 1000 ? '<div class="field-hint" style="margin-top:6px">Showing the first 1000 rows.</div>' : ""}</div>`;
+    ${rows.length > 1000 ? `<div class="field-hint" style="margin-top:6px">${tr("Showing the first 1000 rows.")}</div>` : ""}</div>`;
 }
 
 $("preview-reload").addEventListener("click", () => preview.path && openPreview(preview.path, preview.line));
@@ -948,7 +985,7 @@ function hydrateFileRefs(root) {
     const ref = el.dataset.ref;
     const hit = fileRefCache.get(ref);
     if (hit && (hit.path || Date.now() - hit.at < 30_000)) {
-      if (hit.path) { el.classList.add("file-link"); el.dataset.path = hit.path; el.title = `Open ${hit.path}`; }
+      if (hit.path) { el.classList.add("file-link"); el.dataset.path = hit.path; el.title = tr("Open {path}", { path: hit.path }); }
     } else pendingRefs.add(ref);
   }
   if (pendingRefs.size && !refCheckTimer) refCheckTimer = setTimeout(checkPendingRefs, 150);
@@ -1005,19 +1042,236 @@ function avatar(name, color, extra = "", me = false) {
   return `<div class="avatar" style="background:${color}">${me ? PERSON_SVG : esc(initials(name))}${extra}</div>`;
 }
 
+// --- Avatars: the agent's official icon by default, or the user's own pick ---
+// Icons: Simple Icons (CC0). OpenAI asked Simple Icons to remove its logo, so
+// Codex gets a neutral terminal glyph; users can upload any image instead.
+
+const AGENT_ICONS = {
+  claude: { bg: "#D97757", svg: '<svg viewBox="0 0 24 24" fill="#fff"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>' },
+  gemini: { bg: "linear-gradient(135deg, #4285F4 0%, #8E75B2 60%, #D96570 100%)", svg: '<svg viewBox="0 0 24 24" fill="#fff"><path d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/></svg>' },
+  codex: { bg: "#1f2328", svg: '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7l5 5-5 5M12.5 17H19"/></svg>' },
+};
+const AVATAR_COLORS = ["#2f6fde", "#8250df", "#1a7f37", "#bc4c00", "#cf222e", "#0e7f86", "#d4a72c", "#6e7781", "#D97757", "#1f2328"];
+
+/** Per-browser avatar choices, keyed "<session>:<slot>" (and "human" for you). */
+const avatarPrefs = {
+  all: store.get("ma-avatars", {}),
+  get(key) { return this.all[key] ?? null; },
+  set(key, pref) {
+    const next = { ...this.all };
+    if (pref) next[key] = pref; else delete next[key];
+    try { localStorage.setItem("ma-avatars", JSON.stringify(next)); } catch { throw new Error(tr("This image is too large to store in the browser.")); }
+    this.all = next;
+  },
+};
+
+function slotAvatarKey(slot) { return `${slot.session_id ?? state?.sessionId ?? ""}:${slot.id}`; }
+
+/** Avatar markup from a pref ({ kind: "icon" | "text" | "image" }) with a fallback. */
+function avatarHtml(pref, { type, name, color }, extra = "", attrs = "", cls = "") {
+  const p = pref ?? (AGENT_ICONS[type] ? { kind: "icon" } : { kind: "text" });
+  if (p.kind === "image" && p.src) {
+    return `<div class="avatar has-img ${cls}" ${attrs}><img src="${esc(p.src)}" alt="">${extra}</div>`;
+  }
+  if (p.kind === "icon" && AGENT_ICONS[type]) {
+    return `<div class="avatar has-icon ${cls}" style="background:${AGENT_ICONS[type].bg}" ${attrs}>${AGENT_ICONS[type].svg}${extra}</div>`;
+  }
+  if (p.kind === "person") return `<div class="avatar ${cls}" style="background:${p.color ?? color}" ${attrs}>${PERSON_SVG}${extra}</div>`;
+  const text = (p.text ?? "").trim() || initials(name);
+  return `<div class="avatar ${cls}" style="background:${esc(p.color ?? color)}" ${attrs}>${esc([...text].slice(0, 2).join(""))}${extra}</div>`;
+}
+
+function slotAvatar(slot, extra = "", clickable = false, size = "") {
+  const attrs = clickable ? `data-avatar-slot="${slot.id}" title="${esc(tr("Change avatar"))}" role="button"` : "";
+  return avatarHtml(avatarPrefs.get(slotAvatarKey(slot)), { type: slot.agent_type, name: slotName(slot), color: slotColor(slot.id) }, extra, attrs, `${clickable ? "clickable" : ""} ${size}`);
+}
+
+function humanAvatar(clickable = false) {
+  const attrs = clickable ? `data-avatar-human title="${esc(tr("Change avatar"))}" role="button"` : "";
+  return avatarHtml(avatarPrefs.get("human") ?? { kind: "person" }, { type: null, name: tr("You"), color: "var(--accent)" }, "", attrs, clickable ? "clickable" : "");
+}
+
+/** Read an image file and shrink it to fit max×max, as a data URL. */
+function readImage(file, max, type = "image/png", quality = 0.86) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\//.test(file.type)) return reject(new Error(tr("Could not read the image")));
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL(type, quality));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error(tr("Could not read the image"))); };
+    img.src = url;
+  });
+}
+
+/** Avatar picker for an agent (slot) or for you (slot = null). */
+function avatarModal(slot) {
+  const key = slot ? slotAvatarKey(slot) : "human";
+  const type = slot?.agent_type ?? null;
+  const base = slot ? { type, name: slotName(slot), color: slotColor(slot.id) } : { type: null, name: tr("You"), color: "var(--accent)" };
+  const current = avatarPrefs.get(key);
+  let draft = current ?? (slot ? (AGENT_ICONS[type] ? { kind: "icon" } : { kind: "text" }) : { kind: "person" });
+  const kinds = [
+    ...(AGENT_ICONS[type] ? [["icon", "Official icon"]] : []),
+    ...(slot ? [] : [["person", "Icon"]]),
+    ["text", "Initials"], ["image", "Image"],
+  ];
+  openModal({
+    title: slot ? tr("Avatar · {name}", { name: slotName(slot) }) : "Your avatar",
+    sub: slot ? sessionSub(slot.session_id ?? state.sessionId) : undefined, submitLabel: "Save",
+    body: `<div class="avatar-editor">
+      <div class="avatar-preview" data-preview></div>
+      <div class="form-grid">
+        <label>Avatar</label><div class="seg" data-kinds>${kinds.map(([k, l]) => `<button type="button" class="btn small" data-kind="${k}">${esc(tr(l))}</button>`).join("")}</div>
+        <label data-for="text">Text</label><input data-for="text" name="avatar_text" maxlength="2" placeholder="${esc(initials(base.name))}">
+        <label data-for="color">Color</label><div data-for="color" class="swatches">${AVATAR_COLORS.map((c) => `<button type="button" class="swatch" data-color="${c}" style="background:${c}"></button>`).join("")}</div>
+        <label data-for="image">Image</label><div data-for="image"><label class="btn small file-btn">Upload image…<input type="file" accept="image/*" name="file" hidden></label></div>
+      </div>
+      <div class="field-hint" style="margin-top:10px">${tr(slot ? "Applies to this agent in this session, in this browser." : "Customizations are saved in this browser only.")}${type === "codex" ? ` ${tr("OpenAI's icon is not bundled; upload it as an image if you like.")}` : ""}</div>
+      ${current ? `<button type="button" class="btn small" data-reset style="margin-top:10px">${tr("Reset to default")}</button>` : ""}
+    </div>`,
+    setup: (form) => {
+      const paint = () => {
+        form.querySelector("[data-preview]").innerHTML = avatarHtml(draft, base);
+        form.querySelectorAll("[data-kind]").forEach((b) => b.classList.toggle("primary", b.dataset.kind === draft.kind));
+        form.querySelectorAll("[data-for]").forEach((el) => {
+          const f = el.dataset.for;
+          el.hidden = !(f === draft.kind || (f === "color" && (draft.kind === "text" || draft.kind === "person")));
+        });
+        form.querySelectorAll("[data-color]").forEach((b) => b.classList.toggle("on", b.dataset.color === draft.color));
+      };
+      form.avatar_text.value = draft.kind === "text" ? draft.text ?? "" : "";
+      form.querySelector("[data-kinds]").addEventListener("click", (e) => {
+        const b = e.target.closest("[data-kind]");
+        if (!b) return;
+        const prev = draft;
+        draft = { kind: b.dataset.kind, color: prev.color };
+        if (draft.kind === "text") draft.text = form.avatar_text.value;
+        if (draft.kind === "image") draft.src = prev.kind === "image" ? prev.src : current?.kind === "image" ? current.src : null;
+        paint();
+      });
+      form.avatar_text.addEventListener("input", () => { draft = { ...draft, kind: "text", text: form.avatar_text.value }; paint(); });
+      form.querySelector(".swatches").addEventListener("click", (e) => {
+        const b = e.target.closest("[data-color]");
+        if (b) { draft = { ...draft, color: b.dataset.color }; paint(); }
+      });
+      form.file.addEventListener("change", async () => {
+        try { draft = { kind: "image", src: await readImage(form.file.files[0], 160) }; paint(); }
+        catch (err) { toast(err.message, "error"); }
+      });
+      form.querySelector("[data-reset]")?.addEventListener("click", () => {
+        avatarPrefs.set(key, null);
+        closeModal();
+        rerenderAll();
+      });
+      paint();
+    },
+    onSubmit: async () => {
+      if (draft.kind === "image" && !draft.src) throw new Error(tr("Could not read the image"));
+      avatarPrefs.set(key, draft);
+      toast(tr("Avatar saved"), "ok");
+      rerenderAll();
+    },
+  });
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-avatar-slot], [data-avatar-human]");
+  if (!el || !state) return;
+  e.stopPropagation();
+  if (el.hasAttribute("data-avatar-human")) return avatarModal(null);
+  const slot = slotById(parseInt(el.dataset.avatarSlot, 10));
+  if (slot) avatarModal(slot);
+}, true);
+
+// --- Appearance: a background image under the whole page ---
+
+const APPEARANCE_DEFAULT = { image: null, imageOpacity: 0.7, panelOpacity: 0.75, blur: true };
+
+function appearance() { return { ...APPEARANCE_DEFAULT, ...store.get("ma-appearance", {}) }; }
+
+function saveAppearance(next) {
+  try { localStorage.setItem("ma-appearance", JSON.stringify(next)); }
+  catch { throw new Error(tr("This image is too large to store in the browser.")); }
+}
+
+function applyAppearance(a = appearance()) {
+  const root = document.documentElement;
+  const layer = $("app-bg");
+  root.classList.toggle("has-bg", !!a.image);
+  root.classList.toggle("bg-blur", !!a.image && !!a.blur);
+  layer.style.backgroundImage = a.image ? `url("${a.image}")` : "";
+  layer.style.opacity = String(a.imageOpacity);
+  root.style.setProperty("--panel-alpha", `${Math.round(a.panelOpacity * 100)}%`);
+}
+
+function appearanceModal() {
+  const saved = appearance();
+  let draft = { ...saved };
+  const pct = (v) => `${Math.round(v * 100)}%`;
+  openModal({
+    title: "Appearance", submitLabel: "Done",
+    body: `<div class="form-grid">
+        <label>Background image</label><div class="flex gap-2 items-center">
+          <label class="btn small file-btn">Choose image…<input type="file" accept="image/*" name="file" hidden></label>
+          <button type="button" class="btn small" data-remove-bg>Remove image</button></div>
+        <label>Image opacity</label><div class="range-row"><input type="range" name="imageOpacity" min="0.05" max="1" step="0.05" value="${draft.imageOpacity}"><span data-out="imageOpacity">${pct(draft.imageOpacity)}</span></div>
+        <label>Panel opacity</label><div class="range-row"><input type="range" name="panelOpacity" min="0.2" max="1" step="0.02" value="${draft.panelOpacity}"><span data-out="panelOpacity">${pct(draft.panelOpacity)}</span></div>
+        <label></label><label class="checkbox"><input type="checkbox" name="bg_blur" ${draft.blur ? "checked" : ""}><span>Blur behind panels</span></label>
+        <label>Your avatar</label><div class="flex items-center gap-2"><span data-own-avatar title="${esc(tr("Change avatar"))}" role="button">${humanAvatar().replace('class="avatar', 'class="avatar clickable')}</span><span class="field-hint">${tr("Click the avatar to change it.")}</span></div>
+      </div>
+      <div class="field-hint" style="margin-top:10px">${tr("The image sits under the whole page. Lower the panel opacity to let more of it show through.")} ${tr("Customizations are saved in this browser only.")}</div>
+      <button type="button" class="btn small" data-reset style="margin-top:10px">${tr("Reset appearance")}</button>`,
+    setup: (form) => {
+      const sync = () => {
+        form.querySelector("[data-remove-bg]").disabled = !draft.image;
+        for (const k of ["imageOpacity", "panelOpacity"]) form.querySelector(`[data-out="${k}"]`).textContent = pct(draft[k]);
+        applyAppearance(draft);
+      };
+      for (const k of ["imageOpacity", "panelOpacity"]) form[k].addEventListener("input", () => { draft[k] = Number(form[k].value); sync(); });
+      form.bg_blur.addEventListener("change", () => { draft.blur = form.bg_blur.checked; sync(); });
+      form.file.addEventListener("change", async () => {
+        try { draft.image = await readImage(form.file.files[0], 1920, "image/jpeg", 0.82); sync(); }
+        catch (err) { toast(err.message, "error"); }
+      });
+      form.querySelector("[data-remove-bg]").addEventListener("click", () => { draft.image = null; sync(); });
+      // Keep what was set here, then switch to the avatar picker
+      form.querySelector("[data-own-avatar]").addEventListener("click", () => {
+        try { saveAppearance(draft); } catch (err) { return toast(err.message, "error"); }
+        avatarModal(null);
+      });
+      form.querySelector("[data-reset]").addEventListener("click", () => {
+        draft = { ...APPEARANCE_DEFAULT };
+        form.imageOpacity.value = draft.imageOpacity; form.panelOpacity.value = draft.panelOpacity; form.bg_blur.checked = draft.blur;
+        sync();
+      });
+      sync();
+    },
+    onSubmit: async () => { saveAppearance(draft); },
+    onCancel: () => applyAppearance(),
+  });
+}
+
 function senderOf(m) {
-  if (m.from_id === "human") return { key: "human", name: "You", me: true, color: "var(--accent)" };
-  if (m.from_id === "orchestrator" || m.from_id === "__orchestrator__") return { key: "orchestrator", name: "Orchestrator", color: "#6e7781", role: "system" };
+  if (m.from_id === "human") return { key: "human", name: tr("You"), me: true, color: "var(--accent)" };
+  if (m.from_id === "orchestrator" || m.from_id === "__orchestrator__") return { key: "orchestrator", name: tr("Orchestrator"), color: "#6e7781", role: tr("system") };
   if (m.from_id === "cli") return { key: "cli", name: "CLI", color: "#6e7781" };
   const slot = (m.from_slot_id != null ? slotById(m.from_slot_id) : null) ?? state.slots.find((s) => s.peer_id === m.from_id);
-  if (slot) return { key: `slot:${slot.id}`, name: slotName(slot), role: slot.role, color: slotColor(slot.id) };
+  if (slot) return { key: `slot:${slot.id}`, name: slotName(slot), role: slot.role, color: slotColor(slot.id), slot };
   return { key: `peer:${m.from_id}`, name: m.from_display_name ?? m.from_id ?? "?", color: "#6e7781" };
 }
 
 function recipientOf(m) {
   if (m.to_slot_id != null) { const s = slotById(m.to_slot_id); if (s) return slotName(s); }
-  if (m.to_id === "human") return "You";
-  if (m.to_id === "orchestrator" || m.to_id === "__orchestrator__") return "Orchestrator";
+  if (m.to_id === "human") return tr("You");
+  if (m.to_id === "orchestrator" || m.to_id === "__orchestrator__") return tr("Orchestrator");
   return m.to_display_name ?? m.to_id ?? "?";
 }
 
@@ -1025,9 +1279,9 @@ function systemText(m) {
   const t = m.text ?? "";
   try {
     const j = JSON.parse(t);
-    if (m.msg_type === "control" && j.action) return `${j.action}${j.reason ? ` — ${j.reason}` : ""}`;
-    if (m.msg_type === "role_assignment" && j.role) return `role set to ${j.role}`;
-    if (m.msg_type === "rename" && j.display_name) return `renamed to ${j.display_name}`;
+    if (m.msg_type === "control" && j.action) return `${tr(j.action)}${j.reason ? ` — ${tr(j.reason)}` : ""}`;
+    if (m.msg_type === "role_assignment" && j.role) return tr("role set to {role}", { role: j.role });
+    if (m.msg_type === "rename" && j.display_name) return tr("renamed to {name}", { name: j.display_name });
   } catch { /* plain text */ }
   return t.replace(/\s+/g, " ");
 }
@@ -1065,14 +1319,14 @@ function renderChat(force) {
   lastChatSignature = sig;
 
   if (!state.session) {
-    feed.innerHTML = `<div class="chat-empty">${state.brokerAlive ? "No session selected.<br><button class=\"btn primary\" data-action=\"new-team\" style=\"margin-top:12px\">+ New Team</button>" : "Broker is not running."}</div>`;
+    feed.innerHTML = `<div class="chat-empty">${state.brokerAlive ? `${tr("No session selected.")}<br><button class="btn primary" data-action="new-team" style="margin-top:12px">${tr("+ New Team")}</button>` : tr("Broker is not running.")}</div>`;
     $("chat-count").textContent = "";
     return;
   }
   const items = chatItems();
-  $("chat-count").textContent = `${items.length} message${items.length === 1 ? "" : "s"}`;
+  $("chat-count").textContent = tr(items.length === 1 ? "{n} message" : "{n} messages", { n: items.length });
   if (!items.length) {
-    feed.innerHTML = '<div class="chat-empty">No messages yet. Say something to the team below.</div>';
+    feed.innerHTML = `<div class="chat-empty">${tr("No messages yet. Say something to the team below.")}</div>`;
     return;
   }
 
@@ -1088,7 +1342,7 @@ function renderChat(force) {
     }
     const sender = senderOf(m);
     if (isSystemMessage(m)) {
-      const target = to.size > 1 ? "everyone" : [...to][0];
+      const target = to.size > 1 ? tr("everyone") : [...to][0];
       html += `<div class="sys-note"><span title="${esc(fmtTime(m.sent_at))} · ${esc(m.msg_type)}">${esc(sender.name)} &rarr; ${esc(target)}: ${esc(systemText(m))}</span></div>`;
       lastSender = null;
       continue;
@@ -1096,18 +1350,18 @@ function renderChat(force) {
     const cont = lastSender === sender.key && t - lastTime < 3 * 60_000 && to.size === 1;
     lastSender = sender.key;
     lastTime = t;
-    const toLabel = m.msg_type === "broadcast" || to.size > 2 ? "everyone" : [...to].join(", ");
+    const toLabel = m.msg_type === "broadcast" || to.size > 2 ? tr("everyone") : [...to].join(", ");
     const text = m.text ?? "";
     const long = !expandedMessages.has(m.id) && (text.length > 1500 || text.split("\n").length > 24);
     const kind = m.msg_type !== "chat" ? m.msg_type : "";
     html += `<div class="msg${sender.me ? " me" : ""}${cont ? " cont" : ""}">
-      ${avatar(sender.name, sender.color, "", sender.me)}
+      ${sender.slot ? slotAvatar(sender.slot) : sender.me ? humanAvatar() : avatar(sender.name, sender.color)}
       <div class="msg-body">
         <div class="msg-head">
           <span class="msg-name">${esc(sender.name)}</span>
           ${sender.role ? `<span class="msg-role">${esc(sender.role)}</span>` : ""}
           <span class="msg-to">&rarr; ${esc(toLabel)}</span>
-          ${kind ? `<span class="kind-tag ${esc(kind)}">${esc(kind.replace(/_/g, " "))}</span>` : ""}
+          ${kind ? `<span class="kind-tag ${esc(kind)}">${esc(tr(kind.replace(/_/g, " ")))}</span>` : ""}
           <span class="msg-time">${esc(fmtTime(m.sent_at))}</span>
         </div>
         <div class="bubble rich${kind ? ` kind-${esc(kind)}` : ""}${long ? " collapsed" : ""}" data-mid="${m.id}" title="${cont ? esc(fmtTime(m.sent_at)) : ""}">${renderMarkdown(text, { chat: true })}</div>
@@ -1143,17 +1397,17 @@ $("msg-filter-agent").addEventListener("change", () => render(true));
 function refreshAgentSelects() {
   const live = liveSlots();
   const opts = (list) => list.map((s) => `<option value="${s.id}">${esc(slotName(s))}${s.role ? ` · ${esc(s.role)}` : ""}</option>`).join("");
-  fillSelect("composer-to", `<option value="all">Everyone</option>` + opts(live));
-  fillSelect("msg-filter-agent", `<option value="">everyone</option>` + opts(state.slots));
-  fillSelect("act-agent", `<option value="">all agents</option>` + opts(state.slots));
-  fillSelect("plan-add-assignee", `<option value="">unassigned</option>` + opts(live));
+  fillSelect("composer-to", `<option value="all">${tr("Everyone")}</option>` + opts(live));
+  fillSelect("msg-filter-agent", `<option value="">${tr("everyone")}</option>` + opts(state.slots));
+  fillSelect("act-agent", `<option value="">${tr("all agents")}</option>` + opts(state.slots));
+  fillSelect("plan-add-assignee", `<option value="">${tr("unassigned")}</option>` + opts(live));
   fillSelect("lock-agent", opts(live));
   fillSelect("own-agent", opts(live));
   const to = $("composer-to").value;
   const slot = to === "all" ? null : slotById(parseInt(to, 10));
   $("composer-target-hint").textContent = slot
-    ? `${TASK_LABEL[slot.task_state] ?? slot.task_state}${isPaused(slot) ? " · paused (held until resume)" : ""}`
-    : `${live.filter((s) => s.status === "connected" && !isPaused(s)).length} online`;
+    ? `${taskLabel(slot.task_state)}${isPaused(slot) ? tr(" · paused (held until resume)") : ""}`
+    : tr("{n} online", { n: live.filter((s) => s.status === "connected" && !isPaused(s)).length });
   $("composer-send").disabled = !state.session || state.session.status === "archived";
 }
 
@@ -1197,7 +1451,7 @@ $("composer-text").addEventListener("keydown", (e) => {
 $("composer-to").addEventListener("change", refreshAgentSelects);
 $("composer-presets").addEventListener("click", (e) => {
   e.stopPropagation();
-  openMenu($("composer-presets"), PRESETS.map((t) => ({ label: t, onClick: () => { $("composer-text").value = t; autosize(); $("composer-text").focus(); } })));
+  openMenu($("composer-presets"), PRESETS.map((t) => ({ label: tr(t), onClick: () => { $("composer-text").value = tr(t); autosize(); $("composer-text").focus(); } })));
 });
 
 const PRESETS = [
@@ -1211,15 +1465,15 @@ const PRESETS = [
 
 function renderSessionBar() {
   const s = state.session;
-  $("sb-name").textContent = s ? (s.name || s.id) : (state.sessionId ?? "No session selected");
+  $("sb-name").textContent = s ? (s.name || s.id) : (state.sessionId ?? tr("No session selected"));
   const b = s ? sessionBadge() : null;
   $("sb-status").innerHTML = b ? `<span class="badge ${b.cls}">${b.text}</span>` : "";
   $("sb-gate").innerHTML = s
-    ? `<span class="badge ${state.humanGate ? "badge-review" : "badge-idle"}" style="cursor:pointer" data-action="toggle-gate" title="Human gate: when on, approved work waits for your release instead of auto-ending">human gate ${state.humanGate ? "on" : "off"}</span>`
+    ? `<span class="badge ${state.humanGate ? "badge-review" : "badge-idle"}" style="cursor:pointer" data-action="toggle-gate" title="${tr("Human gate: when on, approved work waits for your release instead of auto-ending")}">${tr(state.humanGate ? "human gate on" : "human gate off")}</span>`
     : "";
   $("sb-meta").textContent = s
-    ? `${s.project_dir}${state.managed ? " · agents run under this dashboard" : ""}`
-    : "Create a team with + New Team, or pick a session on the left.";
+    ? `${s.project_dir}${state.managed ? tr(" · agents run under this dashboard") : ""}`
+    : tr("Create a team with + New Team, or pick a session on the left.");
   $("sb-meta").title = s ? `${s.id} · ${s.project_dir}` : "";
 
   const has = !!s, archived = s?.status === "archived", paused = s?.status === "paused";
@@ -1235,11 +1489,11 @@ function renderGateBanner() {
   const el = $("gate-banner");
   if (!state.awaitingHuman) { el.className = "hidden"; el.innerHTML = ""; return; }
   el.className = "banner";
-  el.innerHTML = `<span class="banner-title">&#9888; Waiting for your approval</span>
-    <span class="dim">Every agent is approved. Review the work, then release it or send it back.</span>
+  el.innerHTML = `<span class="banner-title">&#9888; ${tr("Waiting for your approval")}</span>
+    <span class="dim">${tr("Every agent is approved. Review the work, then release it or send it back.")}</span>
     <span class="toolbar">
-      <button class="btn danger" data-action="gate-sendback">Send back for revision</button>
-      <button class="btn primary" data-action="gate-release">Approve &amp; Release</button>
+      <button class="btn danger" data-action="gate-sendback">${tr("Send back for revision")}</button>
+      <button class="btn primary" data-action="gate-release">${tr("Approve & Release")}</button>
     </span>`;
 }
 
@@ -1249,17 +1503,19 @@ const TASK_LABEL = {
   idle: "idle", working: "working", done_pending_review: "in review",
   addressing_feedback: "addressing feedback", approved: "approved", released: "released",
 };
+function taskLabel(state) { return tr(TASK_LABEL[state] ?? state); }
+
 const TASK_CLASS = {
   idle: "badge-idle", working: "badge-working", done_pending_review: "badge-review",
   addressing_feedback: "badge-feedback", approved: "badge-approved", released: "badge-released",
 };
 
 function taskBadge(taskState) {
-  return `<span class="badge ${TASK_CLASS[taskState] ?? "badge-idle"}" title="task_state: ${esc(taskState)}">${esc(TASK_LABEL[taskState] ?? taskState)}</span>`;
+  return `<span class="badge ${TASK_CLASS[taskState] ?? "badge-idle"}" title="task_state: ${esc(taskState)}">${esc(taskLabel(taskState))}</span>`;
 }
 
 function connBadge(status) {
-  return status === "connected" ? '<span class="badge badge-connected">online</span>' : '<span class="badge badge-disconnected">offline</span>';
+  return status === "connected" ? `<span class="badge badge-connected">${tr("online")}</span>` : `<span class="badge badge-disconnected">${tr("offline")}</span>`;
 }
 
 function slotSummary(slot) {
@@ -1272,11 +1528,11 @@ function renderAgents() {
   const el = $("panel-agents");
   if (busyRegion(el)) return;
   if (!state.session) {
-    el.innerHTML = `<div class="empty">${state.brokerAlive ? "No session selected." : "Broker is not running."}<br><button class="btn primary" data-action="new-team">+ New Team</button></div>`;
+    el.innerHTML = `<div class="empty">${state.brokerAlive ? tr("No session selected.") : tr("Broker is not running.")}<br><button class="btn primary" data-action="new-team">${tr("+ New Team")}</button></div>`;
     return;
   }
   if (!state.slots.length) {
-    el.innerHTML = '<div class="empty">No agents in this session<br><button class="btn primary" data-action="add-agent">+ Add Agent</button></div>';
+    el.innerHTML = `<div class="empty">${tr("No agents in this session")}<br><button class="btn primary" data-action="add-agent">${tr("+ Add Agent")}</button></div>`;
     return;
   }
   const archived = state.session.status === "archived";
@@ -1289,29 +1545,29 @@ function renderAgents() {
     const id = slot.id;
     const tokens = usageLine(slot);
     const actions = released || archived
-      ? `<button class="btn small danger" data-agent="remove" data-slot="${id}" ${archived ? "disabled" : ""}>Remove</button>`
-      : `<button class="btn small primary" data-agent="message" data-slot="${id}">Message</button>
-        ${paused ? `<button class="btn small success" data-agent="resume" data-slot="${id}">Resume</button>` : `<button class="btn small warn" data-agent="pause" data-slot="${id}">Pause</button>`}
-        <button class="btn small" data-agent="settings" data-slot="${id}">Settings</button>
-        <button class="btn small" data-agent="activity" data-slot="${id}">Activity</button>
-        <button class="btn small" data-agent="role" data-slot="${id}">Role</button>
-        <button class="btn small" data-agent="rename" data-slot="${id}">Rename</button>
-        ${reviewable ? `<button class="btn small warn" data-agent="sendback" data-slot="${id}">Send Back</button>` : ""}
-        <button class="btn small ${slot.task_state === "approved" ? "success" : ""}" data-agent="release" data-slot="${id}">Release</button>
-        <button class="btn small danger" data-agent="remove" data-slot="${id}">Remove</button>`;
+      ? `<button class="btn small danger" data-agent="remove" data-slot="${id}" ${archived ? "disabled" : ""}>${tr("Remove")}</button>`
+      : `<button class="btn small primary" data-agent="message" data-slot="${id}">${tr("Message")}</button>
+        ${paused ? `<button class="btn small success" data-agent="resume" data-slot="${id}">${tr("Resume")}</button>` : `<button class="btn small warn" data-agent="pause" data-slot="${id}">${tr("Pause")}</button>`}
+        <button class="btn small" data-agent="settings" data-slot="${id}">${tr("Settings")}</button>
+        <button class="btn small" data-agent="activity" data-slot="${id}">${tr("Activity")}</button>
+        <button class="btn small" data-agent="role" data-slot="${id}">${tr("Role")}</button>
+        <button class="btn small" data-agent="rename" data-slot="${id}">${tr("Rename")}</button>
+        ${reviewable ? `<button class="btn small warn" data-agent="sendback" data-slot="${id}">${tr("Send Back")}</button>` : ""}
+        <button class="btn small ${slot.task_state === "approved" ? "success" : ""}" data-agent="release" data-slot="${id}">${tr("Release")}</button>
+        <button class="btn small danger" data-agent="remove" data-slot="${id}">${tr("Remove")}</button>`;
     return `<div class="agent-card${slot.task_state === "approved" ? " approved" : ""}">
       <div class="agent-head">
-        ${avatar(slotName(slot), slotColor(id))}
-        <div class="agent-title"><div class="agent-name">${esc(slotName(slot))}</div><div class="agent-role">${esc(slot.role ?? "no role")} · ${esc(slot.agent_type)}</div></div>
+        ${slotAvatar(slot, "", true)}
+        <div class="agent-title"><div class="agent-name">${esc(slotName(slot))}</div><div class="agent-role">${esc(slot.role ?? tr("no role"))} · ${esc(slot.agent_type)}</div></div>
         ${connBadge(slot.status)}
       </div>
       <div class="agent-badges">
         ${taskBadge(slot.task_state ?? "idle")}
-        ${paused ? '<span class="badge badge-paused">paused</span>' : ""}
-        ${managed.has(id) ? '<span class="badge badge-managed" title="This dashboard launched and supervises the agent process">managed here</span>' : ""}
+        ${paused ? `<span class="badge badge-paused">${tr("paused")}</span>` : ""}
+        ${managed.has(id) ? `<span class="badge badge-managed" title="${tr("This dashboard launched and supervises the agent process")}">${tr("managed here")}</span>` : ""}
         ${settingsBadges(slot)}
       </div>
-      <div class="agent-ids" title="slot id = stable seat in the session; peer id = the running process's registration">slot #${id} · peer ${esc(slot.peer_id ?? "—")}</div>
+      <div class="agent-ids" title="${tr("slot id = stable seat in the session; peer id = the running process's registration")}">${tr("slot #{id} · peer {peer}", { id, peer: esc(slot.peer_id ?? "—") })}</div>
       ${tokens}
       ${summary ? `<div class="agent-summary rich">${inline(truncate(summary, 260))}</div>` : ""}
       <div class="agent-actions">${actions}</div>
@@ -1323,19 +1579,19 @@ function renderAgents() {
 function renderRoster() {
   const el = $("rpanel-team");
   if ($("rpanel-team").classList.contains("hidden") || busyRegion(el)) return;
-  if (!state.session) { el.innerHTML = '<div class="empty">No session selected</div>'; return; }
-  if (!state.slots.length) { el.innerHTML = '<div class="empty">No agents yet<br><button class="btn primary" data-action="add-agent">+ Add Agent</button></div>'; return; }
+  if (!state.session) { el.innerHTML = `<div class="empty">${tr("No session selected")}</div>`; return; }
+  if (!state.slots.length) { el.innerHTML = `<div class="empty">${tr("No agents yet")}<br><button class="btn primary" data-action="add-agent">${tr("+ Add Agent")}</button></div>`; return; }
   const order = (s) => (s.task_state === "released" ? 2 : s.status === "connected" ? 0 : 1);
   el.innerHTML = [...state.slots].sort((a, b) => order(a) - order(b) || a.id - b.id).map((slot) => {
     const statusColor = isPaused(slot) ? "var(--yellow)" : slot.status === "connected" ? "var(--green)" : "var(--text-muted)";
     const summary = slotSummary(slot);
     return `<div class="roster-item" data-roster="${slot.id}" style="${slot.task_state === "released" ? "opacity:.55" : ""}">
-      ${avatar(slotName(slot), slotColor(slot.id), `<span class="status" style="background:${statusColor}"></span>`)}
+      ${slotAvatar(slot, `<span class="status" style="background:${statusColor}"></span>`)}
       <div class="roster-main">
         <div class="roster-name">${esc(slotName(slot))} <span class="muted" style="font-weight:400;font-size:11.5px">${esc(slot.role ?? "")}</span></div>
-        <div class="roster-sub">${esc(TASK_LABEL[slot.task_state] ?? slot.task_state)}${isPaused(slot) ? " · paused" : ""}${summary ? ` · ${esc(truncate(summary, 80))}` : ""}</div>
+        <div class="roster-sub">${esc(taskLabel(slot.task_state))}${isPaused(slot) ? ` · ${tr("paused")}` : ""}${summary ? ` · ${esc(truncate(summary, 80))}` : ""}</div>
       </div>
-      <button class="icon-btn" data-roster-menu="${slot.id}" title="Actions">&#8943;</button>
+      <button class="icon-btn" data-roster-menu="${slot.id}" title="${tr("Actions")}">&#8943;</button>
     </div>`;
   }).join("");
 }
@@ -1394,7 +1650,7 @@ async function agentAction(kind, slot, btn) {
     case "resume":
       return run(btn, "Resume", () => api("agents/control", { session_id: sid, slot_id: slot.id, action: "resume" }));
     case "rename": {
-      const v = await promptDialog({ title: `Rename ${name}`, sid, label: "Display name", value: slot.display_name ?? "" });
+      const v = await promptDialog({ title: tr("Rename {name}", { name }), sid, label: "Display name", value: slot.display_name ?? "" });
       if (v) return run(null, "Rename", () => api("agents/rename", { session_id: sid, slot_id: slot.id, display_name: v }));
       return;
     }
@@ -1408,9 +1664,9 @@ async function agentAction(kind, slot, btn) {
     case "release": {
       const notApproved = slot.task_state !== "approved";
       const ok = await confirmDialog({
-        title: `Release ${name}?`, sid,
-        message: `<p>Releasing tells ${esc(name)} its work is complete; it disconnects once idle.</p>` +
-          (notApproved ? `<p style="color:var(--yellow)">&#9888; ${esc(name)} is <b>${esc(TASK_LABEL[slot.task_state] ?? slot.task_state)}</b>, not approved.</p>` : ""),
+        title: tr("Release {name}?", { name }), sid,
+        message: `<p>${tr("Releasing tells {name} its work is complete; it disconnects once idle.", { name: esc(name) })}</p>` +
+          (notApproved ? `<p style="color:var(--yellow)">&#9888; ${tr("{name} is <b>{state}</b>, not approved.", { name: esc(name), state: esc(taskLabel(slot.task_state)) })}</p>` : ""),
         confirmLabel: "Release", danger: notApproved,
       });
       if (ok) return run(btn, "Release", () => api("agents/release", { session_id: sid, slot_id: slot.id }));
@@ -1418,8 +1674,8 @@ async function agentAction(kind, slot, btn) {
     }
     case "remove": {
       const ok = await confirmDialog({
-        title: `Remove ${name}?`, sid,
-        message: "<p>Remove stops the agent now (if this dashboard runs it), marks it released and tells the team it left. Unlike <b>Release</b>, it does not wait for the agent to finish.</p>",
+        title: tr("Remove {name}?", { name }), sid,
+        message: `<p>${tr("Remove stops the agent now (if this dashboard runs it), marks it released and tells the team it left. Unlike <b>Release</b>, it does not wait for the agent to finish.")}</p>`,
         confirmLabel: "Remove", danger: true,
       });
       if (ok) return run(btn, "Remove", () => api("agents/remove", { session_id: sid, slot_id: slot.id }));
@@ -1436,22 +1692,22 @@ function renderPlan() {
   const el = $("plan-list");
   if (busyRegion(el)) return;
   if (!state.plan?.plan) {
-    el.innerHTML = `<div class="empty">${state.session ? "No plan yet — add the first task above." : "No session selected"}</div>`;
+    el.innerHTML = `<div class="empty">${state.session ? tr("No plan yet — add the first task above.") : tr("No session selected")}</div>`;
     return;
   }
   const { plan, items, completion } = state.plan;
   const itemsHtml = items.map((item) => {
-    const assigneeOpts = `<option value="">unassigned</option>` + state.slots
+    const assigneeOpts = `<option value="">${tr("unassigned")}</option>` + state.slots
       .filter((s) => s.task_state !== "released" || s.id === item.assigned_to_slot)
       .map((s) => `<option value="${s.id}" ${s.id === item.assigned_to_slot ? "selected" : ""}>${esc(slotName(s))}</option>`).join("");
     const statusOpts = ["pending", "in_progress", "blocked", "done"]
-      .map((st) => `<option value="${st}" ${st === item.status ? "selected" : ""}>${st.replace("_", " ")}</option>`).join("");
+      .map((st) => `<option value="${st}" ${st === item.status ? "selected" : ""}>${tr(st.replace("_", " "))}</option>`).join("");
     return `<div class="plan-item ${esc(item.status)}" data-item="${item.id}">
       <span class="plan-check ${esc(item.status)}">${PLAN_ICON[item.status] ?? PLAN_ICON.pending}</span>
-      <span class="plan-label" data-plan="edit" title="Click to edit">${esc(item.label)}</span>
+      <span class="plan-label" data-plan="edit" title="${tr("Click to edit")}">${esc(item.label)}</span>
       <select data-plan="status">${statusOpts}</select>
       <select data-plan="assignee">${assigneeOpts}</select>
-      <button class="icon-btn" data-plan="delete" title="Delete task">&#10005;</button>
+      <button class="icon-btn" data-plan="delete" title="${tr("Delete task")}">&#10005;</button>
     </div>`;
   }).join("");
   el.innerHTML = `<div class="card">
@@ -1460,7 +1716,7 @@ function renderPlan() {
       <div class="progress-bar"><div class="progress-fill" style="width:${completion}%"></div></div>
       <span class="plan-pct">${completion}%</span>
     </div></div>
-    <div style="padding:4px 14px">${itemsHtml || '<div class="empty">No tasks</div>'}</div>
+    <div style="padding:4px 14px">${itemsHtml || `<div class="empty">${tr("No tasks")}</div>`}</div>
   </div>`;
 }
 
@@ -1496,10 +1752,10 @@ $("plan-list").addEventListener("click", async (e) => {
   const item = state.plan?.items.find((i) => i.id === itemId);
   if (!item) return;
   if (t.dataset.plan === "edit") {
-    const v = await promptDialog({ title: "Edit task", sid, label: "Task", value: item.label, multiline: true });
+    const v = await promptDialog({ title: tr("Edit task"), sid, label: "Task", value: item.label, multiline: true });
     if (v) run(null, "Edit task", () => api("plan/edit", { session_id: sid, item_id: itemId, label: v }).then(() => ({ message: "Task updated" })));
   } else if (t.dataset.plan === "delete") {
-    const ok = await confirmDialog({ title: "Delete task?", sid, message: `<p>${esc(item.label)}</p>`, confirmLabel: "Delete", danger: true });
+    const ok = await confirmDialog({ title: tr("Delete task?"), sid, message: `<p>${esc(item.label)}</p>`, confirmLabel: "Delete", danger: true });
     if (ok) run(null, "Delete task", () => api("plan/delete", { session_id: sid, item_id: itemId }).then(() => ({ message: "Task deleted" })));
   }
 });
@@ -1513,21 +1769,21 @@ function renderKnowledge() {
   if (busyRegion(el)) return;
   const entries = state.knowledge ?? [];
   if (!entries.length) {
-    el.innerHTML = `<div class="empty">${state.session ? "No knowledge entries. Agents store decisions and discoveries here." : "No session selected"}</div>`;
+    el.innerHTML = `<div class="empty">${state.session ? tr("No knowledge entries. Agents store decisions and discoveries here.") : tr("No session selected")}</div>`;
     return;
   }
-  el.innerHTML = `<div class="card"><div class="card-header">Shared Knowledge <span>${entries.length}</span></div>${entries.map((e) => {
-    const by = e.created_by_name ? `by ${esc(e.created_by_name)}` : "";
+  el.innerHTML = `<div class="card"><div class="card-header">${tr("Shared Knowledge")} <span>${entries.length}</span></div>${entries.map((e) => {
+    const by = e.created_by_name ? tr("by {name}", { name: esc(e.created_by_name) }) : "";
     const ago = timeSince(e.updated_at);
     return `<div class="knowledge-item" data-key="${esc(e.key)}">
       <div class="knowledge-main">
-        <div><span class="knowledge-key">${esc(e.key)}</span><span class="knowledge-cat">${esc(e.category)}</span></div>
+        <div><span class="knowledge-key">${esc(e.key)}</span><span class="knowledge-cat">${esc(tr(e.category))}</span></div>
         <div class="knowledge-value rich">${renderMarkdown(e.value, { chat: true })}</div>
         <div class="knowledge-meta">${by}${by && ago ? " · " : ""}${ago}</div>
       </div>
       <div class="flex gap-2" style="align-items:flex-start">
-        <button class="btn small" data-kn="edit">Edit</button>
-        <button class="btn small danger" data-kn="delete">Delete</button>
+        <button class="btn small" data-kn="edit">${tr("Edit")}</button>
+        <button class="btn small danger" data-kn="delete">${tr("Delete")}</button>
       </div>
     </div>`;
   }).join("")}</div>`;
@@ -1538,7 +1794,7 @@ function resetKnowledgeForm() {
   editingKnowledgeKey = null;
   $("knowledge-form").reset();
   $("kn-key").readOnly = false;
-  $("knowledge-form-title").textContent = "Add knowledge";
+  $("knowledge-form-title").textContent = tr("Add knowledge");
 }
 
 $("kn-cancel").addEventListener("click", resetKnowledgeForm);
@@ -1548,7 +1804,7 @@ $("knowledge-form").addEventListener("submit", async (e) => {
   const sid = currentSid();
   if (sid == null) return;
   const body = { session_id: sid, key: $("kn-key").value.trim(), value: $("kn-value").value, category: $("kn-category").value };
-  const r = await run(e.submitter, "Save knowledge", () => api("knowledge/put", body).then(() => ({ message: `Saved "${body.key}"` })));
+  const r = await run(e.submitter, "Save knowledge", () => api("knowledge/put", body).then(() => ({ message: tr("Saved \"{key}\"", { key: body.key }) })));
   if (r) resetKnowledgeForm();
 });
 
@@ -1566,12 +1822,12 @@ $("knowledge-list").addEventListener("click", async (e) => {
     $("kn-key").readOnly = true;
     $("kn-value").value = entry.value;
     $("kn-category").value = entry.category;
-    $("knowledge-form-title").textContent = `Edit "${key}"`;
+    $("knowledge-form-title").textContent = tr("Edit \"{key}\"", { key });
     $("kn-value").focus();
   } else {
-    const ok = await confirmDialog({ title: `Delete "${key}"?`, sid, message: `<p>${esc(truncate(entry.value, 300))}</p>`, confirmLabel: "Delete", danger: true });
+    const ok = await confirmDialog({ title: tr("Delete \"{key}\"?", { key }), sid, message: `<p>${esc(truncate(entry.value, 300))}</p>`, confirmLabel: "Delete", danger: true });
     if (ok) {
-      await run(btn, "Delete knowledge", () => api("knowledge/delete", { session_id: sid, key }).then(() => ({ message: `Deleted "${key}"` })));
+      await run(btn, "Delete knowledge", () => api("knowledge/delete", { session_id: sid, key }).then(() => ({ message: tr("Deleted \"{key}\"", { key }) })));
       if (editingKnowledgeKey === key) resetKnowledgeForm();
     }
   }
@@ -1587,21 +1843,22 @@ function renderFiles() {
     const left = l.expires_at - Date.now();
     return `<tr>
       <td><span class="file-ref mono" data-ref="${esc(l.file_path)}">${esc(l.file_path)}</span></td>
-      <td>${esc(holder ? slotName(holder) : `Slot ${l.held_by_slot}`)}</td>
+      <td>${esc(holder ? slotName(holder) : tr("Slot {id}", { id: l.held_by_slot }))}</td>
       <td class="dim">${esc(l.purpose ?? "")}</td>
       <td class="dim">${timeSince(l.acquired_at)}</td>
-      <td style="color:${left < 60000 ? "var(--yellow)" : "var(--text-dim)"}">${left > 0 ? "in " + fmtDuration(left) : "expired"}</td>
-      <td><button class="btn small danger" data-lock-release="${l.id}">Force unlock</button></td>
+      <td style="color:${left < 60000 ? "var(--yellow)" : "var(--text-dim)"}">${left > 0 ? tr("in {time}", { time: fmtDuration(left) }) : tr("expired")}</td>
+      <td><button class="btn small danger" data-lock-release="${l.id}">${tr("Force unlock")}</button></td>
     </tr>`;
   }).join("");
   const ownRows = state.fileOwnership.map((o) => {
     const owner = slotById(o.slot_id);
-    return `<tr><td class="mono">${esc(o.path_pattern)}</td><td>${esc(owner ? slotName(owner) : `Slot ${o.slot_id}`)}</td><td class="dim">${esc(o.assigned_by ?? "")}</td><td class="dim">${timeSince(o.assigned_at)}</td></tr>`;
+    return `<tr><td class="mono">${esc(o.path_pattern)}</td><td>${esc(owner ? slotName(owner) : tr("Slot {id}", { id: o.slot_id }))}</td><td class="dim">${esc(o.assigned_by ?? "")}</td><td class="dim">${timeSince(o.assigned_at)}</td></tr>`;
   }).join("");
-  el.innerHTML = `<div class="card"><div class="card-header">Active Locks <span>${state.fileLocks.length}</span></div>
-      ${state.fileLocks.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>File</th><th>Held By</th><th>Purpose</th><th>Acquired</th><th>Expires</th><th></th></tr></thead><tbody>${lockRows}</tbody></table></div>` : '<div class="empty" style="padding:16px">No active locks</div>'}</div>
-    <div class="card"><div class="card-header">Ownership Zones <span>${state.fileOwnership.length}</span></div>
-      ${state.fileOwnership.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Pattern</th><th>Owner</th><th>Assigned By</th><th>When</th></tr></thead><tbody>${ownRows}</tbody></table></div>` : '<div class="empty" style="padding:16px">No ownership zones</div>'}</div>`;
+  const th = (...cols) => cols.map((c) => `<th>${c ? tr(c) : ""}</th>`).join("");
+  el.innerHTML = `<div class="card"><div class="card-header">${tr("Active Locks")} <span>${state.fileLocks.length}</span></div>
+      ${state.fileLocks.length ? `<div class="table-wrap"><table class="table"><thead><tr>${th("File", "Held By", "Purpose", "Acquired", "Expires", "")}</tr></thead><tbody>${lockRows}</tbody></table></div>` : `<div class="empty" style="padding:16px">${tr("No active locks")}</div>`}</div>
+    <div class="card"><div class="card-header">${tr("Ownership Zones")} <span>${state.fileOwnership.length}</span></div>
+      ${state.fileOwnership.length ? `<div class="table-wrap"><table class="table"><thead><tr>${th("Pattern", "Owner", "Assigned By", "When")}</tr></thead><tbody>${ownRows}</tbody></table></div>` : `<div class="empty" style="padding:16px">${tr("No ownership zones")}</div>`}</div>`;
   hydrateFileRefs(el);
 }
 
@@ -1614,8 +1871,8 @@ $("files-list").addEventListener("click", async (e) => {
   if (!lock) return;
   const holder = slotById(lock.held_by_slot);
   const ok = await confirmDialog({
-    title: "Force unlock?", sid,
-    message: `<p><span class="mono">${esc(lock.file_path)}</span> is held by <b>${esc(holder ? slotName(holder) : `slot ${lock.held_by_slot}`)}</b>. Unlocking lets other agents edit it while the holder may still be writing.</p>`,
+    title: tr("Force unlock?"), sid,
+    message: `<p>${tr("<span class=\"mono\">{file}</span> is held by <b>{holder}</b>. Unlocking lets other agents edit it while the holder may still be writing.", { file: esc(lock.file_path), holder: esc(holder ? slotName(holder) : tr("Slot {id}", { id: lock.held_by_slot })) })}</p>`,
     confirmLabel: "Force unlock", danger: true,
   });
   if (ok) run(btn, "Unlock", () => api("files/release", { session_id: sid, lock_id: lock.id }));
@@ -1626,7 +1883,7 @@ $("lock-form").addEventListener("submit", async (e) => {
   const sid = currentSid();
   if (sid == null) return;
   const slot = $("lock-agent").value;
-  if (!slot) return toast("Pick an agent", "warn");
+  if (!slot) return toast(tr("Pick an agent"), "warn");
   const r = await run(e.submitter, "Acquire lock", () => api("files/acquire", {
     session_id: sid, slot_id: parseInt(slot, 10), file_path: $("lock-path").value.trim(),
     minutes: Number($("lock-minutes").value), purpose: $("lock-purpose").value.trim(),
@@ -1639,7 +1896,7 @@ $("ownership-form").addEventListener("submit", async (e) => {
   const sid = currentSid();
   if (sid == null) return;
   const slot = $("own-agent").value;
-  if (!slot) return toast("Pick an agent", "warn");
+  if (!slot) return toast(tr("Pick an agent"), "warn");
   const patterns = $("own-patterns").value.split(",").map((p) => p.trim()).filter(Boolean);
   const r = await run(e.submitter, "Assign ownership", () => api("files/ownership", { session_id: sid, slot_id: parseInt(slot, 10), patterns }));
   if (r) $("own-patterns").value = "";
@@ -1650,7 +1907,7 @@ $("ownership-form").addEventListener("submit", async (e) => {
 function renderStats() {
   const el = $("panel-stats");
   if (busyRegion(el)) return;
-  if (!state.session) { el.innerHTML = '<div class="empty">No session selected</div>'; return; }
+  if (!state.session) { el.innerHTML = `<div class="empty">${tr("No session selected")}</div>`; return; }
   const limits = state.limits ?? {};
   const totalIn = state.slots.reduce((a, s) => a + (s.input_tokens ?? 0), 0);
   const totalOut = state.slots.reduce((a, s) => a + (s.output_tokens ?? 0), 0);
@@ -1663,54 +1920,54 @@ function renderStats() {
     { value: state.slots.filter((s) => s.status === "connected").length, label: "Online agents", color: "var(--green)" },
     { value: state.messages.length, label: "Messages", color: "var(--cyan)" },
   ];
-  const cardsHtml = cards.map((c) => `<div class="stat-card"><div class="stat-value" style="color:${c.color}">${c.value}</div><div class="stat-label">${esc(c.label)}</div>
-    ${c.limit ? `<div style="margin-top:6px">${limitBar(c.used, c.limit)}<div class="field-hint">limit ${c.fmt(c.limit)}</div></div>` : ""}</div>`).join("");
+  const cardsHtml = cards.map((c) => `<div class="stat-card"><div class="stat-value" style="color:${c.color}">${c.value}</div><div class="stat-label">${esc(tr(c.label))}</div>
+    ${c.limit ? `<div style="margin-top:6px">${limitBar(c.used, c.limit)}<div class="field-hint">${tr("limit {value}", { value: c.fmt(c.limit) })}</div></div>` : ""}</div>`).join("");
 
   const rows = state.slots.map((slot) => {
     const set = slotSettingsOf(slot);
     const used = (slot.input_tokens ?? 0) + (slot.output_tokens ?? 0);
     const limit = set.token_limit || limits.agent_tokens;
     return `<tr>
-      <td><div class="flex items-center gap-2">${avatar(slotName(slot), slotColor(slot.id))}<div><b>${esc(slotName(slot))}</b><div class="muted" style="font-size:11.5px">${esc(slot.agent_type)} · ${esc(set.model || "default model")}${set.effort ? ` · ${esc(set.effort)}` : ""}</div></div></div></td>
+      <td><div class="flex items-center gap-2">${slotAvatar(slot)}<div><b>${esc(slotName(slot))}</b><div class="muted" style="font-size:11.5px">${esc(slot.agent_type)} · ${esc(set.model || tr("default model"))}${set.effort ? ` · ${esc(set.effort)}` : ""}</div></div></div></td>
       <td class="num">${fmtTokens(slot.input_tokens ?? 0)}</td>
       <td class="num">${fmtTokens(slot.output_tokens ?? 0)}</td>
       <td class="num muted">${fmtTokens(slot.cache_read_tokens ?? 0)}</td>
       <td class="num">${slot.agent_type === "claude" ? fmtUsd(slot.cost_usd ?? 0) : '<span class="muted">—</span>'}</td>
-      <td style="min-width:140px">${limit ? `${limitBar(used, limit)}<div class="field-hint">${fmtTokens(used)} / ${fmtTokens(limit)}${set.token_limit ? "" : " (session default)"}</div>` : '<span class="muted">no limit</span>'}
-        ${set.limit_hit ? `<div><span class="badge badge-limit">paused: ${esc(set.limit_hit)}</span></div>` : ""}</td>
-      <td><button class="btn small" data-agent="settings" data-slot="${slot.id}">Settings</button></td>
+      <td style="min-width:140px">${limit ? `${limitBar(used, limit)}<div class="field-hint">${fmtTokens(used)} / ${fmtTokens(limit)}${set.token_limit ? "" : tr(" (session default)")}</div>` : `<span class="muted">${tr("no limit")}</span>`}
+        ${set.limit_hit ? `<div><span class="badge badge-limit">${tr("paused: {reason}", { reason: esc(tr(set.limit_hit)) })}</span></div>` : ""}</td>
+      <td><button class="btn small" data-agent="settings" data-slot="${slot.id}">${tr("Settings")}</button></td>
     </tr>`;
   }).join("");
 
   const enforced = state.guardrails.filter((g) => g.action !== "monitor" && g.adjustable);
   const guardrails = enforced.map((g) => `<div class="guardrail-row" data-guardrail="${esc(g.id)}">
-      <div class="guardrail-info"><div class="guardrail-label">${esc(g.label)} ${g.is_overridden ? '<span class="badge badge-review">overridden</span>' : ""}</div>
-        <div class="guardrail-desc">${esc(g.description ?? "")} · usage ${g.usage?.current ?? 0}/${g.usage?.limit ?? g.current_value} ${esc(g.unit)}</div></div>
+      <div class="guardrail-info"><div class="guardrail-label">${esc(tr(g.label))} ${g.is_overridden ? `<span class="badge badge-review">${tr("overridden")}</span>` : ""}</div>
+        <div class="guardrail-desc">${esc(tr(g.description ?? ""))} · ${tr("usage")} ${g.usage?.current ?? 0}/${g.usage?.limit ?? g.current_value} ${esc(tr(g.unit))}</div></div>
       <div class="stepper">
         <button class="btn small" data-step="-1">&minus;</button>
         <input type="number" min="0" value="${g.current_value}" data-input>
         <button class="btn small" data-step="1">+</button>
-        <button class="btn small primary" data-set>Set</button>
+        <button class="btn small primary" data-set>${tr("Set")}</button>
       </div>
     </div>`).join("");
 
   const lim = (k) => (limits[k] ? String(limits[k]) : "");
   el.innerHTML = `<div class="stats-grid">${cardsHtml}</div>
-    <div class="card"><div class="card-header">Usage per agent <span style="text-transform:none;letter-spacing:0;font-weight:400">tokens as the CLIs report them; cost only where the CLI reports it</span></div>
-      <div class="table-wrap"><table class="table"><thead><tr><th>Agent</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache reads</th><th class="num">Cost</th><th>Limit</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="7" class="muted">No agents yet</td></tr>'}</tbody></table></div></div>
-    <div class="card"><div class="card-header">Limit locks</div>
+    <div class="card"><div class="card-header">${tr("Usage per agent")} <span style="text-transform:none;letter-spacing:0;font-weight:400">${tr("tokens as the CLIs report them; cost only where the CLI reports it")}</span></div>
+      <div class="table-wrap"><table class="table"><thead><tr><th>${tr("Agent")}</th><th class="num">${tr("Input")}</th><th class="num">${tr("Output")}</th><th class="num">${tr("Cache reads")}</th><th class="num">${tr("Cost")}</th><th>${tr("Limit")}</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="muted">${tr("No agents yet")}</td></tr>`}</tbody></table></div></div>
+    <div class="card"><div class="card-header">${tr("Limit locks")}</div>
       <div class="card-body">
         <form id="limits-form" class="form-grid">
-          <label>Per agent · tokens</label><input type="number" min="0" step="1000" name="agent_tokens" value="${lim("agent_tokens")}" placeholder="no limit">
-          <label>Per agent · cost (USD)</label><input type="number" min="0" step="0.5" name="agent_cost_usd" value="${lim("agent_cost_usd")}" placeholder="no limit (Claude only)">
-          <label>Whole session · tokens</label><input type="number" min="0" step="1000" name="session_tokens" value="${lim("session_tokens")}" placeholder="no limit">
-          <label>Whole session · cost (USD)</label><input type="number" min="0" step="0.5" name="session_cost_usd" value="${lim("session_cost_usd")}" placeholder="no limit">
-          <div style="grid-column:1/-1" class="flex gap-2 items-center"><span class="field-hint" style="flex:1">An agent that reaches a limit is paused and its running turn stops. Raise the limit, then resume it. Tokens = input + output. An agent's own limit (Settings) overrides the per-agent limit.</span>
-            <button type="submit" class="btn primary">Save limits</button></div>
+          <label>${tr("Per agent · tokens")}</label><input type="number" min="0" step="1000" name="agent_tokens" value="${lim("agent_tokens")}" placeholder="${tr("no limit")}">
+          <label>${tr("Per agent · cost (USD)")}</label><input type="number" min="0" step="0.5" name="agent_cost_usd" value="${lim("agent_cost_usd")}" placeholder="${tr("no limit (Claude only)")}">
+          <label>${tr("Whole session · tokens")}</label><input type="number" min="0" step="1000" name="session_tokens" value="${lim("session_tokens")}" placeholder="${tr("no limit")}">
+          <label>${tr("Whole session · cost (USD)")}</label><input type="number" min="0" step="0.5" name="session_cost_usd" value="${lim("session_cost_usd")}" placeholder="${tr("no limit")}">
+          <div style="grid-column:1/-1" class="flex gap-2 items-center"><span class="field-hint" style="flex:1">${tr("An agent that reaches a limit is paused and its running turn stops. Raise the limit, then resume it. Tokens = input + output. An agent's own limit (Settings) overrides the per-agent limit.")}</span>
+            <button type="submit" class="btn primary">${tr("Save limits")}</button></div>
         </form>
       </div></div>
-    ${guardrails ? `<div class="card"><div class="card-header">Guardrails</div><div class="card-body">${guardrails}</div></div>` : ""}`;
+    ${guardrails ? `<div class="card"><div class="card-header">${tr("Guardrails")}</div><div class="card-body">${guardrails}</div></div>` : ""}`;
 }
 
 function limitBar(used, limit) {
@@ -1744,7 +2001,7 @@ $("panel-stats").addEventListener("click", (e) => {
     const id = row.dataset.guardrail;
     input.blur();
     run(e.target, "Guardrail", () => api("guardrail", { session_id: sid, guardrail_id: id, value, reason: "Adjusted via web dashboard" })
-      .then((g) => ({ message: `${g?.label ?? id} set to ${g?.current_value ?? value} ${g?.unit ?? ""}` })));
+      .then((g) => ({ message: tr("{name} set to {value} {unit}", { name: tr(g?.label ?? id), value: g?.current_value ?? value, unit: tr(g?.unit ?? "") }) })));
   }
 });
 
@@ -1763,6 +2020,7 @@ const APPROVAL_MODES = [
   ["ask", "Ask me every step", "Every edit and command waits for your approval."],
 ];
 const MODE_LABEL = Object.fromEntries(APPROVAL_MODES.map(([v, l]) => [v, l]));
+const modeLabel = (mode) => tr(MODE_LABEL[mode] ?? mode);
 
 function slotSettingsOf(slot) {
   let snap = {};
@@ -1778,9 +2036,9 @@ function slotSettingsOf(slot) {
 
 function settingsBadges(slot) {
   const set = slotSettingsOf(slot);
-  return `${set.model ? `<span class="badge badge-mode" title="Model">${esc(set.model)}</span>` : ""}
-    ${set.approval_mode !== "bypass" ? `<span class="badge badge-review" title="Approval mode">${esc(MODE_LABEL[set.approval_mode] ?? set.approval_mode)}</span>` : ""}
-    ${set.limit_hit ? `<span class="badge badge-limit" title="${esc(set.limit_hit)}">limit reached</span>` : ""}`;
+  return `${set.model ? `<span class="badge badge-mode" title="${tr("Model")}">${esc(set.model)}</span>` : ""}
+    ${set.approval_mode !== "bypass" ? `<span class="badge badge-review" title="${tr("Approval mode")}">${esc(modeLabel(set.approval_mode))}</span>` : ""}
+    ${set.limit_hit ? `<span class="badge badge-limit" title="${esc(tr(set.limit_hit))}">${tr("limit reached")}</span>` : ""}`;
 }
 
 function usageLine(slot) {
@@ -1788,37 +2046,38 @@ function usageLine(slot) {
   if (!used && !slot.cost_usd) return "";
   const set = slotSettingsOf(slot);
   const limit = set.token_limit || state.limits?.agent_tokens;
-  return `<div class="agent-ids">${fmtTokens(slot.input_tokens ?? 0)} in / ${fmtTokens(slot.output_tokens ?? 0)} out${slot.cost_usd ? ` · ${fmtUsd(slot.cost_usd)}` : ""}${limit ? ` · limit ${fmtTokens(limit)}` : ""}</div>
+  return `<div class="agent-ids">${tr("{in} in / {out} out", { in: fmtTokens(slot.input_tokens ?? 0), out: fmtTokens(slot.output_tokens ?? 0) })}${slot.cost_usd ? ` · ${fmtUsd(slot.cost_usd)}` : ""}${limit ? ` · ${tr("limit {value}", { value: fmtTokens(limit) })}` : ""}</div>
     ${limit ? `<div style="margin-top:3px">${limitBar(used, limit)}</div>` : ""}`;
 }
 
 function modelFields(type, values = {}) {
   const efforts = EFFORT_OPTIONS[type] ?? [];
-  return `<label>Model</label><div><input type="text" name="model" list="models-${type}" value="${esc(values.model ?? "")}" placeholder="default">
+  return `<label>${tr("Model")}</label><div><input type="text" name="model" list="models-${type}" value="${esc(values.model ?? "")}" placeholder="${tr("default")}">
       <datalist id="models-${type}">${(MODEL_SUGGESTIONS[type] ?? []).map((m) => `<option value="${m}">`).join("")}</datalist>
-      <div class="field-hint">An alias (opus, sonnet…) or a full model name.${type === "gemini" ? " Applies when the agent next starts." : " Applies to a running agent within seconds."}</div></div>
-    <label>Effort</label>${efforts.length
-      ? `<select name="effort"><option value="">default</option>${efforts.map((x) => `<option ${x === values.effort ? "selected" : ""}>${x}</option>`).join("")}</select>`
-      : '<span class="muted" style="font-size:12px">not available for this agent</span>'}`;
+      <div class="field-hint">${tr("An alias (opus, sonnet…) or a full model name.")}${type === "gemini" ? tr(" Applies when the agent next starts.") : tr(" Applies to a running agent within seconds.")}</div></div>
+    <label>${tr("Effort")}</label>${efforts.length
+      ? `<select name="effort"><option value="">${tr("default")}</option>${efforts.map((x) => `<option value="${x}" ${x === values.effort ? "selected" : ""}>${tr(x)}</option>`).join("")}</select>`
+      : `<span class="muted" style="font-size:12px">${tr("not available for this agent")}</span>`}`;
 }
 
 function approvalFields(type, current = "bypass") {
   return `<div style="grid-column:1/-1">${APPROVAL_MODES.map(([v, l, d]) => {
     const disabled = type === "gemini" && v !== "bypass";
-    return `<label class="mode-option${disabled ? " disabled" : ""}"><input type="radio" name="approval_mode" value="${v}" ${v === current ? "checked" : ""} ${disabled ? "disabled" : ""}><span><b>${l}</b><small>${d}</small></span></label>`;
-  }).join("")}${type === "gemini" ? '<div class="field-hint">Gemini agents run unattended (yolo); step approvals need Claude or Codex. Their steps still show in Activity.</div>' : ""}</div>`;
+    return `<label class="mode-option${disabled ? " disabled" : ""}"><input type="radio" name="approval_mode" value="${v}" ${v === current ? "checked" : ""} ${disabled ? "disabled" : ""}><span><b>${tr(l)}</b><small>${tr(d)}</small></span></label>`;
+  }).join("")}${type === "gemini" ? `<div class="field-hint">${tr("Gemini agents run unattended (yolo); step approvals need Claude or Codex. Their steps still show in Activity.")}</div>` : ""}</div>`;
 }
 
 function settingsModal(sid, slot) {
   const set = slotSettingsOf(slot);
   openModal({
-    title: `Settings · ${slotName(slot)}`, sub: `${sessionSub(sid)} · ${slot.agent_type}`, submitLabel: "Save",
+    title: tr("Settings · {name}", { name: slotName(slot) }), sub: `${sessionSub(sid)} · ${slot.agent_type}`, submitLabel: "Save",
     body: `<div class="form-grid">
+        <label>${tr("Avatar")}</label><div class="flex items-center gap-2">${slotAvatar(slot, "", true)}<span class="field-hint">${tr("Click the avatar to change it.")}</span></div>
         ${modelFields(slot.agent_type, set)}
-        <label>Token limit</label><div><input type="number" name="token_limit" min="0" step="1000" value="${set.token_limit || ""}" placeholder="${state.limits?.agent_tokens ? `session default ${state.limits.agent_tokens}` : "no limit"}">
-          <div class="field-hint">Input + output tokens. When reached the agent is paused and its turn stops. Used so far: ${fmtTokens((slot.input_tokens ?? 0) + (slot.output_tokens ?? 0))}.</div></div>
+        <label>${tr("Token limit")}</label><div><input type="number" name="token_limit" min="0" step="1000" value="${set.token_limit || ""}" placeholder="${state.limits?.agent_tokens ? tr("session default {value}", { value: state.limits.agent_tokens }) : tr("no limit")}">
+          <div class="field-hint">${tr("Input + output tokens. When reached the agent is paused and its turn stops. Used so far: {used}.", { used: fmtTokens((slot.input_tokens ?? 0) + (slot.output_tokens ?? 0)) })}</div></div>
       </div>
-      <div class="section-label" style="margin-top:14px">Approvals</div>
+      <div class="section-label" style="margin-top:14px">${tr("Approvals")}</div>
       <div class="form-grid">${approvalFields(slot.agent_type, set.approval_mode)}</div>`,
     onSubmit: async (form) => {
       const body = {
@@ -1829,14 +2088,14 @@ function settingsModal(sid, slot) {
       };
       if (form.effort) body.effort = form.effort.value;
       const r = await api("agents/settings", body);
-      toast(r?.message ?? "Saved", "ok");
+      toast(tr(r?.message ?? "Saved"), "ok");
     },
   });
 }
 
 $("act-settings").addEventListener("click", () => {
   const slot = slotById(parseInt($("act-agent").value, 10)) ?? liveSlots()[0];
-  if (!slot) return toast("No agent selected", "warn");
+  if (!slot) return toast(tr("No agent selected"), "warn");
   const sid = currentSid();
   if (sid != null) settingsModal(sid, slot);
 });
@@ -1861,7 +2120,7 @@ function renderApprovals() {
   if (!pending.length || activeTab === "activity") { banner.className = "hidden"; banner.innerHTML = ""; }
   else {
     banner.className = "approval-banner";
-    banner.innerHTML = `<b>&#9995; ${pending.length} step${pending.length === 1 ? "" : "s"} waiting for your approval</b><span class="dim">${esc(pending.slice(0, 3).map((a) => `${slotName(slotById(a.slot_id))}: ${a.title}`).join(" · "))}</span><span style="flex:1"></span><button class="btn small primary">Review</button>`;
+    banner.innerHTML = `<b>&#9995; ${tr(pending.length === 1 ? "{n} step waiting for your approval" : "{n} steps waiting for your approval", { n: pending.length })}</b><span class="dim">${esc(pending.slice(0, 3).map((a) => `${slotName(slotById(a.slot_id))}: ${a.title}`).join(" · "))}</span><span style="flex:1"></span><button class="btn small primary">${tr("Review")}</button>`;
   }
   const box = $("act-approvals");
   if (busyRegion(box)) return;
@@ -1871,14 +2130,14 @@ function renderApprovals() {
   box.innerHTML = pending.map((a) => {
     const slot = slotById(a.slot_id);
     return `<div class="approval-card" data-approval="${a.id}">
-      <div class="approval-head">${avatar(slotName(slot), slotColor(a.slot_id))}
-        <div class="approval-title"><b>${esc(slotName(slot))}</b> wants to run <code>${esc(a.tool)}</code><div class="sub">${esc(a.title)} · ${timeSince(a.created_at)}</div></div></div>
+      <div class="approval-head">${slot ? slotAvatar(slot) : avatar("?", slotColor(a.slot_id))}
+        <div class="approval-title">${tr("<b>{name}</b> wants to run <code>{tool}</code>", { name: esc(slotName(slot)), tool: esc(a.tool) })}<div class="sub">${esc(a.title)} · ${timeSince(a.created_at)}</div></div></div>
       <div class="approval-body">${approvalPreview(a)}</div>
       <div class="approval-actions">
-        <input type="text" placeholder="Note to the agent (optional, sent with a denial)" data-note>
-        <button class="btn small danger" data-decide="deny">Deny</button>
-        <button class="btn small" data-decide="always" title="Allow this tool (for shell: this program) for the rest of the agent's session">Always allow</button>
-        <button class="btn small primary" data-decide="allow">Allow</button>
+        <input type="text" placeholder="${tr("Note to the agent (optional, sent with a denial)")}" data-note>
+        <button class="btn small danger" data-decide="deny">${tr("Deny")}</button>
+        <button class="btn small" data-decide="always" title="${tr("Allow this tool (for shell: this program) for the rest of the agent's session")}">${tr("Always allow")}</button>
+        <button class="btn small primary" data-decide="allow">${tr("Allow")}</button>
       </div>
     </div>`;
   }).join("");
@@ -1967,26 +2226,26 @@ function unifiedDiff(diff) {
 }
 
 function changesDiff(changes) {
-  return changes.map((c) => `<div class="diff-file">${esc(c.kind ?? "update")} ${fileRef(c.path ?? "")}</div>${c.diff ? unifiedDiff(c.diff) : ""}`).join("");
+  return changes.map((c) => `<div class="diff-file">${esc(tr(c.kind ?? "update"))} ${fileRef(c.path ?? "")}</div>${c.diff ? unifiedDiff(c.diff) : ""}`).join("");
 }
 
 function outputBlock(label, text, isErr) {
   if (!text) return "";
-  return `<div class="result${isErr ? " err" : ""}"><div class="result-label">${esc(label)}</div><pre class="mono">${esc(text)}</pre></div>`;
+  return `<div class="result${isErr ? " err" : ""}"><div class="result-label">${esc(tr(label))}</div><pre class="mono">${esc(text)}</pre></div>`;
 }
 
 function callBody(tool, input) {
   if (tool === "Edit" || tool === "MultiEdit") return editDiff(input);
   if (tool === "Write") return `<div class="diff-file">${fileRef(input.file_path ?? "")}</div><pre class="diff">${String(input.content ?? "").split("\n").slice(0, 200).map((l) => `<span class="add">+${esc(l)}</span>`).join("")}</pre>`;
   if (tool === "Bash") return `<pre class="mono">${esc(input.command ?? "")}</pre>${input.description ? `<div class="field-hint">${esc(input.description)}</div>` : ""}`;
-  if (tool === "Read") return `<div>${fileRef(input.file_path ?? "")}${input.offset ? ` <span class="muted">from line ${esc(input.offset)}</span>` : ""}</div>`;
+  if (tool === "Read") return `<div>${fileRef(input.file_path ?? "")}${input.offset ? ` <span class="muted">${tr("from line {n}", { n: esc(input.offset) })}</span>` : ""}</div>`;
   if (!input || !Object.keys(input).length) return "";
   return `<pre class="mono">${esc(JSON.stringify(input, null, 2))}</pre>`;
 }
 
 function stepTitleHtml(title) {
   // File names in a step title become links like in the chat
-  return inline(title);
+  return inline(tr(title));
 }
 
 /** One entry as HTML; tool results are appended to their call's element instead. */
@@ -2005,22 +2264,22 @@ function stepHtml(e) {
         <div class="step-body">${body}${e.detail ? outputBlock("Result", e.detail, d.status === "failed") : ""}</div></details>`;
     }
     case "tool_result":
-      return `<details class="step${d.is_error ? " err" : ""}"><summary><span class="step-icon">${d.is_error ? "&#9888;" : "&#8627;"}</span><span class="step-title">${esc(e.title)}</span>${time}</summary><div class="step-body"><pre class="mono">${esc(e.detail ?? "")}</pre></div></details>`;
+      return `<details class="step${d.is_error ? " err" : ""}"><summary><span class="step-icon">${d.is_error ? "&#9888;" : "&#8627;"}</span><span class="step-title">${esc(tr(e.title))}</span>${time}</summary><div class="step-body"><pre class="mono">${esc(e.detail ?? "")}</pre></div></details>`;
     case "command": {
       const failed = d.exit_code !== undefined && d.exit_code !== null && d.exit_code !== 0;
-      return `<details class="step${failed ? " err" : ""}"><summary><span class="step-icon">${STEP_ICON.command}</span><span class="step-title">${esc(e.title)}${d.exit_code !== undefined && d.exit_code !== null ? ` <span class="muted">exit ${esc(d.exit_code)}</span>` : ""}</span>${time}</summary>
-        <div class="step-body">${outputBlock("Output", e.detail || "(no output)", failed)}</div></details>`;
+      return `<details class="step${failed ? " err" : ""}"><summary><span class="step-icon">${STEP_ICON.command}</span><span class="step-title">${esc(e.title)}${d.exit_code !== undefined && d.exit_code !== null ? ` <span class="muted">${tr("exit {code}", { code: esc(d.exit_code) })}</span>` : ""}</span>${time}</summary>
+        <div class="step-body">${outputBlock("Output", e.detail || tr("(no output)"), failed)}</div></details>`;
     }
     case "file_change":
       return `<details class="step" open><summary><span class="step-icon">${STEP_ICON.file_change}</span><span class="step-title">${stepTitleHtml(e.title)}</span>${time}</summary><div class="step-body">${changesDiff(d.changes ?? [])}</div></details>`;
     case "approval":
-      return `<div class="act-note${d.allowed === false ? " err" : d.allowed ? " ok" : ""}"><span>&#9995; ${esc(e.title)}${e.detail ? ` — ${esc(e.detail)}` : ""}</span></div>`;
+      return `<div class="act-note${d.allowed === false ? " err" : d.allowed ? " ok" : ""}"><span>&#9995; ${esc(tr(e.title))}${e.detail ? ` — ${esc(e.detail)}` : ""}</span></div>`;
     case "turn_end":
-      return `<div class="act-turn">${esc(e.title)}</div>`;
+      return `<div class="act-turn">${esc(tr(e.title))}</div>`;
     case "error":
-      return `<div class="act-note err"><span>&#9888; ${esc(e.title)}${e.detail ? ` — ${esc(e.detail)}` : ""}</span></div>`;
+      return `<div class="act-note err"><span>&#9888; ${esc(tr(e.title))}${e.detail ? ` — ${esc(tr(e.detail))}` : ""}</span></div>`;
     default:
-      return `<div class="act-note"><span>${esc(e.title)}</span></div>`;
+      return `<div class="act-note"><span>${esc(tr(e.title))}</span></div>`;
   }
 }
 
@@ -2033,15 +2292,15 @@ function activityVisible(e, filter, showTeam, showThinking) {
 
 function renderActivity() {
   const feed = $("act-feed");
-  if (!state?.session) { feed.innerHTML = '<div class="chat-empty">No session selected.</div>'; return; }
+  if (!state?.session) { feed.innerHTML = `<div class="chat-empty">${tr("No session selected.")}</div>`; return; }
   if (activity.sid !== state.sessionId) { void pollActivity(); return; }
   const filter = $("act-agent").value ? parseInt($("act-agent").value, 10) : null;
   const showTeam = $("act-team").checked, showThinking = $("act-thinking").checked;
   const sig = `${filter}|${showTeam}|${showThinking}`;
   const visible = activity.entries.filter((e) => activityVisible(e, filter, showTeam, showThinking));
-  $("act-count").textContent = `${visible.length} step${visible.length === 1 ? "" : "s"}`;
+  $("act-count").textContent = tr(visible.length === 1 ? "{n} step" : "{n} steps", { n: visible.length });
   if (!activity.entries.length) {
-    feed.innerHTML = '<div class="chat-empty">No activity yet. Steps appear here as agents think, read, edit and run commands.<br><span class="muted" style="font-size:12px">Claude and Codex agents launched by multiagents report every step; Gemini reports its tool calls.</span></div>';
+    feed.innerHTML = `<div class="chat-empty">${tr("No activity yet. Steps appear here as agents think, read, edit and run commands.")}<br><span class="muted" style="font-size:12px">${tr("Claude and Codex agents launched by multiagents report every step; Gemini reports its tool calls.")}</span></div>`;
     activity.filterSig = ""; activity.rendered = 0;
     return;
   }
@@ -2064,14 +2323,14 @@ function renderActivity() {
       const d = parseData(e);
       const call = d.tool_use_id ? feed.querySelector(`[data-tuid="${CSS.escape(d.tool_use_id)}"] .step-body`) ?? frag.querySelector(`[data-tuid="${CSS.escape(d.tool_use_id)}"] .step-body`) : null;
       if (call) {
-        call.insertAdjacentHTML("beforeend", outputBlock(d.is_error ? "Error" : "Result", e.detail || "(empty)", d.is_error));
+        call.insertAdjacentHTML("beforeend", outputBlock(d.is_error ? "Error" : "Result", e.detail || tr("(empty)"), d.is_error));
         if (d.is_error) call.closest(".step").classList.add("err");
         continue;
       }
     }
     const slot = slotById(e.slot_id);
     const head = activity.lastSlot !== e.slot_id
-      ? `<div class="act-who">${avatar(slotName(slot), slotColor(e.slot_id)).replace('class="avatar"', 'class="avatar" style="display:inline-grid;width:18px;height:18px;font-size:8px;border-radius:5px;vertical-align:-4px;background:' + slotColor(e.slot_id) + '"')} <b>${esc(slotName(slot))}</b> ${slot?.role ? `· ${esc(slot.role)}` : ""}</div>`
+      ? `<div class="act-who">${slot ? slotAvatar(slot, "", false, "mini") : ""} <b>${esc(slotName(slot))}</b> ${slot?.role ? `· ${esc(slot.role)}` : ""}</div>`
       : "";
     activity.lastSlot = e.slot_id;
     frag.insertAdjacentHTML("beforeend", head + stepHtml(e));
@@ -2104,7 +2363,7 @@ async function globalAction(action, btn) {
   if (sid == null) return;
   switch (action) {
     case "session-pause": {
-      const ok = await confirmDialog({ title: "Pause the whole session?", sid, message: "<p>Every connected agent gets a pause signal, its incoming messages are held and its file locks are released. Resume picks up where they stopped.</p>", confirmLabel: "Pause all" });
+      const ok = await confirmDialog({ title: tr("Pause the whole session?"), sid, message: `<p>${tr("Every connected agent gets a pause signal, its incoming messages are held and its file locks are released. Resume picks up where they stopped.")}</p>`, confirmLabel: "Pause all" });
       if (ok) run(btn, "Pause", () => api("session/control", { session_id: sid, action: "pause" }));
       return;
     }
@@ -2131,12 +2390,12 @@ async function releaseAll(sid, approvedOnly, btn) {
   const targets = approvedOnly
     ? state.slots.filter((s) => s.task_state === "approved")
     : state.slots.filter((s) => s.task_state !== "released" && s.task_state !== "idle");
-  if (!targets.length) return toast("Nothing to release", "warn");
+  if (!targets.length) return toast(tr("Nothing to release"), "warn");
   const notApproved = targets.filter((s) => s.task_state !== "approved");
   const ok = await confirmDialog({
-    title: approvedOnly ? "Release all approved agents?" : "Release ALL agents?", sid,
-    message: `<p>These agents are told their work is complete and disconnect once idle:</p><ul>${targets.map((s) => `<li>${esc(slotName(s))} — ${esc(TASK_LABEL[s.task_state] ?? s.task_state)}</li>`).join("")}</ul>` +
-      (notApproved.length ? `<p style="color:var(--yellow)">&#9888; ${notApproved.length} of them are not approved.</p>` : ""),
+    title: tr(approvedOnly ? "Release all approved agents?" : "Release ALL agents?"), sid,
+    message: `<p>${tr("These agents are told their work is complete and disconnect once idle:")}</p><ul>${targets.map((s) => `<li>${esc(slotName(s))} — ${esc(taskLabel(s.task_state))}</li>`).join("")}</ul>` +
+      (notApproved.length ? `<p style="color:var(--yellow)">&#9888; ${tr("{n} of them are not approved.", { n: notApproved.length })}</p>` : ""),
     confirmLabel: "Release", danger: !approvedOnly,
   });
   if (ok) run(btn, "Release", () => api("agents/release-all", { session_id: sid, approved_only: approvedOnly }));
@@ -2149,26 +2408,26 @@ function sessionMenuItems(s) {
   return [
     { label: "Open", disabled: sid === state.sessionId, onClick: () => selectSession(sid) },
     { label: "Pause", disabled: s.status !== "active", onClick: async () => {
-        if (await confirmDialog({ title: `Pause "${s.name}"?`, sid, message: "<p>Pauses every connected agent of this session.</p>", confirmLabel: "Pause all" }))
+        if (await confirmDialog({ title: tr("Pause \"{name}\"?", { name: s.name }), sid, message: `<p>${tr("Pauses every connected agent of this session.")}</p>`, confirmLabel: "Pause all" }))
           run(null, "Pause", () => api("session/control", { session_id: sid, action: "pause" }));
       } },
     { label: "Resume", disabled: s.status !== "paused", onClick: () => run(null, "Resume", () => api("session/control", { session_id: sid, action: "resume" })) },
     { label: "Relaunch disconnected agents", onClick: async () => {
-        if (await confirmDialog({ title: `Relaunch agents of "${s.name}"?`, sid, message: "<p>Respawns every disconnected, unreleased agent with a handoff of its role, plan items and recent messages. They run under this dashboard. Agents another orchestrator still runs are not touched.</p>", confirmLabel: "Relaunch" }))
+        if (await confirmDialog({ title: tr("Relaunch agents of \"{name}\"?", { name: s.name }), sid, message: `<p>${tr("Respawns every disconnected, unreleased agent with a handoff of its role, plan items and recent messages. They run under this dashboard. Agents another orchestrator still runs are not touched.")}</p>`, confirmLabel: "Relaunch" }))
           run(null, "Relaunch", () => api("session/relaunch", { session_id: sid }));
       } },
     { sep: true },
     { label: "Export JSON", onClick: () => { location.href = `/api/session/export?session_id=${encodeURIComponent(sid)}`; } },
     { label: "Archive", disabled: archived, onClick: async () => {
-        if (await confirmDialog({ title: `Archive "${s.name}"?`, sid, message: "<p>Marks the session archived (like <span class=\"mono\">multiagents session archive</span>). Running agents are not stopped — use <b>End session</b> for that.</p>", confirmLabel: "Archive" }))
+        if (await confirmDialog({ title: tr("Archive \"{name}\"?", { name: s.name }), sid, message: `<p>${tr("Marks the session archived (like <span class=\"mono\">multiagents session archive</span>). Running agents are not stopped — use <b>End session</b> for that.")}</p>`, confirmLabel: "Archive" }))
           run(null, "Archive", () => api("session/archive", { session_id: sid }));
       } },
     { label: "End session", danger: true, disabled: archived, onClick: async () => {
-        if (await confirmDialog({ title: `End "${s.name}"?`, sid, message: "<p>Stops the agents this dashboard runs, marks every agent disconnected and archives the session.</p>", confirmLabel: "End session", danger: true }))
+        if (await confirmDialog({ title: tr("End \"{name}\"?", { name: s.name }), sid, message: `<p>${tr("Stops the agents this dashboard runs, marks every agent disconnected and archives the session.")}</p>`, confirmLabel: "End session", danger: true }))
           run(null, "End session", () => api("session/end", { session_id: sid }));
       } },
     { label: "Delete…", danger: true, onClick: async () => {
-        if (await confirmDialog({ title: `Delete "${s.name}" permanently?`, sid, message: "<p>Stops its agents and deletes all slots, messages, plans and locks. <b>This cannot be undone.</b> Export first if you want a copy. Project files are not touched.</p>", confirmLabel: "Delete forever", danger: true, typeToConfirm: sid }))
+        if (await confirmDialog({ title: tr("Delete \"{name}\" permanently?", { name: s.name }), sid, message: `<p>${tr("Stops its agents and deletes all slots, messages, plans and locks. <b>This cannot be undone.</b> Export first if you want a copy. Project files are not touched.")}</p>`, confirmLabel: "Delete forever", danger: true, typeToConfirm: sid }))
           run(null, "Delete", () => api("session/delete", { session_id: sid, confirm: sid }));
       } },
   ];
@@ -2180,7 +2439,7 @@ function openMenu(anchor, items) {
   const menu = $("menu");
   menu.innerHTML = items.map((it, i) => it.sep
     ? '<div class="menu-sep"></div>'
-    : `<div class="menu-item${it.danger ? " danger" : ""}${it.disabled ? " disabled" : ""}${it.checked ? " checked" : ""}" data-idx="${i}">${esc(it.label)}${it.hint ? `<span class="menu-hint">${esc(it.hint)}</span>` : ""}</div>`).join("");
+    : `<div class="menu-item${it.danger ? " danger" : ""}${it.disabled ? " disabled" : ""}${it.checked ? " checked" : ""}" data-idx="${i}">${esc(tr(it.label))}${it.hint ? `<span class="menu-hint">${esc(it.hint)}</span>` : ""}</div>`).join("");
   menu.onclick = (e) => {
     const el = e.target.closest(".menu-item");
     if (!el) return;
@@ -2198,7 +2457,7 @@ function closeMenu() { $("menu").classList.remove("open"); }
 
 // Clicks on the menu or on a button that opens one leave it to that button
 document.addEventListener("click", (e) => {
-  if (!e.target.closest("#menu, [data-action$='-menu'], [data-session-menu], [data-roster-menu], #theme-btn, #composer-presets")) closeMenu();
+  if (!e.target.closest("#menu, [data-action$='-menu'], [data-session-menu], [data-roster-menu], #theme-btn, #lang-btn, #composer-presets")) closeMenu();
 });
 
 // --- Modals ---
@@ -2210,13 +2469,15 @@ function openModal({ title, sub, body, submitLabel = "OK", danger = false, wide 
   closeModal();
   const overlay = $("modal-overlay");
   overlay.innerHTML = `<form class="modal${wide ? " wide" : ""}" novalidate>
-    <div class="modal-header"><div><div class="modal-title">${esc(title)}</div>${sub ? `<div class="modal-sub">${esc(sub)}</div>` : ""}</div>
+    <div class="modal-header"><div><div class="modal-title">${esc(tr(title))}</div>${sub ? `<div class="modal-sub">${esc(sub)}</div>` : ""}</div>
       <button type="button" class="icon-btn" data-close>&#10005;</button></div>
     <div class="modal-body">${body}</div>
     <div class="modal-footer"><span class="modal-error"></span>
-      <button type="button" class="btn" data-close>Cancel</button>
-      <button type="submit" class="btn ${danger ? "solid-danger" : "primary"}">${esc(submitLabel)}</button></div>
+      <button type="button" class="btn" data-close>${tr("Cancel")}</button>
+      <button type="submit" class="btn ${danger ? "solid-danger" : "primary"}">${esc(tr(submitLabel))}</button></div>
   </form>`;
+  // Static labels, hints and placeholders of the body are translated in place
+  translateTree(overlay.querySelector(".modal-body"));
   overlay.classList.add("open");
   const form = overlay.querySelector("form");
   const errEl = form.querySelector(".modal-error");
@@ -2241,7 +2502,7 @@ function openModal({ title, sub, body, submitLabel = "OK", danger = false, wide 
       await onSubmit(form);
       finish(false);
     } catch (err) {
-      errEl.textContent = err.message;
+      errEl.textContent = tr(err.message);
     } finally {
       submitBtn.disabled = false;
       submitBtn.classList.remove("busy");
@@ -2256,16 +2517,16 @@ function closeModal() { modalClose?.(); }
 
 function sessionSub(sid) {
   const s = state?.sessions?.find((x) => x.id === sid);
-  return `Session: ${s?.name && s.name !== sid ? `${s.name} (${sid})` : sid}`;
+  return tr("Session: {name}", { name: s?.name && s.name !== sid ? `${s.name} (${sid})` : sid });
 }
 
 function confirmDialog({ title, message, confirmLabel = "Confirm", danger = false, sid, typeToConfirm }) {
   return new Promise((resolve) => {
     openModal({
       title, sub: sid != null ? sessionSub(sid) : undefined, submitLabel: confirmLabel, danger,
-      body: `${message ?? ""}${typeToConfirm ? `<p class="dim" style="margin-top:10px">Type <b class="mono">${esc(typeToConfirm)}</b> to confirm:</p><input type="text" name="confirm" style="width:100%" autocomplete="off">` : ""}`,
+      body: `${message ?? ""}${typeToConfirm ? `<p class="dim" style="margin-top:10px">${tr("Type <b class=\"mono\">{text}</b> to confirm:", { text: esc(typeToConfirm) })}</p><input type="text" name="confirm" style="width:100%" autocomplete="off">` : ""}`,
       onSubmit: (form) => {
-        if (typeToConfirm && form.confirm.value.trim() !== typeToConfirm) throw new Error("The text does not match");
+        if (typeToConfirm && form.confirm.value.trim() !== typeToConfirm) throw new Error(tr("The text does not match"));
         resolve(true);
       },
       onCancel: () => resolve(false),
@@ -2277,10 +2538,10 @@ function promptDialog({ title, label, value = "", multiline = false, sid }) {
   return new Promise((resolve) => {
     openModal({
       title, sub: sid != null ? sessionSub(sid) : undefined, submitLabel: "Save",
-      body: `<div class="form-grid"><label>${esc(label)}</label>${multiline ? `<textarea name="v" rows="3">${esc(value)}</textarea>` : `<input type="text" name="v" value="${esc(value)}">`}</div>`,
+      body: `<div class="form-grid"><label>${esc(tr(label))}</label>${multiline ? `<textarea name="v" rows="3">${esc(value)}</textarea>` : `<input type="text" name="v" value="${esc(value)}">`}</div>`,
       onSubmit: (form) => {
         const v = form.v.value.trim();
-        if (!v) throw new Error(`${label} is required`);
+        if (!v) throw new Error(tr("{label} is required", { label: tr(label) }));
         resolve(v);
       },
       onCancel: () => resolve(null),
@@ -2289,7 +2550,7 @@ function promptDialog({ title, label, value = "", multiline = false, sid }) {
 }
 
 function agentOptions(selectedId) {
-  return liveSlots().map((s) => `<option value="${s.id}" ${s.id === selectedId ? "selected" : ""}>${esc(slotName(s))}${s.role ? ` · ${esc(s.role)}` : ""} — ${esc(TASK_LABEL[s.task_state] ?? s.task_state)}</option>`).join("");
+  return liveSlots().map((s) => `<option value="${s.id}" ${s.id === selectedId ? "selected" : ""}>${esc(slotName(s))}${s.role ? ` · ${esc(s.role)}` : ""} — ${esc(taskLabel(s.task_state))}</option>`).join("");
 }
 
 function roleDatalist() {
@@ -2299,7 +2560,7 @@ function roleDatalist() {
 
 function roleModal(sid, slot) {
   openModal({
-    title: `Change role of ${slotName(slot)}`, sub: sessionSub(sid), submitLabel: "Assign role",
+    title: tr("Change role of {name}", { name: slotName(slot) }), sub: sessionSub(sid), submitLabel: "Assign role",
     body: `<div class="form-grid">
       <label>Role</label><input type="text" name="role" list="role-suggestions" value="${esc(slot.role ?? "")}" autofocus>
       <label>Description</label><textarea name="desc" rows="4">${esc(slot.role_description ?? "")}</textarea>
@@ -2307,7 +2568,7 @@ function roleModal(sid, slot) {
     ${roleDatalist()}`,
     onSubmit: async (form) => {
       const r = await api("agents/role", { session_id: sid, slot_id: slot.id, role: form.role.value.trim(), role_description: form.desc.value.trim() });
-      toast(r?.message ?? "Role assigned", "ok");
+      toast(tr(r?.message ?? "Role assigned"), "ok");
     },
   });
 }
@@ -2321,12 +2582,12 @@ function sendBackModal(sid, slotId) {
     body: `<div class="form-grid">
       <label>Worker</label><select name="slot">${agentOptions(preferred)}</select>
       <label>Feedback</label><textarea name="feedback" rows="6" autofocus placeholder="What must change before you approve?"></textarea>
-    </div><div class="field-hint" style="margin-top:8px">Delivered as actionable feedback from you; the agent moves to <b>addressing feedback</b> and the review loop runs again.</div>`,
+    </div><div class="field-hint" style="margin-top:8px">${tr("Delivered as actionable feedback from you; the agent moves to <b>addressing feedback</b> and the review loop runs again.")}</div>`,
     onSubmit: async (form) => {
       const feedback = form.feedback.value.trim();
       if (!feedback) throw new Error("Write the feedback first");
       const r = await api("agents/feedback", { session_id: sid, slot_id: parseInt(form.slot.value, 10), feedback });
-      toast(r?.message ?? "Sent back", "ok");
+      toast(tr(r?.message ?? "Sent back"), "ok");
     },
   });
 }
@@ -2340,7 +2601,7 @@ async function loadAvailability() {
 
 function typeOptions(selected, avail) {
   return ["claude", "codex", "gemini"].map((t) =>
-    `<option value="${t}" ${t === selected ? "selected" : ""}>${t}${avail && avail[t] === false ? " (not installed)" : ""}</option>`).join("");
+    `<option value="${t}" ${t === selected ? "selected" : ""}>${t}${avail && avail[t] === false ? tr(" (not installed)") : ""}</option>`).join("");
 }
 
 async function addAgentModal(sid) {
@@ -2373,9 +2634,9 @@ async function addAgentModal(sid) {
       };
       if (form.effort?.value) body.effort = form.effort.value;
       if (!body.name || !body.role || !body.initial_task) throw new Error("Name, role and task are required");
-      if (avail[body.agent_type] === false) throw new Error(`${body.agent_type} CLI is not installed on this machine`);
+      if (avail[body.agent_type] === false) throw new Error(tr("{type} CLI is not installed on this machine", { type: body.agent_type }));
       const r = await api("agents/add", body);
-      toast(r?.message ?? "Agent launched", "ok");
+      toast(tr(r?.message ?? "Agent launched"), "ok");
     },
   });
 }
@@ -2386,10 +2647,10 @@ function newSessionModal() {
     body: `<div class="form-grid">
       <label>Session name</label><input type="text" name="name" autofocus>
       <label>Project directory</label><input type="text" name="dir" placeholder="/absolute/path/to/project">
-    </div><div class="field-hint" style="margin-top:8px">Like <span class="mono">multiagents session create</span>: writes .multiagents/session.json into the directory. Add agents afterwards, or use <b>New Team</b> to launch a whole team.</div>`,
+    </div><div class="field-hint" style="margin-top:8px">${tr("Like <span class=\"mono\">multiagents session create</span>: writes .multiagents/session.json into the directory. Add agents afterwards, or use <b>New Team</b> to launch a whole team.")}</div>`,
     onSubmit: async (form) => {
       const r = await api("session/create", { name: form.name.value.trim(), project_dir: form.dir.value.trim() });
-      toast(`Session "${r?.id}" created`, "ok");
+      toast(tr("Session \"{id}\" created", { id: r?.id }), "ok");
     },
   });
 }
@@ -2419,7 +2680,7 @@ async function newTeamModal() {
     </div>
     <div class="team-agent-row" style="grid-template-columns:1fr 1fr;margin-top:8px">
       <input type="text" data-f="model" list="models-all" placeholder="model (default)" value="${esc(a.model ?? "")}">
-      <select data-f="approval_mode" title="Who approves this agent's steps">${APPROVAL_MODES.map(([v, l]) => `<option value="${v}" ${v === (a.approval_mode ?? "bypass") ? "selected" : ""}>${l}</option>`).join("")}</select>
+      <select data-f="approval_mode" title="Who approves this agent's steps">${APPROVAL_MODES.map(([v, l]) => `<option value="${v}" ${v === (a.approval_mode ?? "bypass") ? "selected" : ""}>${tr(l)}</option>`).join("")}</select>
     </div>
     <textarea data-f="initial_task" rows="2" placeholder="Agent-specific task (optional — the team goal is shared with everyone)">${esc(a.initial_task)}</textarea>
   </div>`;
@@ -2431,15 +2692,15 @@ async function newTeamModal() {
         <label>Session name</label><input type="text" name="name" placeholder="e.g. 食物过敏论文 / Manuscript Revision">
         <label>Team goal / prompt</label><textarea name="goal" rows="4" placeholder="What should the team achieve?"></textarea>
       </div>
-      <div class="section-label">Agents ${Object.keys(TEAM_PRESETS).map((p) => `<button type="button" class="btn small" data-preset="${esc(p)}">${esc(p)}</button>`).join("")}</div>
+      <div class="section-label">Agents ${Object.keys(TEAM_PRESETS).map((p) => `<button type="button" class="btn small" data-preset="${esc(p)}">${esc(tr(p))}</button>`).join("")}</div>
       <div data-agents>${TEAM_PRESETS["Worker + Reviewer"].map(agentRow).join("")}</div>
       <button type="button" class="btn small" data-add-agent>+ Add agent</button>
       <div class="section-label">Plan (optional)</div>
-      <textarea name="plan" rows="3" style="width:100%" placeholder="One task per line. Prefix with an agent name and a colon to assign it, e.g. &quot;Claude Reviewer: Review the API&quot;"></textarea>
+      <textarea name="plan" rows="3" style="width:100%" placeholder="${esc(tr("One task per line. Prefix with an agent name and a colon to assign it, e.g. \"Claude Reviewer: Review the API\""))}"></textarea>
       <div class="section-label">Workflow</div>
-      <label class="checkbox"><input type="checkbox" name="wf_approval" checked><span>Require reviewer approval<small>Work counts as finished only after an explicit approve.</small></span></label>
-      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_feedback" checked><span>Require actionable feedback before revision<small>Reviewers must say concretely what to change.</small></span></label>
-      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_human" checked><span>Pause for human approval before release<small>Human gate: once everything is approved the session waits for you (Approve &amp; Release / Send back) instead of ending itself.</small></span></label>
+      <label class="checkbox"><input type="checkbox" name="wf_approval" checked><span>${tr("Require reviewer approval")}<small>${tr("Work counts as finished only after an explicit approve.")}</small></span></label>
+      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_feedback" checked><span>${tr("Require actionable feedback before revision")}<small>${tr("Reviewers must say concretely what to change.")}</small></span></label>
+      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_human" checked><span>${tr("Pause for human approval before release")}<small>${tr("Human gate: once everything is approved the session waits for you (Approve & Release / Send back) instead of ending itself.")}</small></span></label>
       ${roleDatalist()}
       <datalist id="models-all">${Object.values(MODEL_SUGGESTIONS).flat().map((m) => `<option value="${m}">`).join("")}</datalist>`,
     setup: (form) => {
@@ -2459,7 +2720,7 @@ async function newTeamModal() {
       if (!agents.length) throw new Error("Add at least one agent");
       if (agents.some((a) => !a.name || !a.role)) throw new Error("Every agent needs a name and a role");
       const unavailable = agents.filter((a) => avail[a.agent_type] === false).map((a) => `${a.name} (${a.agent_type})`);
-      if (unavailable.length) throw new Error(`Not installed on this machine: ${unavailable.join(", ")}`);
+      if (unavailable.length) throw new Error(tr("Not installed on this machine: {list}", { list: unavailable.join(", ") }));
       const names = agents.map((a) => a.name.toLowerCase());
       const plan = form.plan.value.split("\n").map((l) => l.trim()).filter(Boolean).map((line) => {
         const m = line.match(/^([^:：]{1,60})[:：]\s*(.+)$/);
@@ -2472,9 +2733,9 @@ async function newTeamModal() {
         workflow: { require_reviewer_approval: form.wf_approval.checked, require_actionable_feedback: form.wf_feedback.checked, human_release: form.wf_human.checked },
       };
       if (!body.project_dir || !body.session_name) throw new Error("Working directory and session name are required");
-      toast("Starting team — agents take 15–60s to connect…", "info");
+      toast(tr("Starting team — agents take 15–60s to connect…"), "info");
       const r = await api("team/create", body);
-      toast(`Team started: ${r?.data?.session_id ?? body.session_name}`, "ok");
+      toast(tr("Team started: {id}", { id: r?.data?.session_id ?? body.session_name }), "ok");
     },
   });
 }
@@ -2483,17 +2744,17 @@ async function newTeamModal() {
 
 $("broker-pill").addEventListener("click", async () => {
   let info;
-  try { info = await api("broker"); } catch (e) { return toast(`Broker status failed: ${e.message}`, "error"); }
+  try { info = await api("broker"); } catch (e) { return toast(tr("Broker status failed: {error}", { error: e.message }), "error"); }
   openModal({
     title: "Broker", submitLabel: "Close",
     body: `<div class="form-grid">
-      <label>Status</label><span>${info.alive ? '<span style="color:var(--green)">&#9679; running</span>' : '<span style="color:var(--red)">&#9679; not running</span>'}</span>
+      <label>Status</label><span>${info.alive ? `<span style="color:var(--green)">&#9679; ${tr("running")}</span>` : `<span style="color:var(--red)">&#9679; ${tr("not running")}</span>`}</span>
       <label>URL</label><span class="mono">${esc(info.url)}</span>
-      <label>Sessions</label><span>${info.sessions} (${info.active_sessions} active)</span>
-      <label>Peers</label><span>${info.peers} registered</span>
+      <label>Sessions</label><span>${tr("{n} ({active} active)", { n: info.sessions, active: info.active_sessions })}</span>
+      <label>Peers</label><span>${tr("{n} registered", { n: info.peers })}</span>
       <label>Current session</label><span class="mono">${esc(info.current_session ?? "—")}</span>
-      <label>This dashboard runs</label><span>${(state?.managedSlots ?? []).length} agent(s) of the current session</span>
-    </div><div class="field-hint" style="margin-top:10px">Stop the broker from a terminal with <span class="mono">multiagents kill-broker</span> — it disconnects every agent on the machine.</div>`,
+      <label>This dashboard runs</label><span>${tr("{n} agent(s) of the current session", { n: (state?.managedSlots ?? []).length })}</span>
+    </div><div class="field-hint" style="margin-top:10px">${tr("Stop the broker from a terminal with <span class=\"mono\">multiagents kill-broker</span> — it disconnects every agent on the machine.")}</div>`,
     onSubmit: () => {},
   });
 });
@@ -2524,24 +2785,24 @@ function fmtDuration(ms) {
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 function fmtTime(iso) {
-  try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch { return ""; }
+  try { return new Date(iso).toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" }); } catch { return ""; }
 }
 function fmtDay(t) {
   const d = new Date(t), today = new Date();
   const yesterday = new Date(); yesterday.setDate(today.getDate() - 1);
-  if (d.toDateString() === today.toDateString()) return "Today";
-  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return d.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+  if (d.toDateString() === today.toDateString()) return tr("Today");
+  if (d.toDateString() === yesterday.toDateString()) return tr("Yesterday");
+  return d.toLocaleDateString(locale(), { year: "numeric", month: "short", day: "numeric" });
 }
 function timeSince(epoch) {
   if (!epoch) return "";
   const s = Math.round((Date.now() - epoch) / 1000);
-  if (s < 60) return `${s}s ago`;
+  if (s < 60) return tr("{n}s ago", { n: s });
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) return tr("{n}m ago", { n: m });
   const h = Math.floor(m / 60);
-  if (h < 48) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
+  if (h < 48) return tr("{n}h ago", { n: h });
+  return tr("{n}d ago", { n: Math.floor(h / 24) });
 }
 
 // --- Session picker ---
@@ -2563,11 +2824,11 @@ function renderPicker() {
   pickerFiltered = sortedSessions(state?.sessions).filter((s) => !search || s.name?.toLowerCase().includes(search) || s.id.toLowerCase().includes(search));
   pickerFocusIdx = Math.min(pickerFocusIdx, Math.max(0, pickerFiltered.length - 1));
   const list = $("picker-list");
-  if (!pickerFiltered.length) { list.innerHTML = '<div class="picker-empty">No sessions found</div>'; return; }
+  if (!pickerFiltered.length) { list.innerHTML = `<div class="picker-empty">${tr("No sessions found")}</div>`; return; }
   list.innerHTML = pickerFiltered.map((s, i) => `<div class="picker-item${i === pickerFocusIdx ? " focused" : ""}${state?.sessionId === s.id ? " active" : ""}" data-idx="${i}">
       ${statusDot(s.status)}
       <span class="picker-item-name">${esc(s.name || s.id)}</span>
-      <span class="picker-item-id">${esc(s.status)}</span>
+      <span class="picker-item-id">${esc(tr(s.status))}</span>
       <span class="picker-item-time">${timeSince(s.last_active_at ?? s.created_at)}</span>
     </div>`).join("");
   list.querySelector(".focused")?.scrollIntoView({ block: "nearest" });
@@ -2582,7 +2843,7 @@ async function selectSession(id) {
       throw new Error(data.error || `HTTP ${res.status}`);
     }
   } catch (e) {
-    toast(`Switching session failed: ${e.message}`, "error");
+    toast(tr("Switching session failed: {error}", { error: e.message }), "error");
   }
 }
 
@@ -2603,7 +2864,8 @@ $("picker-search").addEventListener("keydown", (e) => {
 
 // --- Boot ---
 
-applyTheme();
+applyLanguage();
+applyAppearance();
 applyLayout();
 $("msg-show-system").checked = store.get("ma-show-system", false);
 switchRightTab(store.get("ma-rtab", "preview"));

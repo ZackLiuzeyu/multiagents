@@ -289,6 +289,7 @@ const indexHtml = Bun.file(`${DASHBOARD_DIR}index.html`);
 // The UI's own assets (a fixed list: nothing else in the directory is served)
 const ASSETS: Record<string, string> = {
   "/app.js": "text/javascript; charset=utf-8",
+  "/i18n.js": "text/javascript; charset=utf-8",
   "/styles.css": "text/css; charset=utf-8",
 };
 
