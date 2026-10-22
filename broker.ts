@@ -1870,6 +1870,24 @@ Bun.serve({
           if (allReviewRolesApproved || singleReviewerApproved) {
             db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [target_slot_id]);
             newState = "approved";
+
+            // If all non-reviewer workers are now approved, also transition active reviewers to approved
+            const liveSlots = db.query(
+              "SELECT id, role, task_state FROM slots WHERE session_id = ? AND task_state != 'released'"
+            ).all(session_id) as Array<{ id: number; role: string | null; task_state: string }>;
+
+            const unapprovedWorkers = liveSlots.filter(
+              (s) => !/qa|review|test|lead/i.test(s.role ?? "") && s.task_state !== "approved"
+            );
+
+            if (unapprovedWorkers.length === 0) {
+              const activeReviewers = liveSlots.filter(
+                (s) => /qa|review|test|lead/i.test(s.role ?? "") && s.task_state !== "approved"
+              );
+              for (const rev of activeReviewers) {
+                db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [rev.id]);
+              }
+            }
           } else {
             // Keep in done_pending_review — still waiting for more approvals
             newState = targetSlot.task_state;

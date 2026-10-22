@@ -417,14 +417,28 @@ async function handleExit(
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
 ): Promise<void> {
-  // Update slot status to disconnected
+  let taskState: string | undefined;
   try {
-    await brokerClient.updateSlot({
-      id: slotId,
-      status: "disconnected",
-    });
-  } catch (err) {
-    log(LOG_PREFIX, `Failed to update slot ${slotId} on exit: ${err}`);
+    const slot = await brokerClient.getSlot(slotId);
+    taskState = slot?.task_state;
+  } catch { /* ok */ }
+
+  // An agent whose work completed normally (code 0) in "approved" state remains connected
+  // in standby awaiting human review or release — it must not drop offline while the session is active.
+  const isStandbyApproved = exitCode === 0 && taskState === "approved";
+
+  if (!isStandbyApproved) {
+    // Update slot status to disconnected
+    try {
+      await brokerClient.updateSlot({
+        id: slotId,
+        status: "disconnected",
+      });
+    } catch (err) {
+      log(LOG_PREFIX, `Failed to update slot ${slotId} on exit: ${err}`);
+    }
+  } else {
+    log(LOG_PREFIX, `Slot ${slotId} completed (exit 0) with task_state="approved" — keeping slot online (standby for review/release)`);
   }
 
   if (exitCode === 0) {

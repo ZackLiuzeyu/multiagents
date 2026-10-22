@@ -684,6 +684,13 @@ async function autoRestartIfIncomplete(
     }
 
     // Agent completed normally (done_pending_review, approved, released)
+    if (state === "approved") {
+      log(LOG_PREFIX, `${name} completed with task_state="approved" — keeping online in standby awaiting human review/release`);
+      try {
+        await brokerClient.updateSlot({ id: slotId, status: "connected" });
+      } catch { /* ok */ }
+      return false;
+    }
     log(LOG_PREFIX, `${name} completed with task_state="${state}" — no restart needed`);
     return false;
   } catch (err) {
@@ -2181,6 +2188,16 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
           }
         }
 
+        // --- Auto-approve reviewers when all workers are approved ---
+        const workerSlots = slots.filter((s) => !(s.role && /qa|review|test|lead/i.test(s.role)) && (s as any).task_state !== "released");
+        if (workerSlots.length > 0 && workerSlots.every((s) => (s as any).task_state === "approved")) {
+          const activeReviewers = reviewerSlots.filter((s) => (s as any).task_state !== "approved" && (s as any).task_state !== "released");
+          for (const rev of activeReviewers) {
+            log(LOG_PREFIX, `Auto-approving reviewer ${rev.display_name ?? `slot ${rev.id}`} (all worker tasks approved)`);
+            await brokerClient.updateSlot({ id: rev.id, task_state: "approved" } as any);
+          }
+        }
+
         const allDone = slots.every(
           (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
         );
@@ -2286,8 +2303,12 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
 
           const now = Date.now();
 
-          // A connected agent is stuck only when messages stay unclaimed past the threshold
-          if (slot.status === "connected") {
+          const sessionProcs = activeProcesses.get(sessionId);
+          const hasRunningProc = sessionProcs?.has(slot.id) === true;
+
+          // A connected agent is stuck only when messages stay unclaimed past the threshold,
+          // UNLESS its process already completed and is in standby, in which case wake it up immediately!
+          if (slot.status === "connected" && hasRunningProc) {
             const messageAge = inbox.oldest_at ? now - inbox.oldest_at : 0;
             if (messageAge < CONNECTED_STALE_MS) continue;
           }

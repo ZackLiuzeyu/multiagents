@@ -685,5 +685,14 @@ export function awaitingHuman(session: Session | null, slots: Slot[]): boolean {
   if (!session || session.status === "archived") return false;
   if (safeJsonParse<Record<string, unknown>>(session.config, {}).human_gate !== true) return false;
   const live = slots.filter((s) => s.task_state !== "released");
-  return live.length > 0 && live.every((s) => s.task_state === "approved");
+  if (live.length === 0) return false;
+  if (live.every((s) => s.task_state === "approved")) return true;
+
+  // When all workers are approved, and reviewers have finished reviewing, gate opens
+  const workers = live.filter((s) => !/qa|review|test|lead/i.test(s.role ?? ""));
+  if (workers.length > 0 && workers.every((s) => s.task_state === "approved")) {
+    const reviewers = live.filter((s) => /qa|review|test|lead/i.test(s.role ?? ""));
+    return reviewers.every((s) => s.task_state === "approved" || s.task_state === "working" || s.task_state === "idle");
+  }
+  return false;
 }

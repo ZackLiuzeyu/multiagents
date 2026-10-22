@@ -308,6 +308,12 @@ describe("workflow helpers", () => {
     const slot = (task_state: string) => ({ task_state }) as Slot;
     expect(awaitingHuman(session, [slot("approved"), slot("released")])).toBe(true);
     expect(awaitingHuman(session, [slot("approved"), slot("working")])).toBe(false);
+    // When worker is approved and reviewer role has finished review, human gate engages
+    const workerSlot = (task_state: string) => ({ task_state, role: "Worker" }) as Slot;
+    const reviewerSlot = (task_state: string) => ({ task_state, role: "Code Reviewer" }) as Slot;
+    expect(awaitingHuman(session, [workerSlot("approved"), reviewerSlot("working")])).toBe(true);
+    expect(awaitingHuman(session, [workerSlot("approved"), reviewerSlot("approved")])).toBe(true);
+    expect(awaitingHuman(session, [workerSlot("working"), reviewerSlot("working")])).toBe(false);
     expect(awaitingHuman(session, [slot("released")])).toBe(false);
     expect(awaitingHuman({ ...session, config: "{}" }, [slot("approved")])).toBe(false);
     expect(awaitingHuman({ ...session, status: "archived" }, [slot("approved")])).toBe(false);
