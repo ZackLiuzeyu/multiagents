@@ -281,6 +281,25 @@ if (addColumn("ALTER TABLE messages ADD COLUMN acked_at TEXT")) {
   db.run("UPDATE messages SET acked_at = COALESCE(delivered_at, sent_at) WHERE delivered = 1 AND acked_at IS NULL");
 }
 
+// Session names without ASCII letters used to slugify to "", leaving a session
+// no client can address. Give such a session a real id, in every table.
+{
+  const orphan = db.query("SELECT created_at FROM sessions WHERE id = ''").get() as { created_at: number } | null;
+  if (orphan) {
+    let newId = `session-${orphan.created_at.toString(36)}`;
+    while (db.query("SELECT 1 FROM sessions WHERE id = ?").get(newId)) newId += "x";
+    const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[])
+      .map((t) => t.name)
+      .filter((t) => t !== "sessions" && (db.query(`PRAGMA table_info(${t})`).all() as { name: string }[]).some((c) => c.name === "session_id"));
+    db.transaction(() => {
+      db.run("PRAGMA defer_foreign_keys = ON");
+      db.run("UPDATE sessions SET id = ? WHERE id = ''", [newId]);
+      for (const t of tables) db.run(`UPDATE ${t} SET session_id = ? WHERE session_id = ''`, [newId]);
+    })();
+    console.error(`[multiagents broker] renamed the session with an empty id to "${newId}"`);
+  }
+}
+
 // --- Context snapshot builder ---
 
 function parseSnapshot(raw: string | null | undefined): Record<string, unknown> {
@@ -818,6 +837,7 @@ function handleKnowledgeDelete(body: KnowledgeDeleteRequest): { ok: boolean } {
 // --- Sessions ---
 
 function handleCreateSession(body: CreateSessionRequest): Session {
+  if (typeof body.id !== "string" || !body.id.trim()) throw new Error("Session id must not be empty");
   const now = Date.now();
   db.run(
     "INSERT INTO sessions (id, name, project_dir, git_root, status, config, created_at, last_active_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",

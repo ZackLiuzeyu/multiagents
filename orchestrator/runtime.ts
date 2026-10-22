@@ -14,7 +14,7 @@ import type { Subprocess } from "bun";
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentLaunchConfig } from "../shared/types.ts";
-import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
+import { log, getGitRoot, uniqueSessionId, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   GUARDRAIL_CHECK_INTERVAL,
   CONFLICT_CHECK_INTERVAL,
@@ -745,17 +745,11 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
         }
 
         // Generate unique session ID — check existing sessions to avoid collisions
-        let sessionId = slugify(session_name);
+        let existingIds: string[] = [];
         try {
-          const existing = await brokerClient.listSessions();
-          const existingIds = new Set(existing.map((s: any) => s.id));
-          if (existingIds.has(sessionId)) {
-            // Append incrementing suffix until unique
-            let i = 2;
-            while (existingIds.has(`${sessionId}-${i}`)) i++;
-            sessionId = `${sessionId}-${i}`;
-          }
+          existingIds = (await brokerClient.listSessions()).map((s) => s.id);
         } catch { /* broker may not support list yet — proceed with base slug */ }
+        const sessionId = uniqueSessionId(session_name, existingIds);
 
         // Auto-create project directory if it doesn't exist
         if (!fs.existsSync(project_dir)) {

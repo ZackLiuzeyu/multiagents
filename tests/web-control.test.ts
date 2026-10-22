@@ -309,3 +309,23 @@ describe("workflow helpers", () => {
     expect(awaitingHuman({ ...session, status: "archived" }, [slot("approved")])).toBe(false);
   });
 });
+
+describe("session ids", () => {
+  test("a Chinese session name keeps a usable id", async () => {
+    const created = await api("session/create", { name: "食物过敏论文", project_dir: path.join(tmpDir, "proj") });
+    expect(created.ok).toBe(true);
+    expect(created.result.id).toBe("食物过敏论文");
+    const again = await api("session/create", { name: "食物过敏论文", project_dir: path.join(tmpDir, "proj") });
+    expect(again.result.id).toBe("食物过敏论文-2");
+    const symbols = await api("session/create", { name: "!!!", project_dir: path.join(tmpDir, "proj") });
+    expect(symbols.result.id).toBe("session");
+    const switched = await fetch(`${DASHBOARD_URL}/api/session`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: "食物过敏论文" }) });
+    expect(switched.status).toBe(200);
+    expect((await api("session/end", { session_id: "食物过敏论文" })).ok).toBe(true);
+  });
+
+  test("the broker refuses an empty session id", async () => {
+    const res = await fetch(`${BROKER_URL}/sessions/create`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: "", name: "x", project_dir: tmpDir }) });
+    expect(res.ok).toBe(false);
+  });
+});

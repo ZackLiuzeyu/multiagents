@@ -1963,7 +1963,10 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ session_id: id }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
         lastMsgSignature = "";
         resetKnowledgeForm();
       } catch (e) {
