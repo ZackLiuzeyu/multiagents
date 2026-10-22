@@ -321,6 +321,25 @@ export interface UpdateSessionRequest {
   pause_reason?: string | null;
   paused_at?: number | null;
   config?: Record<string, unknown>;
+  /** Keys merged into the existing config; other keys survive. */
+  config_patch?: Record<string, unknown>;
+}
+
+export interface AddPlanItemRequest {
+  session_id: string;
+  label: string;
+  assigned_to_slot?: number | null;
+  /** Title for the plan when the session has none yet (default: the session name). */
+  title?: string;
+}
+
+export interface EditPlanItemRequest {
+  session_id: string;
+  item_id: number;
+  label?: string;
+  status?: "pending" | "in_progress" | "blocked" | "done";
+  /** null unassigns the item. */
+  assigned_to_slot?: number | null;
 }
 
 export interface CreateSlotRequest {

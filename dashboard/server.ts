@@ -3,7 +3,9 @@
 // multiagents — Web Dashboard Server
 // ============================================================================
 // Standalone Bun.serve() on port 7900. Fetches state from broker (7899) and
-// pushes live updates to connected browsers via WebSocket.
+// pushes live updates to connected browsers via WebSocket. It also hosts the
+// orchestrator runtime, so teams and agents launched from the browser are
+// supervised by this process (see dashboard/control.ts for the actions).
 //
 // Usage:
 //   bun dashboard/server.ts [session-id]
@@ -15,6 +17,8 @@ import { DASHBOARD_REFRESH } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
+import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds } from "../orchestrator/runtime.ts";
+import { handleControl, exportSession, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
 
 // --- Configuration ---
 
@@ -22,6 +26,10 @@ const WEB_DASHBOARD_PORT = parseInt(process.env.MULTIAGENTS_WEB_PORT ?? "7900", 
 const BROKER_PORT = resolveBrokerPort();
 const BROKER_URL = brokerUrl();
 const broker = new BrokerClient(BROKER_URL);
+const controlCtx: ControlContext = { broker, brokerPort: BROKER_PORT };
+
+// Lifecycle actions from the browser run the orchestrator's own code, as the human
+configureRuntime({ launchDashboards: false, actor: HUMAN_ID });
 
 // --- Session resolution (same logic as TUI) ---
 
@@ -63,6 +71,16 @@ interface DashboardState {
   plan: PlanState | null;
   knowledge: Array<{ key: string; value: string; category: string; created_by_name: string | null; updated_at: number }>;
   brokerAlive: boolean;
+  brokerUrl: string;
+  /** Every session on the broker, for the sidebar */
+  sessions: Session[];
+  /** Registered peers machine-wide */
+  peerCount: number;
+  /** Slots whose agent process this dashboard launched and supervises */
+  managedSlots: number[];
+  managed: boolean;
+  humanGate: boolean;
+  awaitingHuman: boolean;
   timestamp: number;
 }
 
@@ -79,6 +97,13 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     plan: null,
     knowledge: [],
     brokerAlive: false,
+    brokerUrl: BROKER_URL,
+    sessions: [],
+    peerCount: 0,
+    managedSlots: [],
+    managed: false,
+    humanGate: false,
+    awaitingHuman: false,
     timestamp: Date.now(),
   };
 
@@ -88,7 +113,10 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     return state;
   }
 
-  if (!state.brokerAlive || !sessionId) return state;
+  if (!state.brokerAlive) return state;
+
+  state.sessions = await broker.listSessions().catch(() => []);
+  if (!sessionId) return state;
 
   try {
     const [session, slots, messages, guardrails, fileLocks, fileOwnership, plan, knowledge] = await Promise.all([
@@ -118,6 +146,11 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     state.fileOwnership = fileOwnership;
     state.plan = plan;
     state.knowledge = knowledge;
+    state.peerCount = peers.length;
+    state.managedSlots = managedSlotIds(sessionId);
+    state.managed = isManagedSession(sessionId);
+    try { state.humanGate = JSON.parse(session?.config ?? "{}").human_gate === true; } catch { /* malformed config */ }
+    state.awaitingHuman = awaitingHuman(session, slots);
   } catch (e) {
     console.error(`[web-dashboard] Fetch error: ${e}`);
   }
@@ -132,6 +165,21 @@ let currentState: DashboardState | null = null;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let pollGeneration = 0; // Incremented on session switch to kill stale poll loops
 let userPinnedSession = false; // True when user explicitly selected a session — disables auto-switch
+
+// Fetches overlap (poll ticks and post-mutation refreshes); only a newer fetch may replace what clients saw.
+let fetchSeq = 0;
+let broadcastSeq = 0;
+
+async function fetchAndBroadcast(): Promise<DashboardState> {
+  const seq = ++fetchSeq;
+  const state = await fetchState(sessionId);
+  if (seq > broadcastSeq) {
+    broadcastSeq = seq;
+    currentState = state;
+    broadcastState(state);
+  }
+  return state;
+}
 
 function broadcastState(state: DashboardState) {
   const json = JSON.stringify({ type: "state", data: state });
@@ -161,8 +209,7 @@ async function startPolling() {
   const gen = ++pollGeneration;
 
   // Initial fetch
-  currentState = await fetchState(sessionId);
-  broadcastState(currentState);
+  await fetchAndBroadcast();
 
   // Recursive tick — reads the global `sessionId` each cycle
   async function tick() {
@@ -187,14 +234,13 @@ async function startPolling() {
       } catch { /* broker down */ }
     }
 
-    currentState = await fetchState(sessionId);
-    broadcastState(currentState);
+    await fetchAndBroadcast();
 
     // Stop if superseded
     if (gen !== pollGeneration) return;
 
     // Schedule next tick: slow for completed/archived, fast for active
-    const nextComplete = isSessionComplete(currentState);
+    const nextComplete = currentState ? isSessionComplete(currentState) : false;
     const nextStatus = currentState?.session?.status;
     const delay = (nextComplete || nextStatus === "archived") ? 3000
       : nextStatus === "paused" ? 2000
@@ -209,6 +255,19 @@ async function startPolling() {
 
 const sessionArg = process.argv[2];
 let sessionId = await resolveSessionId(sessionArg);
+
+function apiError(e: unknown): Response {
+  let status = e instanceof ApiError ? e.status : 500;
+  let message = e instanceof Error ? e.message : String(e);
+  // Surface the broker's own answer rather than the client's wrapper around it
+  const fromBroker = message.match(/^Broker POST \S+ failed \((\d+)\): (.*)$/s);
+  if (fromBroker) {
+    status = Number(fromBroker[1]);
+    try { message = JSON.parse(fromBroker[2]!).error ?? fromBroker[2]; } catch { message = fromBroker[2]!; }
+  }
+  if (status >= 500) console.error(`[web-dashboard] API error: ${message}`);
+  return Response.json({ ok: false, error: message }, { status });
+}
 
 // --- HTML serving ---
 
@@ -253,36 +312,69 @@ const server = Bun.serve({
       }
     }
 
-    // API: guardrail adjust
-    if (url.pathname === "/api/guardrail" && req.method === "POST") {
-      const body = await req.json() as { session_id: string; guardrail_id: string; value: number; reason?: string };
+    // API: broker status
+    if (url.pathname === "/api/broker" && req.method === "GET") {
+      const alive = await broker.isAlive();
+      const sessions = alive ? await broker.listSessions().catch(() => []) : [];
+      const peers = alive ? await broker.listPeers({ scope: "machine", cwd: "/", git_root: null }).catch(() => []) : [];
+      return Response.json({
+        alive,
+        url: BROKER_URL,
+        sessions: sessions.length,
+        active_sessions: sessions.filter((s) => s.status === "active").length,
+        peers: peers.length,
+        current_session: sessionId,
+      });
+    }
+
+    // API: session export (download)
+    if (url.pathname === "/api/session/export" && req.method === "GET") {
+      const id = url.searchParams.get("session_id");
+      if (!id) return Response.json({ error: "session_id required" }, { status: 400 });
       try {
-        const result = await broker.updateGuardrail({
-          session_id: body.session_id,
-          guardrail_id: body.guardrail_id,
-          new_value: body.value,
-          reason: body.reason ?? "Adjusted via web dashboard",
-          changed_by: "web-dashboard",
+        const data = await exportSession(controlCtx, id);
+        return new Response(JSON.stringify(data, null, 2), {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Disposition": `attachment; filename="session-${id.replace(/[^\w.-]/g, "_")}-export.json"`,
+          },
         });
-        return Response.json(result);
       } catch (e) {
-        return Response.json({ error: String(e) }, { status: 500 });
+        return apiError(e);
       }
     }
 
-    // API: pause/resume session
-    if (url.pathname === "/api/session/control" && req.method === "POST") {
-      const body = await req.json() as { session_id: string; action: "pause" | "resume" };
-      try {
-        const result = await broker.updateSession({
-          id: body.session_id,
-          status: body.action === "pause" ? "paused" : "active",
-          pause_reason: body.action === "pause" ? "Paused via web dashboard" : undefined,
-          paused_at: body.action === "pause" ? Date.now() : undefined,
-        });
-        return Response.json(result);
-      } catch (e) {
-        return Response.json({ error: String(e) }, { status: 500 });
+    // API: control actions (send, pause, release, add agent, plan, knowledge, ...)
+    if (url.pathname.startsWith("/api/") && (req.method === "POST" || req.method === "GET")) {
+      const action = url.pathname.slice("/api/".length);
+      if (CONTROL_ACTIONS.includes(action)) {
+        let body: Record<string, unknown> = {};
+        if (req.method === "POST") {
+          try {
+            body = (await req.json()) as Record<string, unknown>;
+          } catch {
+            return Response.json({ ok: false, error: "Body must be JSON" }, { status: 400 });
+          }
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            return Response.json({ ok: false, error: "Body must be a JSON object" }, { status: 400 });
+          }
+        }
+        try {
+          const result = await handleControl(controlCtx, action, body);
+          // A team started from the browser is what the user wants to watch next
+          const created = action === "team/create" ? (result as { data?: { session_id?: string } }).data?.session_id : undefined;
+          const createdSession = action === "session/create" ? (result as Session).id : undefined;
+          if (created || createdSession) {
+            sessionId = (created ?? createdSession)!;
+            userPinnedSession = true;
+            await startPolling();
+          } else if (req.method === "POST") {
+            await fetchAndBroadcast();
+          }
+          return Response.json({ ok: true, result });
+        } catch (e) {
+          return apiError(e);
+        }
       }
     }
 
@@ -316,8 +408,25 @@ const server = Bun.serve({
   },
 });
 
+// Start the broker if needed (as the orchestrator does) and the supervision
+// loops for the agents this dashboard launches
+try {
+  await ensureBroker(broker);
+} catch (e) {
+  console.error(`[web-dashboard] Broker unavailable: ${e instanceof Error ? e.message : e}`);
+}
+startBackgroundLoops(broker);
+
 // Start polling
 await startPolling();
+
+// Agents launched from the browser belong to this process: stop them with it
+function shutdown() {
+  shutdownRuntime();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 console.error(`[web-dashboard] Listening on http://127.0.0.1:${WEB_DASHBOARD_PORT}`);
 console.error(`[web-dashboard] Session: ${sessionId ?? "(none — waiting for session)"}`);

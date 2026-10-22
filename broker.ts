@@ -62,6 +62,8 @@ import type {
   KnowledgeListRequest,
   KnowledgeGetRequest,
   KnowledgeDeleteRequest,
+  AddPlanItemRequest,
+  EditPlanItemRequest,
 } from "./shared/types.ts";
 
 // --- Configuration ---
@@ -879,7 +881,12 @@ function handleUpdateSession(body: UpdateSessionRequest): Session | null {
   if (body.status !== undefined) { fields.push("status = ?"); values.push(body.status); }
   if (body.pause_reason !== undefined) { fields.push("pause_reason = ?"); values.push(body.pause_reason); }
   if (body.paused_at !== undefined) { fields.push("paused_at = ?"); values.push(body.paused_at); }
-  if (body.config !== undefined) { fields.push("config = ?"); values.push(JSON.stringify(body.config)); }
+  let config = body.config;
+  if (body.config_patch !== undefined) {
+    const current = config ?? parseSnapshot((db.query("SELECT config FROM sessions WHERE id = ?").get(body.id) as { config: string | null } | null)?.config ?? null);
+    config = { ...current, ...body.config_patch };
+  }
+  if (config !== undefined) { fields.push("config = ?"); values.push(JSON.stringify(config)); }
 
   fields.push("last_active_at = ?");
   values.push(Date.now());
@@ -1191,6 +1198,8 @@ function handleUpdateGuardrail(body: UpdateGuardrailRequest) {
 
 // --- Plans ---
 
+const PLAN_ITEM_STATUSES = new Set(["pending", "in_progress", "blocked", "done"]);
+
 interface CreatePlanRequest {
   session_id: string;
   title: string;
@@ -1258,6 +1267,64 @@ function handleUpdatePlanItem(body: { item_id: number; status: string; session_i
     return handleGetPlan({ session_id: body.session_id });
   }
   return { ok: true };
+}
+
+/** The plan item, provided it belongs to the session's plan. */
+function sessionPlanItem(sessionId: string, itemId: number): { id: number; plan_id: number } | null {
+  return db.query(
+    "SELECT pi.id, pi.plan_id FROM plan_items pi JOIN plans p ON p.id = pi.plan_id WHERE pi.id = ? AND p.session_id = ?",
+  ).get(itemId, sessionId) as { id: number; plan_id: number } | null;
+}
+
+/** Append an item to the session's plan, creating the plan if it has none. */
+function handleAddPlanItem(body: AddPlanItemRequest) {
+  if (!body.session_id) throw new Error("session_id required");
+  if (!body.label || !body.label.trim()) throw new Error("label required");
+  const now = Date.now();
+  let plan = db.query("SELECT id FROM plans WHERE session_id = ? ORDER BY id DESC LIMIT 1").get(body.session_id) as { id: number } | null;
+  if (!plan) {
+    const session = db.query("SELECT name FROM sessions WHERE id = ?").get(body.session_id) as { name: string } | null;
+    if (!session) throw new Error(`Session ${body.session_id} not found`);
+    db.run("INSERT INTO plans (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [body.session_id, body.title ?? session.name, now, now]);
+    plan = db.query("SELECT id FROM plans WHERE session_id = ? ORDER BY id DESC LIMIT 1").get(body.session_id) as { id: number };
+  }
+  const last = db.query("SELECT MAX(sort_order) AS max FROM plan_items WHERE plan_id = ?").get(plan.id) as { max: number | null };
+  db.run(
+    "INSERT INTO plan_items (plan_id, parent_id, label, status, assigned_to_slot, sort_order) VALUES (?, NULL, ?, 'pending', ?, ?)",
+    [plan.id, body.label.trim(), body.assigned_to_slot ?? null, (last.max ?? -1) + 1],
+  );
+  db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [now, plan.id]);
+  return handleGetPlan({ session_id: body.session_id });
+}
+
+/** Change an item's label, status or assignee (null unassigns). */
+function handleEditPlanItem(body: EditPlanItemRequest) {
+  const item = sessionPlanItem(body.session_id, body.item_id);
+  if (!item) return null;
+  const fields: string[] = [];
+  const values: any[] = [];
+  if (body.label !== undefined) {
+    if (!body.label.trim()) throw new Error("label must not be empty");
+    fields.push("label = ?"); values.push(body.label.trim());
+  }
+  if (body.status !== undefined) {
+    if (!PLAN_ITEM_STATUSES.has(body.status)) throw new Error(`Invalid status "${body.status}"`);
+    fields.push("status = ?", "completed_at = ?"); values.push(body.status, body.status === "done" ? Date.now() : null);
+  }
+  if (body.assigned_to_slot !== undefined) { fields.push("assigned_to_slot = ?"); values.push(body.assigned_to_slot); }
+  if (fields.length > 0) {
+    db.run(`UPDATE plan_items SET ${fields.join(", ")} WHERE id = ?`, [...values, item.id]);
+    db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [Date.now(), item.plan_id]);
+  }
+  return handleGetPlan({ session_id: body.session_id });
+}
+
+function handleDeletePlanItem(body: { session_id: string; item_id: number }) {
+  const item = sessionPlanItem(body.session_id, body.item_id);
+  if (!item) return null;
+  db.run("DELETE FROM plan_items WHERE id = ?", [item.id]);
+  db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [Date.now(), item.plan_id]);
+  return handleGetPlan({ session_id: body.session_id });
 }
 
 // --- Message log ---
@@ -1461,6 +1528,16 @@ Bun.serve({
           return Response.json(handleGetPlan(body as { session_id: string }));
         case "/plan/update-item":
           return Response.json(handleUpdatePlanItem(body as { item_id: number; status: string; session_id?: string }));
+        case "/plan/add-item":
+          return Response.json(handleAddPlanItem(body as AddPlanItemRequest));
+        case "/plan/edit-item": {
+          const edited = handleEditPlanItem(body as EditPlanItemRequest);
+          return edited ? Response.json(edited) : Response.json({ error: "Plan item not found in session" }, { status: 404 });
+        }
+        case "/plan/delete-item": {
+          const remaining = handleDeletePlanItem(body as { session_id: string; item_id: number });
+          return remaining ? Response.json(remaining) : Response.json({ error: "Plan item not found in session" }, { status: 404 });
+        }
 
         // --- Message log ---
         case "/message-log":
