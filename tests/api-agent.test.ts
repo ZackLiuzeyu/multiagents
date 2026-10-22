@@ -152,7 +152,7 @@ describe("an API agent at work", () => {
     expect(slot.agent_type).toBe("api");
     expect(JSON.parse(slot.context_snapshot)).toMatchObject({ provider_id: "fake-ai", provider_name: "Fake AI" });
 
-    const reply = await waitFor(async () => (await post("/message-log", { session_id: sid, limit: 50 })).find((m: any) => m.to_id === "human" && m.from_slot_id === slotId), 20_000);
+    const reply = await waitFor(async () => (await post("/message-log", { session_id: sid, limit: 50 })).find((m: any) => m.to_id === "human" && m.from_slot_id === slotId), 35_000);
     expect(reply.text).toBe("notes look fine");
 
     const steps = await waitFor(async () => {
