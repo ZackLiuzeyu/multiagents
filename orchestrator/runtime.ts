@@ -36,7 +36,7 @@ import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget, pauseAgent } from "./session-control.ts";
-import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox, limitVerdict, type UsageLimits } from "./supervision.ts";
+import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox, limitVerdict, deadSlotVerdict, type UsageLimits } from "./supervision.ts";
 import { LiveTracker } from "./live.ts";
 import { ActivityRecorder, awaitApproval, claudeActivity, codexActivity, geminiActivity, describeTool, isTeamTool, CLAUDE_PERMISSION_MODE, CODEX_APPROVAL_POLICY } from "./activity.ts";
 
@@ -1869,32 +1869,36 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
     }
   }, GUARDRAIL_CHECK_INTERVAL);
 
-  // Dead slot auto-cleanup loop — every 60s, remove slots disconnected for >5 min
+  // Orphan slot cleanup — every 60s. Only slots whose agent connected but never
+  // worked are deleted (deadSlotVerdict): a finished agent (e.g. Gemini exits 0
+  // after approval) stays listed as offline until a person removes it.
   setInterval(async () => {
     const now = Date.now();
     for (const sessionId of activeProcesses.keys()) {
       try {
         const slots = await brokerClient.listSlots(sessionId);
+        if (!slots.some((s) => s.status === "disconnected")) continue;
+        const session = await brokerClient.getSession(sessionId);
+        const config = safeJsonParse<Record<string, unknown>>(session.config, {});
+        const sessionOnHold = session.status !== "active" || !!config.qa_mode
+          || (config.human_gate === true && slots.some((s) => s.task_state === "approved"));
+        const [messages, plan] = await Promise.all([
+          brokerClient.getMessageLog(sessionId, { limit: 1000 }).catch(() => null),
+          brokerClient.getPlan(sessionId).catch(() => null),
+        ]);
+        // Without the history, every slot counts as having taken part
+        if (!messages) continue;
+        const tookPart = new Set<number>([
+          ...messages.map((m) => m.from_slot_id).filter((id): id is number => id != null),
+          ...(plan?.items ?? []).map((i) => i.assigned_to_slot).filter((id): id is number => id != null),
+        ]);
         for (const slot of slots) {
-          if (slot.status !== "disconnected") continue;
-
-          // CRITICAL: Skip slots that have NEVER connected — they're still starting up.
-          // Without this check, last_disconnected is null → defaults to 0 → deadFor = now
-          // (billions of ms) → the slot looks dead for "54 years" → gets deleted immediately.
-          // This was THE bug that caused all starting agents to vanish from the dashboard.
-          if (!slot.last_connected) continue;
-
-          const disconnectedAt = slot.last_disconnected ?? slot.last_connected ?? now;
-          const deadFor = now - disconnectedAt;
-          if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
-
-          // Skip driver-managed slots — orchestrator controls their lifecycle
-          if (activeDrivers.has(sessionId, slot.id)) continue;
-
-          // Auto-cleanup: delete the dead slot
+          const verdict = deadSlotVerdict({ slot, driven: activeDrivers.has(sessionId, slot.id), tookPart: tookPart.has(slot.id), sessionOnHold, now });
+          if (verdict !== "delete") continue;
           try {
             await brokerClient.deleteSlot(slot.id);
-            log(LOG_PREFIX, `Auto-deleted dead slot ${slot.id} (${slot.display_name || slot.role}) — disconnected for ${Math.round(deadFor / 60000)}m`);
+            const deadFor = now - (slot.last_disconnected ?? slot.last_connected ?? now);
+            log(LOG_PREFIX, `Auto-deleted orphan slot ${slot.id} (${slot.display_name || slot.role}) — never worked, disconnected for ${Math.round(deadFor / 60000)}m`);
           } catch { /* best effort */ }
         }
       } catch { /* ok */ }
