@@ -89,6 +89,12 @@ const AGENT_COMMANDS: Record<AgentType, string> = {
   custom: "",
 };
 
+/** Env vars that replace an agent's CLI binary (the drivers launch these instead). */
+const COMMAND_OVERRIDES: Partial<Record<AgentType, string>> = {
+  claude: "MULTIAGENTS_CLAUDE_COMMAND",
+  codex: "MULTIAGENTS_CODEX_COMMAND",
+};
+
 /**
  * Detect whether an agent CLI is installed and available on PATH.
  * Handles both direct binaries (claude, codex) and npx-based tools (gemini).
@@ -116,12 +122,16 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
     return { available: false };
   }
 
-  const which = Bun.spawnSync(["which", cmd], { env: spawnEnv });
+  // An override is what gets launched, so it is what has to exist
+  const overrideVar = COMMAND_OVERRIDES[type];
+  const override = overrideVar ? process.env[overrideVar]?.trim() : undefined;
+  const which = Bun.spawnSync(["which", override ? override.split(/\s+/)[0]! : cmd], { env: spawnEnv });
   const binPath = new TextDecoder().decode(which.stdout).trim();
 
   if (which.exitCode !== 0 || !binPath) {
     return { available: false };
   }
+  if (override) return { available: true, version: `${overrideVar}=${override}`, path: binPath };
 
   // Try to get version
   let version: string | undefined;
