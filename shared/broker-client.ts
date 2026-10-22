@@ -43,6 +43,9 @@ import type {
   KnowledgeCategory,
   AddPlanItemRequest,
   EditPlanItemRequest,
+  ActivityAddRequest,
+  ActivityEntry,
+  ApprovalRequest,
 } from "./types.ts";
 
 /** HTTP client for the multiagents broker API. */
@@ -272,6 +275,33 @@ export class BrokerClient {
 
   deleteSlot(slotId: number): Promise<{ ok: boolean; deleted: boolean }> {
     return this.post("/slots/delete", { id: slotId });
+  }
+
+  // --- Activity timeline & approvals ---
+
+  addActivity(req: ActivityAddRequest): Promise<{ ok: boolean; added: number }> {
+    if (req.entries.length === 0) return Promise.resolve({ ok: true, added: 0 });
+    return this.post("/activity/add", req);
+  }
+
+  listActivity(req: { session_id: string; slot_id?: number; after_id?: number; limit?: number }): Promise<ActivityEntry[]> {
+    return this.post("/activity/list", req);
+  }
+
+  createApproval(req: { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }): Promise<ApprovalRequest> {
+    return this.post("/approvals/create", req);
+  }
+
+  getApproval(id: number): Promise<ApprovalRequest> {
+    return this.post("/approvals/get", { id });
+  }
+
+  listApprovals(sessionId: string, status?: string): Promise<ApprovalRequest[]> {
+    return this.post("/approvals/list", { session_id: sessionId, status });
+  }
+
+  decideApproval(req: { id: number; session_id: string; decision: "allow" | "deny" | "cancel"; note?: string; always?: boolean; decided_by?: string }): Promise<ApprovalRequest> {
+    return this.post("/approvals/decide", req);
   }
 
   // --- Knowledge Store ---

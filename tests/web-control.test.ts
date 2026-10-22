@@ -69,6 +69,8 @@ beforeAll(async () => {
       MULTIAGENTS_NO_OPEN: "1",
       MULTIAGENTS_NO_DASHBOARD: "1",
       MULTIAGENTS_CLAUDE_COMMAND: `bun ${FAKE_CLAUDE}`,
+      MULTIAGENTS_LIMIT_CHECK_MS: "300",
+      FAKE_CLAUDE_LOG: path.join(tmpDir, "fake-claude.log"),
     },
     stdout: "ignore",
     stderr: "ignore",
@@ -360,5 +362,79 @@ describe("project files over HTTP", () => {
     expect(checked.result).toEqual({ "result.csv": "out/result.csv", "ghost.md": null });
 
     expect((await fetch(`${DASHBOARD_URL}/api/fs/list?path=`)).status).toBe(400);
+  });
+});
+
+describe("approvals, activity, settings and limits", () => {
+  test("a step of an agent in ask mode waits for a person; the timeline shows it", async () => {
+    const r = await api("team/create", {
+      project_dir: path.join(tmpDir, "ask-team"),
+      session_name: "Ask Team",
+      goal: "List files",
+      agents: [{ agent_type: "claude", name: "Careful", role: "Software Engineer", initial_task: "TOOL:Bash:ls-la", approval_mode: "ask", model: "sonnet" }],
+      workflow: {},
+    });
+    expect(r.ok).toBe(true);
+    const sid = r.result.data.session_id;
+    const [slot] = await broker("/slots/list", { session_id: sid });
+    expect(JSON.parse(slot.context_snapshot)).toMatchObject({ approval_mode: "ask", model: "sonnet" });
+
+    const pending = await waitFor(async () => {
+      const list = await broker("/approvals/list", { session_id: sid, status: "pending" });
+      return list.length ? list : null;
+    }, 15_000);
+    expect(pending[0]).toMatchObject({ tool: "Bash", title: "$ ls-la", slot_id: slot.id });
+
+    // Another session cannot decide it
+    expect((await api("approvals/decide", { session_id: SESSION, approval_id: pending[0].id, decision: "allow" })).ok).toBe(false);
+    const decided = await api("approvals/decide", { session_id: sid, approval_id: pending[0].id, decision: "allow" });
+    expect(decided.ok).toBe(true);
+    expect((await api("approvals/decide", { session_id: sid, approval_id: pending[0].id, decision: "deny" })).ok).toBe(false);
+
+    const steps = await waitFor(async () => {
+      const res = await (await fetch(`${DASHBOARD_URL}/api/activity?session_id=${encodeURIComponent(sid)}`)).json() as any;
+      const kinds = res.result.map((e: any) => e.kind);
+      return kinds.includes("tool_result") && kinds.includes("turn_end") ? res.result : null;
+    }, 15_000);
+    const titles = steps.map((e: any) => e.title);
+    expect(titles).toContain("Waiting for approval · $ ls-la");
+    expect(titles).toContain("Approved · $ ls-la");
+    expect(titles).toContain("$ ls-la");
+    expect(steps.find((e: any) => e.kind === "tool_result").detail).toBe("ran Bash ls-la");
+
+    // A model switch reaches the running session as a control request
+    expect((await api("agents/settings", { session_id: sid, slot_id: slot.id, model: "opus" })).ok).toBe(true);
+    await waitFor(() => Promise.resolve(fs.readFileSync(path.join(tmpDir, "fake-claude.log"), "utf-8").includes('"subtype":"set_model","model":"opus"')), 10_000);
+
+    // A token limit below what the agent used pauses it
+    expect((await api("session/limits", { session_id: sid, limits: { agent_tokens: 50 } })).ok).toBe(true);
+    const paused = await waitFor(async () => {
+      const s = await broker("/slots/get", { id: slot.id });
+      return s.paused ? s : null;
+    }, 10_000);
+    expect(JSON.parse(paused.context_snapshot).limit_hit).toMatch(/^token limit reached/);
+
+    expect((await api("session/end", { session_id: sid })).ok).toBe(true);
+  }, 60_000);
+
+  test("settings are validated per agent type", async () => {
+    expect((await api("agents/settings", { session_id: SESSION, slot_id: slotA, effort: "turbo" })).status).toBe(400);
+    expect((await api("agents/settings", { session_id: SESSION, slot_id: slotA, approval_mode: "sometimes" })).status).toBe(400);
+    expect((await api("agents/settings", { session_id: SESSION, slot_id: slotA, model: "bad model;" })).status).toBe(400);
+    const ok = await api("agents/settings", { session_id: SESSION, slot_id: slotA, model: "haiku", effort: "low", token_limit: 9000 });
+    expect(ok.ok).toBe(true);
+    const snap = JSON.parse((await broker("/slots/get", { id: slotA })).context_snapshot);
+    expect(snap).toMatchObject({ model: "haiku", effort: "low", token_limit: 9000 });
+    // Clearing
+    await api("agents/settings", { session_id: SESSION, slot_id: slotA, model: "", token_limit: null });
+    expect(JSON.parse((await broker("/slots/get", { id: slotA })).context_snapshot)).toMatchObject({ model: null, token_limit: null });
+  });
+
+  test("limits are stored on the session and shown in the dashboard state", async () => {
+    const r = await api("session/limits", { session_id: SESSION, limits: { session_tokens: 100000, agent_cost_usd: 2.5, agent_tokens: "" } });
+    expect(r.result.limits).toEqual({ session_tokens: 100000, agent_cost_usd: 2.5 });
+    const session = await broker("/sessions/get", { id: SESSION });
+    expect(JSON.parse(session.config).limits).toEqual({ session_tokens: 100000, agent_cost_usd: 2.5 });
+    await api("session/limits", { session_id: SESSION, limits: {} });
   });
 });

@@ -13,7 +13,7 @@ import type { Subprocess } from "bun";
 
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
-import type { AgentLaunchConfig } from "../shared/types.ts";
+import type { AgentLaunchConfig, Slot } from "../shared/types.ts";
 import { log, getGitRoot, uniqueSessionId, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   GUARDRAIL_CHECK_INTERVAL,
@@ -23,18 +23,19 @@ import {
 } from "../shared/constants.ts";
 import { brokerUrl } from "../shared/broker-url.ts";
 
-import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, slotSettings } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
-import { deliverPendingMessages, type DriverSlot } from "./delivery.ts";
+import { deliverPendingMessages, launchedSettings, type DriverSlot } from "./delivery.ts";
 import { RespawnGuard } from "./respawn-guard.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import type { ClaudeDriver } from "./claude-driver.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
-import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
-import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox } from "./supervision.ts";
+import { controlSession, broadcastToTeam, resolveTarget, pauseAgent } from "./session-control.ts";
+import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox, limitVerdict, type UsageLimits } from "./supervision.ts";
+import { ActivityRecorder, awaitApproval, claudeActivity, codexActivity, geminiActivity, describeTool, isTeamTool, CLAUDE_PERMISSION_MODE, CODEX_APPROVAL_POLICY } from "./activity.ts";
 
 const LOG_PREFIX = "orchestrator";
 const BROKER_URL = brokerUrl();
@@ -53,6 +54,7 @@ interface LaunchedAgent {
   process: Subprocess;
   codexDriver?: CodexDriver;
   claudeDriver?: ClaudeDriver;
+  settings?: { model?: string; effort?: string; approvalMode?: string };
 }
 
 async function slotIsReleased(slotId: number, brokerClient: BrokerClient): Promise<boolean> {
@@ -114,10 +116,13 @@ function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, b
       ? { kind: "codex", driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 }
       : null;
   if (!state) {
-    monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
+    const recorder = new ActivityRecorder(sessionId, slotId, brokerClient);
+    monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent, (event) => recorder.push(...geminiActivity(event)));
+    result.process.exited.then(() => recorder.flush());
     return;
   }
 
+  if (result.settings) state.applied = launchedSettings(state.kind, result.settings);
   const displaced = activeDrivers.track(sessionId, slotId, state);
   if (displaced) {
     log(LOG_PREFIX, `Slot ${slotId} already had a live ${displaced.kind} driver (pid ${displaced.driver.pid}) — stopping it in favour of the new one`);
@@ -128,7 +133,182 @@ function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, b
   } else {
     monitorCodexDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
   }
+  superviseDriver(sessionId, slotId, state, brokerClient);
   state.driver.onExit((code) => onDriverExit(sessionId, slotId, state, code, brokerClient));
+}
+
+/** Key under which "always allow" remembers a tool (a shell command by its program). */
+function approvalKey(tool: string, input: Record<string, unknown>): string {
+  if (tool === "Bash" && typeof input.command === "string") return `Bash:${input.command.trim().split(/\s+/)[0] ?? ""}`;
+  return tool;
+}
+
+/**
+ * Feed the driver's steps into the activity timeline and route its tool
+ * approvals to a person (through the broker, so any dashboard can answer).
+ */
+function superviseDriver(sessionId: string, slotId: number, state: DriverSlot, brokerClient: BrokerClient): void {
+  const recorder = new ActivityRecorder(sessionId, slotId, brokerClient);
+  const stillWanted = () => state.driver.alive && activeDrivers.get(sessionId, slotId) === state;
+  const alwaysAllowed = new Set<string>();
+  state.driver.onExit((code) => {
+    recorder.push({ kind: "status", title: `Agent process exited (code ${code})` });
+    void recorder.flush();
+  });
+
+  const ask = async (tool: string, title: string, input: unknown) => {
+    recorder.push({ kind: "approval", title: `Waiting for approval · ${title}`, data: { tool, input } });
+    await recorder.flush();
+    const outcome = await awaitApproval(brokerClient, { sessionId, slotId, tool, title, input }, stillWanted);
+    recorder.push({
+      kind: "approval",
+      title: `${outcome.allowed ? (outcome.always ? "Always allowed" : "Approved") : outcome.note === "cancelled" ? "Cancelled" : "Denied"} · ${title}`,
+      detail: outcome.note && outcome.note !== "cancelled" ? outcome.note : null,
+      data: { tool, allowed: outcome.allowed },
+    });
+    return outcome;
+  };
+
+  if (state.kind === "claude") {
+    const tools = new Map<string, { name: string; title: string }>();
+    state.driver.onEvent((event) => recorder.push(...claudeActivity(event as Record<string, any>, tools)), { replay: true });
+    state.driver.onPermissionRequest(async (req) => {
+      if (isTeamTool(req.toolName)) return { behavior: "allow" };
+      const key = approvalKey(req.toolName, req.input);
+      if (alwaysAllowed.has(key)) return { behavior: "allow" };
+      const outcome = await ask(req.toolName, describeTool(req.toolName, req.input), req.input);
+      if (!outcome.allowed) {
+        return { behavior: "deny", message: outcome.note && outcome.note !== "cancelled" ? `A person denied this tool call: ${outcome.note}` : "A person denied this tool call." };
+      }
+      if (outcome.always) alwaysAllowed.add(key);
+      return { behavior: "allow", always: outcome.always };
+    });
+  } else {
+    const items = new Map<string, Record<string, any>>(); // started items, for the context of an approval
+    state.driver.onNotification(({ method, params }) => {
+      if (method === "item/started" && params.item && typeof (params.item as { id?: unknown }).id === "string") {
+        items.set((params.item as { id: string }).id, params.item as Record<string, any>);
+      }
+      if (method === "item/completed" && params.item) items.delete((params.item as { id?: string }).id ?? "");
+      recorder.push(...codexActivity(method, params as Record<string, any>));
+    });
+    state.driver.onApprovalRequest(async ({ kind, params }) => {
+      const item = items.get(String(params.itemId ?? ""));
+      const command = Array.isArray(params.command) ? params.command.join(" ") : (params.command as string | undefined) ?? (item?.command as string | undefined);
+      const changes = (item?.changes as Array<{ path?: string }> | undefined) ?? [];
+      const title = kind === "command"
+        ? `$ ${command ?? "shell command"}`
+        : changes.length ? `Edit ${changes.map((c) => c.path).join(", ")}` : "Apply file changes";
+      const tool = kind === "command" ? "shell" : kind === "fileChange" ? "apply_patch" : "permissions";
+      const key = kind === "command" ? `shell:${(command ?? "").trim().split(/\s+/)[0] ?? ""}` : tool;
+      if (alwaysAllowed.has(key)) return "accept";
+      const outcome = await ask(tool, title, { ...params, ...(item?.changes ? { changes: item.changes } : {}), ...(command ? { command } : {}) });
+      if (!outcome.allowed) return "decline";
+      if (outcome.always) { alwaysAllowed.add(key); return "acceptForSession"; }
+      return "accept";
+    });
+  }
+  (state as DriverSlot & { recorder?: ActivityRecorder }).recorder = recorder;
+}
+
+/** Recorder attached by superviseDriver (for status lines from the loops). */
+function recorderOf(state: DriverSlot): ActivityRecorder | undefined {
+  return (state as DriverSlot & { recorder?: ActivityRecorder }).recorder;
+}
+
+/**
+ * Bring a running driver in line with its slot: model, effort and approval
+ * mode edited in a dashboard apply live (Claude: control requests; Codex: the
+ * next turn), and a paused slot's running turn is interrupted.
+ */
+async function reconcileDriver(slot: Slot, state: DriverSlot): Promise<void> {
+  const want = slotSettings(slot);
+  const recorder = recorderOf(state);
+  // A driver launched without a record of its settings is taken to run the slot's current ones
+  state.applied ??= launchedSettings(state.kind, want);
+  const applied = state.applied;
+
+  if (state.kind === "claude") {
+    if (applied.approvalMode !== want.approvalMode) {
+      applied.approvalMode = want.approvalMode;
+      try {
+        await state.driver.setPermissionMode(CLAUDE_PERMISSION_MODE[want.approvalMode]);
+        recorder?.push({ kind: "status", title: `Approval mode → ${want.approvalMode}` });
+      } catch (err) {
+        recorder?.push({ kind: "error", title: `Could not switch to approval mode ${want.approvalMode}`, detail: String(err instanceof Error ? err.message : err) });
+      }
+    }
+    if (applied.model !== want.model) {
+      applied.model = want.model;
+      try {
+        await state.driver.setModel(want.model);
+        recorder?.push({ kind: "status", title: `Model → ${want.model ?? "default"}` });
+      } catch (err) {
+        recorder?.push({ kind: "error", title: `Could not switch to model ${want.model ?? "default"}`, detail: String(err instanceof Error ? err.message : err) });
+      }
+    }
+    if (applied.effort !== want.effort) {
+      applied.effort = want.effort;
+      recorder?.push({ kind: "status", title: `Effort → ${want.effort ?? "default"} (applies when the agent restarts)` });
+    }
+  } else {
+    if (applied.model !== want.model || applied.effort !== want.effort || applied.approvalMode !== want.approvalMode) {
+      state.driver.settings = { approvalPolicy: CODEX_APPROVAL_POLICY[want.approvalMode], model: want.model, effort: want.effort };
+      recorder?.push({ kind: "status", title: `Settings for the next turn: model ${want.model ?? "default"} · effort ${want.effort ?? "default"} · approvals ${want.approvalMode}` });
+      Object.assign(applied, { model: want.model, effort: want.effort, approvalMode: want.approvalMode });
+    }
+  }
+
+  // Pausing stops the running turn too, not only the next delivery
+  const paused = slot.paused === true || (slot.paused as unknown as number) === 1;
+  if (!paused) {
+    state.pauseInterrupted = false;
+  } else if (!state.pauseInterrupted) {
+    state.pauseInterrupted = true;
+    const running = state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null;
+    if (running) {
+      try {
+        if (state.kind === "claude") await state.driver.interrupt();
+        else await state.driver.interrupt(state.threadId ?? state.driver.threadId ?? "");
+        recorder?.push({ kind: "status", title: "Paused — the running turn was interrupted" });
+      } catch (err) {
+        log(LOG_PREFIX, `Interrupt on pause failed for slot ${slot.id}: ${err}`);
+      }
+    }
+  }
+}
+
+/**
+ * Enforce the session's usage limits: an agent over its limit (or any agent of
+ * a session over the session limit) is paused, and its running turn stops.
+ */
+async function enforceUsageLimits(sessionId: string, brokerClient: BrokerClient): Promise<void> {
+  const session = await brokerClient.getSession(sessionId);
+  const limits = (safeJsonParse<Record<string, unknown>>(session.config, {}).limits ?? {}) as UsageLimits;
+  const slots = await brokerClient.listSlots(sessionId);
+  for (const slot of slots) {
+    if (slot.task_state === "released") continue;
+    const reason = limitVerdict(slot, slots, limits, slotSettings(slot).tokenLimit);
+    const snapshot = safeJsonParse<Record<string, unknown>>(slot.context_snapshot, {});
+    if (!reason) {
+      if (snapshot.limit_hit) await brokerClient.updateSlot({ id: slot.id, context_patch: { limit_hit: null } });
+      continue;
+    }
+    if (snapshot.limit_hit !== reason) await brokerClient.updateSlot({ id: slot.id, context_patch: { limit_hit: reason } });
+    const paused = slot.paused === true || (slot.paused as unknown as number) === 1;
+    if (paused) continue;
+    log(LOG_PREFIX, `${slot.display_name ?? `Slot ${slot.id}`}: ${reason} — pausing`);
+    await pauseAgent(sessionId, slot, brokerClient);
+    const state = activeDrivers.get(sessionId, slot.id);
+    if (state) {
+      recorderOf(state)?.push({ kind: "error", title: `Stopped: ${reason}`, detail: "Raise the limit in the dashboard, then resume the agent." });
+      try {
+        if (state.kind === "claude") await state.driver.interrupt();
+        else await state.driver.interrupt(state.threadId ?? state.driver.threadId ?? "");
+      } catch { /* best effort */ }
+    }
+    pendingEvents.push({ type: "limit_reached", severity: "warning", slotId: slot.id, sessionId, message: `${slot.display_name ?? `Slot ${slot.id}`} paused: ${reason}` });
+  }
 }
 
 /** A driver process ended: detach it, mark the slot disconnected, and respawn only if it was not released. */
@@ -479,6 +659,9 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
               role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
               initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like, files to modify, APIs to use, and verification steps." },
               file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively, e.g., 'src/auth/**'" },
+              model: { type: "string", description: "Model for this agent, e.g. 'opus' / 'sonnet' (claude), 'gpt-5' (codex), 'gemini-2.5-pro' (gemini). Default: the CLI's default." },
+              effort: { type: "string", description: "Reasoning effort: claude low|medium|high|xhigh|max, codex minimal|low|medium|high." },
+              approval_mode: { type: "string", enum: ["bypass", "auto", "accept_edits", "ask"], description: "Who approves tool calls: bypass (never ask, default), auto (the CLI's reviewer; risky calls go to a person), accept_edits (edits pass, the rest asks), ask (a person approves every call). Gemini supports only bypass." },
             },
             required: ["agent_type", "name", "role", "role_description", "initial_task"],
           },
@@ -550,6 +733,9 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
         initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like." },
         file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively" },
+        model: { type: "string", description: "Model for this agent, e.g. 'opus' / 'sonnet' (claude), 'gpt-5' (codex), 'gemini-2.5-pro' (gemini). Default: the CLI's default." },
+        effort: { type: "string", description: "Reasoning effort: claude low|medium|high|xhigh|max, codex minimal|low|medium|high." },
+        approval_mode: { type: "string", enum: ["bypass", "auto", "accept_edits", "ask"], description: "Who approves tool calls: bypass (never ask, default), auto (the CLI's reviewer; risky calls go to a person), accept_edits (edits pass, the rest asks), ask (a person approves every call). Gemini supports only bypass." },
       },
       required: ["session_id", "agent_type", "name", "role", "role_description", "initial_task"],
     },
@@ -964,7 +1150,7 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
 
       // ---- add_agent ----
       case "add_agent": {
-        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership } = args as {
+        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership, model, effort, approval_mode } = args as {
           session_id: string;
           agent_type: "claude" | "codex" | "gemini";
           name: string;
@@ -972,6 +1158,9 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
           role_description: string;
           initial_task: string;
           file_ownership?: string[];
+          model?: string;
+          effort?: string;
+          approval_mode?: AgentLaunchConfig["approval_mode"];
         };
 
         const detection = await detectAgent(agent_type);
@@ -987,6 +1176,9 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
           role_description,
           initial_task,
           file_ownership,
+          model,
+          effort,
+          approval_mode,
         };
 
         const result = await launchAgent(session_id, session.project_dir, config, brokerClient);
@@ -1540,6 +1732,7 @@ let guardrailTimer: ReturnType<typeof setInterval> | null = null;
 let conflictTimer: ReturnType<typeof setInterval> | null = null;
 
 let loopsStarted = false;
+const USAGE_LIMIT_CHECK_MS = Number(process.env.MULTIAGENTS_LIMIT_CHECK_MS) || 10_000;
 
 export function startBackgroundLoops(brokerClient: BrokerClient): void {
   if (loopsStarted) return;
@@ -1647,8 +1840,14 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
   // One tick at a time: a slow driver call must not let the next tick hand out the same messages again.
   setInterval(nonOverlapping(async () => {
     for (const [sessionId, drivers] of activeDrivers.sessions()) {
+      const slots = new Map((await brokerClient.listSlots(sessionId).catch(() => [] as Slot[])).map((s) => [s.id, s]));
       for (const [slotId, state] of drivers) {
         if (!state.driver.alive) continue;
+
+        const slot = slots.get(slotId);
+        if (slot) {
+          try { await reconcileDriver(slot, state); } catch (err) { log(LOG_PREFIX, `Settings sync failed for slot ${slotId}: ${err}`); }
+        }
 
         if (state.kind === "codex") {
           try { await interruptIfStuck(slotId, state); } catch (err) { log(LOG_PREFIX, `Interrupt check failed for slot ${slotId}: ${err}`); }
@@ -1665,6 +1864,13 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
       }
     }
   }), 3_000);
+
+  // Usage limits — pause agents that reached their token/cost limit
+  setInterval(nonOverlapping(async () => {
+    for (const sessionId of activeProcesses.keys()) {
+      try { await enforceUsageLimits(sessionId, brokerClient); } catch (err) { log(LOG_PREFIX, `Limit check failed for ${sessionId}: ${err}`); }
+    }
+  }), USAGE_LIMIT_CHECK_MS);
 
   // Stuck agent nudge loop — every 45s, nudge agents silent for >1 min
   setInterval(async () => {

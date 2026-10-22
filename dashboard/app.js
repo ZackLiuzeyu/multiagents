@@ -225,11 +225,12 @@ function onSessionChanged() {
   resetKnowledgeForm();
   closePreview();
   explorerReset();
+  activityReset();
 }
 
 // --- Tabs ---
 
-const TABS = ["chat", "agents", "plan", "knowledge", "files", "stats"];
+const TABS = ["chat", "activity", "agents", "plan", "knowledge", "files", "stats"];
 
 function switchTab(tab) {
   activeTab = tab;
@@ -287,6 +288,7 @@ function render(force = false) {
   renderSidebar();
   renderSessionBar();
   renderGateBanner();
+  renderApprovals();
   renderBadges();
   refreshAgentSelects();
   renderRoster();
@@ -299,6 +301,7 @@ function render(force = false) {
     case "knowledge": renderKnowledge(); break;
     case "files": renderFiles(); break;
     case "stats": renderStats(); break;
+    case "activity": renderActivity(); break;
   }
 }
 
@@ -1142,6 +1145,7 @@ function refreshAgentSelects() {
   const opts = (list) => list.map((s) => `<option value="${s.id}">${esc(slotName(s))}${s.role ? ` · ${esc(s.role)}` : ""}</option>`).join("");
   fillSelect("composer-to", `<option value="all">Everyone</option>` + opts(live));
   fillSelect("msg-filter-agent", `<option value="">everyone</option>` + opts(state.slots));
+  fillSelect("act-agent", `<option value="">all agents</option>` + opts(state.slots));
   fillSelect("plan-add-assignee", `<option value="">unassigned</option>` + opts(live));
   fillSelect("lock-agent", opts(live));
   fillSelect("own-agent", opts(live));
@@ -1283,11 +1287,13 @@ function renderAgents() {
     const paused = isPaused(slot);
     const reviewable = slot.task_state === "approved" || slot.task_state === "done_pending_review";
     const id = slot.id;
-    const tokens = slot.input_tokens || slot.output_tokens ? `<span class="agent-ids">${fmtTokens(slot.input_tokens ?? 0)} in / ${fmtTokens(slot.output_tokens ?? 0)} out</span>` : "";
+    const tokens = usageLine(slot);
     const actions = released || archived
       ? `<button class="btn small danger" data-agent="remove" data-slot="${id}" ${archived ? "disabled" : ""}>Remove</button>`
       : `<button class="btn small primary" data-agent="message" data-slot="${id}">Message</button>
         ${paused ? `<button class="btn small success" data-agent="resume" data-slot="${id}">Resume</button>` : `<button class="btn small warn" data-agent="pause" data-slot="${id}">Pause</button>`}
+        <button class="btn small" data-agent="settings" data-slot="${id}">Settings</button>
+        <button class="btn small" data-agent="activity" data-slot="${id}">Activity</button>
         <button class="btn small" data-agent="role" data-slot="${id}">Role</button>
         <button class="btn small" data-agent="rename" data-slot="${id}">Rename</button>
         ${reviewable ? `<button class="btn small warn" data-agent="sendback" data-slot="${id}">Send Back</button>` : ""}
@@ -1303,6 +1309,7 @@ function renderAgents() {
         ${taskBadge(slot.task_state ?? "idle")}
         ${paused ? '<span class="badge badge-paused">paused</span>' : ""}
         ${managed.has(id) ? '<span class="badge badge-managed" title="This dashboard launched and supervises the agent process">managed here</span>' : ""}
+        ${settingsBadges(slot)}
       </div>
       <div class="agent-ids" title="slot id = stable seat in the session; peer id = the running process's registration">slot #${id} · peer ${esc(slot.peer_id ?? "—")}</div>
       ${tokens}
@@ -1343,6 +1350,8 @@ $("rpanel-team").addEventListener("click", (e) => {
     const items = [
       { label: "Message", disabled: released, onClick: () => agentAction("message", slot) },
       isPaused(slot) ? { label: "Resume", disabled: released, onClick: () => agentAction("resume", slot) } : { label: "Pause", disabled: released, onClick: () => agentAction("pause", slot) },
+      { label: "Settings (model, approvals, limit)", disabled: released, onClick: () => agentAction("settings", slot) },
+      { label: "Show activity", onClick: () => agentAction("activity", slot) },
       { label: "Change role", disabled: released, onClick: () => agentAction("role", slot) },
       { label: "Rename", disabled: released, onClick: () => agentAction("rename", slot) },
       { label: "Send back for revision", disabled: released, onClick: () => agentAction("sendback", slot) },
@@ -1390,6 +1399,11 @@ async function agentAction(kind, slot, btn) {
       return;
     }
     case "role": return roleModal(sid, slot);
+    case "settings": return settingsModal(sid, slot);
+    case "activity":
+      $("act-agent").value = String(slot.id);
+      switchTab("activity");
+      return;
     case "sendback": return sendBackModal(sid, slot.id);
     case "release": {
       const notApproved = slot.task_state !== "approved";
@@ -1637,54 +1651,93 @@ function renderStats() {
   const el = $("panel-stats");
   if (busyRegion(el)) return;
   if (!state.session) { el.innerHTML = '<div class="empty">No session selected</div>'; return; }
+  const limits = state.limits ?? {};
   const totalIn = state.slots.reduce((a, s) => a + (s.input_tokens ?? 0), 0);
   const totalOut = state.slots.reduce((a, s) => a + (s.output_tokens ?? 0), 0);
+  const totalCache = state.slots.reduce((a, s) => a + (s.cache_read_tokens ?? 0), 0);
+  const totalCost = state.slots.reduce((a, s) => a + (s.cost_usd ?? 0), 0);
   const cards = [
+    { value: fmtTokens(totalIn + totalOut), label: "Tokens (input + output)", color: "var(--accent)", limit: limits.session_tokens, used: totalIn + totalOut, fmt: fmtTokens },
+    { value: fmtUsd(totalCost), label: "Cost (reported by Claude)", color: "var(--green)", limit: limits.session_cost_usd, used: totalCost, fmt: fmtUsd },
+    { value: fmtTokens(totalCache), label: "Cache reads", color: "var(--purple)" },
     { value: state.slots.filter((s) => s.status === "connected").length, label: "Online agents", color: "var(--green)" },
-    { value: state.slots.filter((s) => s.task_state === "working").length, label: "Working", color: "var(--accent)" },
-    { value: state.slots.filter((s) => s.task_state === "approved").length, label: "Approved (not released)", color: "var(--green)" },
-    { value: state.slots.filter((s) => s.task_state === "released").length, label: "Released", color: "var(--text-dim)" },
     { value: state.messages.length, label: "Messages", color: "var(--cyan)" },
-    { value: fmtTokens(totalIn), label: "Input tokens", color: "var(--purple)" },
-    { value: fmtTokens(totalOut), label: "Output tokens", color: "var(--purple)" },
   ];
-  for (const g of state.guardrails.filter((g) => g.action === "monitor")) {
-    cards.push({ value: g.usage?.current ?? 0, label: `${g.label} (${g.unit})`, color: "var(--text)" });
-  }
-  const enforced = state.guardrails.filter((g) => g.action !== "monitor");
-  const guardrails = enforced.length ? `<div class="card"><div class="card-header">Guardrails <span style="text-transform:none;letter-spacing:0;font-weight:400">changes are logged as "Adjusted via web dashboard"</span></div>
-    <div class="card-body">${enforced.map((g) => {
-      const u = g.usage ?? { current: 0, limit: g.current_value, percent: 0, status: "ok" };
-      const color = u.status === "triggered" ? "var(--red)" : u.status === "warning" ? "var(--yellow)" : "var(--green)";
-      const pct = Math.min(100, Math.round((u.percent ?? 0) * 100)); // broker reports a 0..1 ratio
-      return `<div class="guardrail-row" data-guardrail="${esc(g.id)}">
-        <div class="guardrail-info">
-          <div class="guardrail-label">${esc(g.label)} ${g.is_overridden ? '<span class="badge badge-review">overridden</span>' : ""}</div>
-          <div class="guardrail-desc">${esc(g.description ?? "")} · default ${g.default_value} ${esc(g.unit)} · action: ${esc(g.action)}</div>
-          <div class="progress-bar" style="margin-top:4px;max-width:260px"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
-          <div class="guardrail-desc" style="color:${color}">usage ${u.current}/${u.limit}</div>
-        </div>
-        ${g.adjustable ? `<div class="stepper">
-          <button class="btn small" data-step="-1">&minus;</button>
-          <input type="number" min="0" value="${g.current_value}" data-input>
-          <button class="btn small" data-step="1">+</button>
-          <button class="btn small primary" data-set>Set</button>
-          ${(g.suggested_increases ?? []).map((v) => `<button class="btn small" data-suggest="${v}">${v}</button>`).join("")}
-        </div>` : '<span class="dim" style="font-size:12px">fixed</span>'}
-      </div>`;
-    }).join("")}</div></div>` : "";
-  el.innerHTML = `<div class="stats-grid">${cards.map((s) => `<div class="stat-card"><div class="stat-value" style="color:${s.color}">${s.value}</div><div class="stat-label">${esc(s.label)}</div></div>`).join("")}</div>${guardrails}`;
+  const cardsHtml = cards.map((c) => `<div class="stat-card"><div class="stat-value" style="color:${c.color}">${c.value}</div><div class="stat-label">${esc(c.label)}</div>
+    ${c.limit ? `<div style="margin-top:6px">${limitBar(c.used, c.limit)}<div class="field-hint">limit ${c.fmt(c.limit)}</div></div>` : ""}</div>`).join("");
+
+  const rows = state.slots.map((slot) => {
+    const set = slotSettingsOf(slot);
+    const used = (slot.input_tokens ?? 0) + (slot.output_tokens ?? 0);
+    const limit = set.token_limit || limits.agent_tokens;
+    return `<tr>
+      <td><div class="flex items-center gap-2">${avatar(slotName(slot), slotColor(slot.id))}<div><b>${esc(slotName(slot))}</b><div class="muted" style="font-size:11.5px">${esc(slot.agent_type)} · ${esc(set.model || "default model")}${set.effort ? ` · ${esc(set.effort)}` : ""}</div></div></div></td>
+      <td class="num">${fmtTokens(slot.input_tokens ?? 0)}</td>
+      <td class="num">${fmtTokens(slot.output_tokens ?? 0)}</td>
+      <td class="num muted">${fmtTokens(slot.cache_read_tokens ?? 0)}</td>
+      <td class="num">${slot.agent_type === "claude" ? fmtUsd(slot.cost_usd ?? 0) : '<span class="muted">—</span>'}</td>
+      <td style="min-width:140px">${limit ? `${limitBar(used, limit)}<div class="field-hint">${fmtTokens(used)} / ${fmtTokens(limit)}${set.token_limit ? "" : " (session default)"}</div>` : '<span class="muted">no limit</span>'}
+        ${set.limit_hit ? `<div><span class="badge badge-limit">paused: ${esc(set.limit_hit)}</span></div>` : ""}</td>
+      <td><button class="btn small" data-agent="settings" data-slot="${slot.id}">Settings</button></td>
+    </tr>`;
+  }).join("");
+
+  const enforced = state.guardrails.filter((g) => g.action !== "monitor" && g.adjustable);
+  const guardrails = enforced.map((g) => `<div class="guardrail-row" data-guardrail="${esc(g.id)}">
+      <div class="guardrail-info"><div class="guardrail-label">${esc(g.label)} ${g.is_overridden ? '<span class="badge badge-review">overridden</span>' : ""}</div>
+        <div class="guardrail-desc">${esc(g.description ?? "")} · usage ${g.usage?.current ?? 0}/${g.usage?.limit ?? g.current_value} ${esc(g.unit)}</div></div>
+      <div class="stepper">
+        <button class="btn small" data-step="-1">&minus;</button>
+        <input type="number" min="0" value="${g.current_value}" data-input>
+        <button class="btn small" data-step="1">+</button>
+        <button class="btn small primary" data-set>Set</button>
+      </div>
+    </div>`).join("");
+
+  const lim = (k) => (limits[k] ? String(limits[k]) : "");
+  el.innerHTML = `<div class="stats-grid">${cardsHtml}</div>
+    <div class="card"><div class="card-header">Usage per agent <span style="text-transform:none;letter-spacing:0;font-weight:400">tokens as the CLIs report them; cost only where the CLI reports it</span></div>
+      <div class="table-wrap"><table class="table"><thead><tr><th>Agent</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache reads</th><th class="num">Cost</th><th>Limit</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="7" class="muted">No agents yet</td></tr>'}</tbody></table></div></div>
+    <div class="card"><div class="card-header">Limit locks</div>
+      <div class="card-body">
+        <form id="limits-form" class="form-grid">
+          <label>Per agent · tokens</label><input type="number" min="0" step="1000" name="agent_tokens" value="${lim("agent_tokens")}" placeholder="no limit">
+          <label>Per agent · cost (USD)</label><input type="number" min="0" step="0.5" name="agent_cost_usd" value="${lim("agent_cost_usd")}" placeholder="no limit (Claude only)">
+          <label>Whole session · tokens</label><input type="number" min="0" step="1000" name="session_tokens" value="${lim("session_tokens")}" placeholder="no limit">
+          <label>Whole session · cost (USD)</label><input type="number" min="0" step="0.5" name="session_cost_usd" value="${lim("session_cost_usd")}" placeholder="no limit">
+          <div style="grid-column:1/-1" class="flex gap-2 items-center"><span class="field-hint" style="flex:1">An agent that reaches a limit is paused and its running turn stops. Raise the limit, then resume it. Tokens = input + output. An agent's own limit (Settings) overrides the per-agent limit.</span>
+            <button type="submit" class="btn primary">Save limits</button></div>
+        </form>
+      </div></div>
+    ${guardrails ? `<div class="card"><div class="card-header">Guardrails</div><div class="card-body">${guardrails}</div></div>` : ""}`;
 }
 
+function limitBar(used, limit) {
+  const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  return `<div class="usage-bar${pct >= 100 ? " over" : pct >= 80 ? " warn" : ""}" title="${pct}%"><div style="width:${pct}%"></div></div>`;
+}
+
+$("panel-stats").addEventListener("submit", (e) => {
+  if (e.target.id !== "limits-form") return;
+  e.preventDefault();
+  const sid = currentSid();
+  if (sid == null) return;
+  const f = e.target;
+  const limits = Object.fromEntries(["agent_tokens", "agent_cost_usd", "session_tokens", "session_cost_usd"].map((k) => [k, f[k].value === "" ? null : Number(f[k].value)]));
+  document.activeElement?.blur();
+  run(e.submitter, "Limits", () => api("session/limits", { session_id: sid, limits }));
+});
+
 $("panel-stats").addEventListener("click", (e) => {
+  const agentBtn = e.target.closest("[data-agent]");
+  if (agentBtn) { const slot = slotById(parseInt(agentBtn.dataset.slot, 10)); if (slot) agentAction(agentBtn.dataset.agent, slot, agentBtn); return; }
   const row = e.target.closest("[data-guardrail]");
   if (!row) return;
   const input = row.querySelector("[data-input]");
   const step = e.target.closest("[data-step]");
   if (step) { input.value = Math.max(0, Number(input.value) + Number(step.dataset.step)); input.focus(); return; }
-  const suggest = e.target.closest("[data-suggest]");
-  if (suggest) input.value = suggest.dataset.suggest;
-  if (suggest || e.target.closest("[data-set]")) {
+  if (e.target.closest("[data-set]")) {
     const sid = currentSid();
     if (sid == null) return;
     const value = Number(input.value);
@@ -1693,6 +1746,347 @@ $("panel-stats").addEventListener("click", (e) => {
     run(e.target, "Guardrail", () => api("guardrail", { session_id: sid, guardrail_id: id, value, reason: "Adjusted via web dashboard" })
       .then((g) => ({ message: `${g?.label ?? id} set to ${g?.current_value ?? value} ${g?.unit ?? ""}` })));
   }
+});
+
+// --- Agent settings: model, effort, approval mode, token limit ---
+
+const MODEL_SUGGESTIONS = {
+  claude: ["opus", "sonnet", "haiku", "fable", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"],
+  codex: ["gpt-5-codex", "gpt-5", "gpt-5-mini", "o3"],
+  gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+};
+const EFFORT_OPTIONS = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["minimal", "low", "medium", "high"], gemini: [] };
+const APPROVAL_MODES = [
+  ["bypass", "Fully autonomous", "Never asks. The agent reads, edits and runs commands on its own."],
+  ["auto", "Auto review", "The CLI's own reviewer approves safe steps; risky ones come to you. (Claude: auto mode · Codex: on-request)"],
+  ["accept_edits", "Auto-approve edits", "File edits go through; shell commands and other tools wait for you. (Claude; Codex asks for everything)"],
+  ["ask", "Ask me every step", "Every edit and command waits for your approval."],
+];
+const MODE_LABEL = Object.fromEntries(APPROVAL_MODES.map(([v, l]) => [v, l]));
+
+function slotSettingsOf(slot) {
+  let snap = {};
+  try { snap = JSON.parse(slot.context_snapshot ?? "{}") ?? {}; } catch {}
+  return {
+    model: typeof snap.model === "string" ? snap.model : "",
+    effort: typeof snap.effort === "string" ? snap.effort : "",
+    approval_mode: snap.approval_mode || "bypass",
+    token_limit: Number(snap.token_limit) > 0 ? Number(snap.token_limit) : 0,
+    limit_hit: typeof snap.limit_hit === "string" ? snap.limit_hit : "",
+  };
+}
+
+function settingsBadges(slot) {
+  const set = slotSettingsOf(slot);
+  return `${set.model ? `<span class="badge badge-mode" title="Model">${esc(set.model)}</span>` : ""}
+    ${set.approval_mode !== "bypass" ? `<span class="badge badge-review" title="Approval mode">${esc(MODE_LABEL[set.approval_mode] ?? set.approval_mode)}</span>` : ""}
+    ${set.limit_hit ? `<span class="badge badge-limit" title="${esc(set.limit_hit)}">limit reached</span>` : ""}`;
+}
+
+function usageLine(slot) {
+  const used = (slot.input_tokens ?? 0) + (slot.output_tokens ?? 0);
+  if (!used && !slot.cost_usd) return "";
+  const set = slotSettingsOf(slot);
+  const limit = set.token_limit || state.limits?.agent_tokens;
+  return `<div class="agent-ids">${fmtTokens(slot.input_tokens ?? 0)} in / ${fmtTokens(slot.output_tokens ?? 0)} out${slot.cost_usd ? ` · ${fmtUsd(slot.cost_usd)}` : ""}${limit ? ` · limit ${fmtTokens(limit)}` : ""}</div>
+    ${limit ? `<div style="margin-top:3px">${limitBar(used, limit)}</div>` : ""}`;
+}
+
+function modelFields(type, values = {}) {
+  const efforts = EFFORT_OPTIONS[type] ?? [];
+  return `<label>Model</label><div><input type="text" name="model" list="models-${type}" value="${esc(values.model ?? "")}" placeholder="default">
+      <datalist id="models-${type}">${(MODEL_SUGGESTIONS[type] ?? []).map((m) => `<option value="${m}">`).join("")}</datalist>
+      <div class="field-hint">An alias (opus, sonnet…) or a full model name.${type === "gemini" ? " Applies when the agent next starts." : " Applies to a running agent within seconds."}</div></div>
+    <label>Effort</label>${efforts.length
+      ? `<select name="effort"><option value="">default</option>${efforts.map((x) => `<option ${x === values.effort ? "selected" : ""}>${x}</option>`).join("")}</select>`
+      : '<span class="muted" style="font-size:12px">not available for this agent</span>'}`;
+}
+
+function approvalFields(type, current = "bypass") {
+  return `<div style="grid-column:1/-1">${APPROVAL_MODES.map(([v, l, d]) => {
+    const disabled = type === "gemini" && v !== "bypass";
+    return `<label class="mode-option${disabled ? " disabled" : ""}"><input type="radio" name="approval_mode" value="${v}" ${v === current ? "checked" : ""} ${disabled ? "disabled" : ""}><span><b>${l}</b><small>${d}</small></span></label>`;
+  }).join("")}${type === "gemini" ? '<div class="field-hint">Gemini agents run unattended (yolo); step approvals need Claude or Codex. Their steps still show in Activity.</div>' : ""}</div>`;
+}
+
+function settingsModal(sid, slot) {
+  const set = slotSettingsOf(slot);
+  openModal({
+    title: `Settings · ${slotName(slot)}`, sub: `${sessionSub(sid)} · ${slot.agent_type}`, submitLabel: "Save",
+    body: `<div class="form-grid">
+        ${modelFields(slot.agent_type, set)}
+        <label>Token limit</label><div><input type="number" name="token_limit" min="0" step="1000" value="${set.token_limit || ""}" placeholder="${state.limits?.agent_tokens ? `session default ${state.limits.agent_tokens}` : "no limit"}">
+          <div class="field-hint">Input + output tokens. When reached the agent is paused and its turn stops. Used so far: ${fmtTokens((slot.input_tokens ?? 0) + (slot.output_tokens ?? 0))}.</div></div>
+      </div>
+      <div class="section-label" style="margin-top:14px">Approvals</div>
+      <div class="form-grid">${approvalFields(slot.agent_type, set.approval_mode)}</div>`,
+    onSubmit: async (form) => {
+      const body = {
+        session_id: sid, slot_id: slot.id,
+        model: form.model.value.trim(),
+        approval_mode: form.querySelector("[name=approval_mode]:checked")?.value ?? "bypass",
+        token_limit: form.token_limit.value === "" ? null : Number(form.token_limit.value),
+      };
+      if (form.effort) body.effort = form.effort.value;
+      const r = await api("agents/settings", body);
+      toast(r?.message ?? "Saved", "ok");
+    },
+  });
+}
+
+$("act-settings").addEventListener("click", () => {
+  const slot = slotById(parseInt($("act-agent").value, 10)) ?? liveSlots()[0];
+  if (!slot) return toast("No agent selected", "warn");
+  const sid = currentSid();
+  if (sid != null) settingsModal(sid, slot);
+});
+
+// --- Approvals ---
+
+function approvalPreview(a) {
+  let input = {};
+  try { input = JSON.parse(a.input ?? "{}") ?? {}; } catch {}
+  if (a.tool === "Bash" || a.tool === "shell") return `<pre class="mono">${esc(input.command ?? "")}</pre>${input.description ? `<div class="field-hint">${esc(input.description)}</div>` : ""}`;
+  if (a.tool === "Edit" || a.tool === "MultiEdit") return editDiff(input);
+  if (a.tool === "Write") return `<div class="diff-file">${fileRef(input.file_path ?? "")}</div><pre class="diff">${(String(input.content ?? "")).split("\n").slice(0, 60).map((l) => `<span class="add">+${esc(l)}</span>`).join("")}</pre>`;
+  if (a.tool === "apply_patch" && Array.isArray(input.changes)) return changesDiff(input.changes);
+  return `<pre class="mono">${esc(JSON.stringify(input, null, 2))}</pre>`;
+}
+
+function renderApprovals() {
+  const pending = state.approvals ?? [];
+  $("badge-activity").textContent = pending.length ? `${pending.length}!` : "";
+  const banner = $("approval-banner");
+  // On the Activity tab the cards themselves are the reminder
+  if (!pending.length || activeTab === "activity") { banner.className = "hidden"; banner.innerHTML = ""; }
+  else {
+    banner.className = "approval-banner";
+    banner.innerHTML = `<b>&#9995; ${pending.length} step${pending.length === 1 ? "" : "s"} waiting for your approval</b><span class="dim">${esc(pending.slice(0, 3).map((a) => `${slotName(slotById(a.slot_id))}: ${a.title}`).join(" · "))}</span><span style="flex:1"></span><button class="btn small primary">Review</button>`;
+  }
+  const box = $("act-approvals");
+  if (busyRegion(box)) return;
+  const sig = pending.map((a) => a.id).join(",");
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.innerHTML = pending.map((a) => {
+    const slot = slotById(a.slot_id);
+    return `<div class="approval-card" data-approval="${a.id}">
+      <div class="approval-head">${avatar(slotName(slot), slotColor(a.slot_id))}
+        <div class="approval-title"><b>${esc(slotName(slot))}</b> wants to run <code>${esc(a.tool)}</code><div class="sub">${esc(a.title)} · ${timeSince(a.created_at)}</div></div></div>
+      <div class="approval-body">${approvalPreview(a)}</div>
+      <div class="approval-actions">
+        <input type="text" placeholder="Note to the agent (optional, sent with a denial)" data-note>
+        <button class="btn small danger" data-decide="deny">Deny</button>
+        <button class="btn small" data-decide="always" title="Allow this tool (for shell: this program) for the rest of the agent's session">Always allow</button>
+        <button class="btn small primary" data-decide="allow">Allow</button>
+      </div>
+    </div>`;
+  }).join("");
+  hydrateFileRefs(box);
+}
+
+$("approval-banner").addEventListener("click", () => switchTab("activity"));
+$("act-approvals").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-decide]");
+  if (!btn) return;
+  const sid = currentSid();
+  if (sid == null) return;
+  const card = btn.closest("[data-approval]");
+  const decision = btn.dataset.decide === "deny" ? "deny" : "allow";
+  const r = await run(btn, "Approval", () => api("approvals/decide", {
+    session_id: sid, approval_id: parseInt(card.dataset.approval, 10), decision,
+    always: btn.dataset.decide === "always", note: card.querySelector("[data-note]").value.trim(),
+  }));
+  if (r) { card.remove(); delete $("act-approvals").dataset.sig; }
+});
+
+// --- Activity timeline ---
+
+const activity = { sid: null, entries: [], lastId: 0, filterSig: "", rendered: 0, polling: false };
+
+function activityReset() {
+  Object.assign(activity, { sid: null, entries: [], lastId: 0, filterSig: "", rendered: 0 });
+  $("act-feed").innerHTML = "";
+}
+
+async function pollActivity() {
+  if (activity.polling || !state?.session || document.hidden) return;
+  if (activeTab !== "activity") return;
+  const sid = state.sessionId;
+  if (activity.sid !== sid) { activityReset(); activity.sid = sid; }
+  activity.polling = true;
+  try {
+    const q = new URLSearchParams({ session_id: sid, limit: activity.lastId ? "1000" : "600" });
+    if (activity.lastId) q.set("after_id", String(activity.lastId));
+    const res = await fetch(`/api/activity?${q}`);
+    const data = await res.json();
+    if (!data.ok || sid !== state?.sessionId) return;
+    if (data.result.length) {
+      activity.entries.push(...data.result);
+      activity.lastId = data.result[data.result.length - 1].id;
+      if (activity.entries.length > 3000) { activity.entries = activity.entries.slice(-2500); activity.filterSig = ""; }
+      renderActivity();
+    }
+  } catch { /* retried next tick */ } finally {
+    activity.polling = false;
+  }
+}
+setInterval(pollActivity, 1500);
+
+const STEP_ICON = { thinking: "&#128173;", tool_call: "&#128295;", command: "&#9002;", file_change: "&#9998;", approval: "&#9995;", status: "&#8226;", error: "&#9888;" };
+const TOOL_ICON = { Read: "&#128065;", Write: "&#128221;", Edit: "&#9998;", MultiEdit: "&#9998;", Bash: "&#9002;", shell: "&#9002;", Grep: "&#128269;", Glob: "&#128269;", WebFetch: "&#127760;", WebSearch: "&#127760;", Task: "&#129302;", Agent: "&#129302;", TodoWrite: "&#9745;" };
+
+function parseData(e) { try { return JSON.parse(e.data ?? "null") ?? {}; } catch { return {}; } }
+
+function lineDiff(oldText, newText) {
+  const a = String(oldText ?? "").split("\n"), b = String(newText ?? "").split("\n");
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const ctx = (l) => `<span class="ctx"> ${esc(l)}</span>`;
+  return [
+    ...a.slice(Math.max(0, pre - 2), pre).map(ctx),
+    ...a.slice(pre, a.length - suf).map((l) => `<span class="del">-${esc(l)}</span>`),
+    ...b.slice(pre, b.length - suf).map((l) => `<span class="add">+${esc(l)}</span>`),
+    ...a.slice(a.length - suf, a.length - suf + 2).map(ctx),
+  ].join("");
+}
+
+function editDiff(input) {
+  const edits = Array.isArray(input.edits) ? input.edits : [{ old_string: input.old_string, new_string: input.new_string }];
+  return `<div class="diff-file">${fileRef(input.file_path ?? "")}</div>${edits.map((ed) => `<pre class="diff">${lineDiff(ed.old_string, ed.new_string)}</pre>`).join("")}`;
+}
+
+function unifiedDiff(diff) {
+  return `<pre class="diff">${String(diff ?? "").split("\n").map((l) =>
+    l.startsWith("@@") ? `<span class="hunk">${esc(l)}</span>`
+    : l.startsWith("+") && !l.startsWith("+++") ? `<span class="add">${esc(l)}</span>`
+    : l.startsWith("-") && !l.startsWith("---") ? `<span class="del">${esc(l)}</span>`
+    : `<span class="ctx">${esc(l)}</span>`).join("")}</pre>`;
+}
+
+function changesDiff(changes) {
+  return changes.map((c) => `<div class="diff-file">${esc(c.kind ?? "update")} ${fileRef(c.path ?? "")}</div>${c.diff ? unifiedDiff(c.diff) : ""}`).join("");
+}
+
+function outputBlock(label, text, isErr) {
+  if (!text) return "";
+  return `<div class="result${isErr ? " err" : ""}"><div class="result-label">${esc(label)}</div><pre class="mono">${esc(text)}</pre></div>`;
+}
+
+function callBody(tool, input) {
+  if (tool === "Edit" || tool === "MultiEdit") return editDiff(input);
+  if (tool === "Write") return `<div class="diff-file">${fileRef(input.file_path ?? "")}</div><pre class="diff">${String(input.content ?? "").split("\n").slice(0, 200).map((l) => `<span class="add">+${esc(l)}</span>`).join("")}</pre>`;
+  if (tool === "Bash") return `<pre class="mono">${esc(input.command ?? "")}</pre>${input.description ? `<div class="field-hint">${esc(input.description)}</div>` : ""}`;
+  if (tool === "Read") return `<div>${fileRef(input.file_path ?? "")}${input.offset ? ` <span class="muted">from line ${esc(input.offset)}</span>` : ""}</div>`;
+  if (!input || !Object.keys(input).length) return "";
+  return `<pre class="mono">${esc(JSON.stringify(input, null, 2))}</pre>`;
+}
+
+function stepTitleHtml(title) {
+  // File names in a step title become links like in the chat
+  return inline(title);
+}
+
+/** One entry as HTML; tool results are appended to their call's element instead. */
+function stepHtml(e) {
+  const d = parseData(e);
+  const time = `<span class="step-time">${esc(fmtTime(new Date(e.ts).toISOString()))}</span>`;
+  switch (e.kind) {
+    case "thinking":
+      return `<details class="step thinking"><summary><span class="step-icon">${STEP_ICON.thinking}</span><span class="step-title">${esc(truncate((e.detail ?? e.title).replace(/\s+/g, " "), 160))}</span>${time}</summary>
+        ${e.detail ? `<div class="step-body"><div class="think-text">${esc(e.detail)}</div></div>` : ""}</details>`;
+    case "text":
+      return `<div class="step kind-text"><div class="rich">${renderMarkdown(e.detail ?? "", { chat: true })}</div></div>`;
+    case "tool_call": {
+      const body = callBody(d.tool, d.input ?? {});
+      return `<details class="step" data-tuid="${esc(d.tool_use_id ?? "")}"${d.tool === "Edit" || d.tool === "MultiEdit" ? " open" : ""}><summary><span class="step-icon">${TOOL_ICON[d.tool] ?? STEP_ICON.tool_call}</span><span class="step-title">${stepTitleHtml(e.title)}</span>${time}</summary>
+        <div class="step-body">${body}${e.detail ? outputBlock("Result", e.detail, d.status === "failed") : ""}</div></details>`;
+    }
+    case "tool_result":
+      return `<details class="step${d.is_error ? " err" : ""}"><summary><span class="step-icon">${d.is_error ? "&#9888;" : "&#8627;"}</span><span class="step-title">${esc(e.title)}</span>${time}</summary><div class="step-body"><pre class="mono">${esc(e.detail ?? "")}</pre></div></details>`;
+    case "command": {
+      const failed = d.exit_code !== undefined && d.exit_code !== null && d.exit_code !== 0;
+      return `<details class="step${failed ? " err" : ""}"><summary><span class="step-icon">${STEP_ICON.command}</span><span class="step-title">${esc(e.title)}${d.exit_code !== undefined && d.exit_code !== null ? ` <span class="muted">exit ${esc(d.exit_code)}</span>` : ""}</span>${time}</summary>
+        <div class="step-body">${outputBlock("Output", e.detail || "(no output)", failed)}</div></details>`;
+    }
+    case "file_change":
+      return `<details class="step" open><summary><span class="step-icon">${STEP_ICON.file_change}</span><span class="step-title">${stepTitleHtml(e.title)}</span>${time}</summary><div class="step-body">${changesDiff(d.changes ?? [])}</div></details>`;
+    case "approval":
+      return `<div class="act-note${d.allowed === false ? " err" : d.allowed ? " ok" : ""}"><span>&#9995; ${esc(e.title)}${e.detail ? ` — ${esc(e.detail)}` : ""}</span></div>`;
+    case "turn_end":
+      return `<div class="act-turn">${esc(e.title)}</div>`;
+    case "error":
+      return `<div class="act-note err"><span>&#9888; ${esc(e.title)}${e.detail ? ` — ${esc(e.detail)}` : ""}</span></div>`;
+    default:
+      return `<div class="act-note"><span>${esc(e.title)}</span></div>`;
+  }
+}
+
+function activityVisible(e, filter, showTeam, showThinking) {
+  if (filter && e.slot_id !== filter) return false;
+  if (!showThinking && e.kind === "thinking") return false;
+  if (!showTeam && (e.kind === "tool_call" || e.kind === "tool_result") && parseData(e).team) return false;
+  return true;
+}
+
+function renderActivity() {
+  const feed = $("act-feed");
+  if (!state?.session) { feed.innerHTML = '<div class="chat-empty">No session selected.</div>'; return; }
+  if (activity.sid !== state.sessionId) { void pollActivity(); return; }
+  const filter = $("act-agent").value ? parseInt($("act-agent").value, 10) : null;
+  const showTeam = $("act-team").checked, showThinking = $("act-thinking").checked;
+  const sig = `${filter}|${showTeam}|${showThinking}`;
+  const visible = activity.entries.filter((e) => activityVisible(e, filter, showTeam, showThinking));
+  $("act-count").textContent = `${visible.length} step${visible.length === 1 ? "" : "s"}`;
+  if (!activity.entries.length) {
+    feed.innerHTML = '<div class="chat-empty">No activity yet. Steps appear here as agents think, read, edit and run commands.<br><span class="muted" style="font-size:12px">Claude and Codex agents launched by multiagents report every step; Gemini reports its tool calls.</span></div>';
+    activity.filterSig = ""; activity.rendered = 0;
+    return;
+  }
+  const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+  let fresh;
+  if (sig !== activity.filterSig) {
+    activity.filterSig = sig;
+    feed.innerHTML = "";
+    activity.rendered = 0;
+    activity.lastSlot = null;
+    fresh = activity.entries;
+  } else {
+    fresh = activity.entries.slice(activity.rendered);
+  }
+  activity.rendered = activity.entries.length;
+  const frag = document.createElement("div");
+  for (const e of fresh) {
+    if (!activityVisible(e, filter, showTeam, showThinking)) continue;
+    if (e.kind === "tool_result") {
+      const d = parseData(e);
+      const call = d.tool_use_id ? feed.querySelector(`[data-tuid="${CSS.escape(d.tool_use_id)}"] .step-body`) ?? frag.querySelector(`[data-tuid="${CSS.escape(d.tool_use_id)}"] .step-body`) : null;
+      if (call) {
+        call.insertAdjacentHTML("beforeend", outputBlock(d.is_error ? "Error" : "Result", e.detail || "(empty)", d.is_error));
+        if (d.is_error) call.closest(".step").classList.add("err");
+        continue;
+      }
+    }
+    const slot = slotById(e.slot_id);
+    const head = activity.lastSlot !== e.slot_id
+      ? `<div class="act-who">${avatar(slotName(slot), slotColor(e.slot_id)).replace('class="avatar"', 'class="avatar" style="display:inline-grid;width:18px;height:18px;font-size:8px;border-radius:5px;vertical-align:-4px;background:' + slotColor(e.slot_id) + '"')} <b>${esc(slotName(slot))}</b> ${slot?.role ? `· ${esc(slot.role)}` : ""}</div>`
+      : "";
+    activity.lastSlot = e.slot_id;
+    frag.insertAdjacentHTML("beforeend", head + stepHtml(e));
+  }
+  while (frag.firstChild) feed.appendChild(frag.firstChild);
+  hydrateFileRefs(feed);
+  if (atBottom || fresh === activity.entries) { feed.scrollTop = feed.scrollHeight; $("act-jump").classList.add("hidden"); }
+  else if (fresh.length) $("act-jump").classList.remove("hidden");
+}
+
+for (const id of ["act-agent", "act-team", "act-thinking"]) $(id).addEventListener("change", () => { activity.filterSig = ""; renderActivity(); });
+$("act-jump").addEventListener("click", () => { const f = $("act-feed"); f.scrollTop = f.scrollHeight; $("act-jump").classList.add("hidden"); });
+$("act-feed").addEventListener("scroll", () => {
+  const f = $("act-feed");
+  if (f.scrollHeight - f.scrollTop - f.clientHeight < 80) $("act-jump").classList.add("hidden");
 });
 
 // --- Toolbar / global actions ---
@@ -1961,14 +2355,23 @@ async function addAgentModal(sid) {
       <label>Role description</label><textarea name="desc" rows="2" placeholder="Expertise, platform, constraints (optional)"></textarea>
       <label>Task / instruction</label><textarea name="task" rows="5" placeholder="What should this agent do first?"></textarea>
       <label>File ownership</label><input type="text" name="own" placeholder="optional: src/api/**, tests/**">
-    </div>${roleDatalist()}
+    </div>
+    <div class="section-label" style="margin-top:14px">Model &amp; approvals</div>
+    <div class="form-grid" data-settings>${modelFields(def)}${approvalFields(def)}</div>
+    ${roleDatalist()}
     <div class="field-hint" style="margin-top:8px">The agent runs under this dashboard (keep it open). Launching takes 15–60s before it connects.</div>`,
+    setup: (form) => form.type.addEventListener("change", () => {
+      form.querySelector("[data-settings]").innerHTML = modelFields(form.type.value) + approvalFields(form.type.value);
+    }),
     onSubmit: async (form) => {
       const body = {
         session_id: sid, agent_type: form.type.value, name: form.name.value.trim(), role: form.role.value.trim(),
         role_description: form.desc.value.trim(), initial_task: form.task.value.trim(),
         file_ownership: form.own.value.split(",").map((p) => p.trim()).filter(Boolean),
+        model: form.model.value.trim(),
+        approval_mode: form.querySelector("[name=approval_mode]:checked")?.value ?? "bypass",
       };
+      if (form.effort?.value) body.effort = form.effort.value;
       if (!body.name || !body.role || !body.initial_task) throw new Error("Name, role and task are required");
       if (avail[body.agent_type] === false) throw new Error(`${body.agent_type} CLI is not installed on this machine`);
       const r = await api("agents/add", body);
@@ -2014,6 +2417,10 @@ async function newTeamModal() {
       <input type="text" data-f="role" list="role-suggestions" placeholder="Role" value="${esc(a.role)}">
       <button type="button" class="icon-btn" data-remove-agent title="Remove">&#10005;</button>
     </div>
+    <div class="team-agent-row" style="grid-template-columns:1fr 1fr;margin-top:8px">
+      <input type="text" data-f="model" list="models-all" placeholder="model (default)" value="${esc(a.model ?? "")}">
+      <select data-f="approval_mode" title="Who approves this agent's steps">${APPROVAL_MODES.map(([v, l]) => `<option value="${v}" ${v === (a.approval_mode ?? "bypass") ? "selected" : ""}>${l}</option>`).join("")}</select>
+    </div>
     <textarea data-f="initial_task" rows="2" placeholder="Agent-specific task (optional — the team goal is shared with everyone)">${esc(a.initial_task)}</textarea>
   </div>`;
   openModal({
@@ -2033,7 +2440,8 @@ async function newTeamModal() {
       <label class="checkbox"><input type="checkbox" name="wf_approval" checked><span>Require reviewer approval<small>Work counts as finished only after an explicit approve.</small></span></label>
       <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_feedback" checked><span>Require actionable feedback before revision<small>Reviewers must say concretely what to change.</small></span></label>
       <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_human" checked><span>Pause for human approval before release<small>Human gate: once everything is approved the session waits for you (Approve &amp; Release / Send back) instead of ending itself.</small></span></label>
-      ${roleDatalist()}`,
+      ${roleDatalist()}
+      <datalist id="models-all">${Object.values(MODEL_SUGGESTIONS).flat().map((m) => `<option value="${m}">`).join("")}</datalist>`,
     setup: (form) => {
       const list = form.querySelector("[data-agents]");
       form.querySelector("[data-add-agent]").addEventListener("click", () => list.insertAdjacentHTML("beforeend", agentRow({ agent_type: fallback, name: "", role: "", initial_task: "" })));
@@ -2044,6 +2452,8 @@ async function newTeamModal() {
       const agents = [...form.querySelectorAll(".team-agent")].map((row) => {
         const a = {};
         row.querySelectorAll("[data-f]").forEach((f) => { a[f.dataset.f] = f.value.trim(); });
+        if (!a.model) delete a.model;
+        if (a.agent_type === "gemini") a.approval_mode = "bypass";
         return a;
       });
       if (!agents.length) throw new Error("Add at least one agent");
@@ -2101,6 +2511,7 @@ function fmtTokens(n) {
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
 }
+function fmtUsd(n) { return `$${(n ?? 0) < 1 ? (n ?? 0).toFixed(3) : (n ?? 0).toFixed(2)}`; }
 function fmtBytes(n) {
   if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GB`;
   if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;

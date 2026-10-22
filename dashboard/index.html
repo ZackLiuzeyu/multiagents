@@ -74,14 +74,16 @@
           </div>
         </div>
         <div id="gate-banner" class="hidden"></div>
+        <div id="approval-banner" class="hidden"></div>
 
         <div class="tabs" id="tab-bar">
           <div class="tab active" data-tab="chat">Chat <span class="tab-badge" id="badge-chat">0</span></div>
+          <div class="tab" data-tab="activity">Activity <span class="tab-badge" id="badge-activity"></span></div>
           <div class="tab" data-tab="agents">Agents <span class="tab-badge" id="badge-agents">0</span></div>
           <div class="tab" data-tab="plan">Plan <span class="tab-badge" id="badge-plan">-</span></div>
           <div class="tab" data-tab="knowledge">Knowledge <span class="tab-badge" id="badge-knowledge">0</span></div>
           <div class="tab" data-tab="files">Locks <span class="tab-badge" id="badge-files">0</span></div>
-          <div class="tab" data-tab="stats">Stats <span class="tab-badge" id="badge-stats"></span></div>
+          <div class="tab" data-tab="stats">Usage <span class="tab-badge" id="badge-stats"></span></div>
         </div>
 
         <!-- Chat -->
@@ -109,6 +111,21 @@
               </div>
             </div>
           </div>
+        </div>
+
+        <!-- Activity: what each agent is doing, step by step -->
+        <div class="view chat-view hidden" id="panel-activity">
+          <div class="chat-toolbar">
+            <select id="act-agent"><option value="">all agents</option></select>
+            <label class="checkbox" style="align-items:center"><input type="checkbox" id="act-team"> team messages</label>
+            <label class="checkbox" style="align-items:center"><input type="checkbox" id="act-thinking" checked> thinking</label>
+            <span class="spacer"></span>
+            <span id="act-count" class="muted"></span>
+            <button class="btn small" id="act-settings" title="Model, approvals and limits of the selected agent">Agent settings</button>
+          </div>
+          <div id="act-approvals"></div>
+          <div class="chat-scroll act-scroll" id="act-feed"></div>
+          <button class="jump-new hidden" id="act-jump" style="bottom:24px">Newest steps &#8595;</button>
         </div>
 
         <div class="view hidden" id="panel-agents"></div>

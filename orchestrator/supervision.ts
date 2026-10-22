@@ -8,6 +8,45 @@
 import type { DriverSlot } from "./delivery.ts";
 import type { PeekResult } from "../shared/types.ts";
 
+export interface UsageLimits {
+  /** input + output tokens per agent */
+  agent_tokens?: number;
+  agent_cost_usd?: number;
+  /** input + output tokens summed over the session's agents */
+  session_tokens?: number;
+  session_cost_usd?: number;
+}
+
+export interface SlotUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cost_usd?: number | null;
+}
+
+export function slotTokens(slot: SlotUsage): number {
+  return (slot.input_tokens ?? 0) + (slot.output_tokens ?? 0);
+}
+
+/**
+ * Why an agent must stop (a limit it reached), or null. `agentTokenLimit` is
+ * the agent's own limit when set, else the session's per-agent limit.
+ */
+export function limitVerdict(slot: SlotUsage, all: SlotUsage[], limits: UsageLimits, agentTokenLimit?: number): string | null {
+  const positive = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined);
+  const perAgent = positive(agentTokenLimit) ?? positive(limits.agent_tokens);
+  const tokens = slotTokens(slot);
+  if (perAgent && tokens >= perAgent) return `token limit reached (${tokens.toLocaleString("en-US")} / ${perAgent.toLocaleString("en-US")})`;
+  const agentCost = positive(limits.agent_cost_usd);
+  if (agentCost && (slot.cost_usd ?? 0) >= agentCost) return `cost limit reached ($${(slot.cost_usd ?? 0).toFixed(2)} / $${agentCost.toFixed(2)})`;
+  const sessionTokens = positive(limits.session_tokens);
+  const total = all.reduce((a, s) => a + slotTokens(s), 0);
+  if (sessionTokens && total >= sessionTokens) return `session token limit reached (${total.toLocaleString("en-US")} / ${sessionTokens.toLocaleString("en-US")})`;
+  const sessionCost = positive(limits.session_cost_usd);
+  const cost = all.reduce((a, s) => a + (s.cost_usd ?? 0), 0);
+  if (sessionCost && cost >= sessionCost) return `session cost limit reached ($${cost.toFixed(2)} / $${sessionCost.toFixed(2)})`;
+  return null;
+}
+
 /** Driver-managed agents per session; a slot holds at most one driver. */
 export class DriverRegistry {
   private bySession = new Map<string, Map<number, DriverSlot>>();

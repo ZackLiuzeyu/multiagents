@@ -15,11 +15,11 @@
 import { BrokerClient } from "../shared/broker-client.ts";
 import { DASHBOARD_REFRESH } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
-import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
+import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership, ApprovalRequest } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
 import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds } from "../orchestrator/runtime.ts";
 import { handleFs } from "./files.ts";
-import { handleControl, exportSession, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
+import { handleControl, exportSession, listActivity, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
 
 // --- Configuration ---
 
@@ -82,6 +82,10 @@ interface DashboardState {
   managed: boolean;
   humanGate: boolean;
   awaitingHuman: boolean;
+  /** Tool calls waiting for a person */
+  approvals: ApprovalRequest[];
+  /** Usage limits from the session config */
+  limits: Record<string, number>;
   timestamp: number;
 }
 
@@ -105,6 +109,8 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     managed: false,
     humanGate: false,
     awaitingHuman: false,
+    approvals: [],
+    limits: {},
     timestamp: Date.now(),
   };
 
@@ -120,7 +126,7 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
   if (!sessionId) return state;
 
   try {
-    const [session, slots, messages, guardrails, fileLocks, fileOwnership, plan, knowledge] = await Promise.all([
+    const [session, slots, messages, guardrails, fileLocks, fileOwnership, plan, knowledge, approvals] = await Promise.all([
       broker.getSession(sessionId).catch(() => null),
       broker.listSlots(sessionId).catch(() => []),
       broker.getMessageLog(sessionId, { limit: 200 }).catch(() => []),
@@ -129,6 +135,7 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
       broker.listFileOwnership(sessionId).catch(() => []),
       broker.getPlan(sessionId).catch(() => null),
       broker.listKnowledge(sessionId).catch(() => []),
+      broker.listApprovals(sessionId, "pending").catch(() => []),
     ]);
 
     // Get peers for slot enrichment
@@ -150,7 +157,12 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     state.peerCount = peers.length;
     state.managedSlots = managedSlotIds(sessionId);
     state.managed = isManagedSession(sessionId);
-    try { state.humanGate = JSON.parse(session?.config ?? "{}").human_gate === true; } catch { /* malformed config */ }
+    state.approvals = approvals;
+    try {
+      const config = JSON.parse(session?.config ?? "{}");
+      state.humanGate = config.human_gate === true;
+      state.limits = config.limits && typeof config.limits === "object" ? config.limits : {};
+    } catch { /* malformed config */ }
     state.awaitingHuman = awaitingHuman(session, slots);
   } catch (e) {
     console.error(`[web-dashboard] Fetch error: ${e}`);
@@ -337,6 +349,15 @@ const server = Bun.serve({
     if (url.pathname.startsWith("/api/fs/") && req.method === "GET") {
       try {
         return await handleFs(broker, url.pathname.slice("/api/fs/".length), url);
+      } catch (e) {
+        return apiError(e);
+      }
+    }
+
+    // API: activity timeline (incremental with after_id)
+    if (url.pathname === "/api/activity" && req.method === "GET") {
+      try {
+        return Response.json({ ok: true, result: await listActivity(controlCtx, url) });
       } catch (e) {
         return apiError(e);
       }

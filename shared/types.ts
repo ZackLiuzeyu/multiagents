@@ -128,6 +128,8 @@ export interface Slot {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  /** USD as reported by the CLI (Claude); 0 where the CLI reports none */
+  cost_usd: number;
 }
 
 export interface FileLock {
@@ -366,6 +368,8 @@ export interface UpdateSlotRequest {
   input_tokens?: number;
   output_tokens?: number;
   cache_read_tokens?: number;
+  /** Added to the slot's running cost */
+  cost_usd?: number;
 }
 
 // --- Lifecycle handoff requests ---
@@ -448,6 +452,63 @@ export interface AgentLaunchConfig {
   initial_task: string;
   file_ownership?: string[];
   report_to?: string;
+  /** Model name or alias for the CLI (claude: opus/sonnet/haiku…, codex: gpt-…, gemini: gemini-…). */
+  model?: string;
+  /** Reasoning effort (claude: low…max, codex: minimal…high). */
+  effort?: string;
+  /** Who approves the agent's tool calls; default "bypass" (fully autonomous). */
+  approval_mode?: ApprovalMode;
+}
+
+/**
+ * How an agent's tool calls are approved:
+ *   bypass       — never ask (fully autonomous)
+ *   auto         — the CLI's own reviewer decides; risky calls come to a person (Claude "auto", Codex "on-request")
+ *   accept_edits — file edits go through, commands and other tools ask (Claude only; Codex treats it like "ask")
+ *   ask          — every tool call waits for a person
+ */
+export type ApprovalMode = "bypass" | "auto" | "accept_edits" | "ask";
+
+/** One step of an agent's work as shown in the activity timeline. */
+export type ActivityKind =
+  | "thinking" | "text" | "tool_call" | "tool_result" | "command" | "file_change"
+  | "approval" | "turn_end" | "status" | "error";
+
+export interface ActivityEntry {
+  id: number;
+  session_id: string;
+  slot_id: number;
+  kind: ActivityKind;
+  title: string;
+  detail: string | null;
+  /** JSON: tool input, diff, exit code, usage… */
+  data: string | null;
+  ts: number;
+}
+
+export interface ActivityAddRequest {
+  session_id: string;
+  slot_id: number;
+  entries: Array<{ kind: ActivityKind; title: string; detail?: string | null; data?: unknown; ts?: number }>;
+}
+
+export type ApprovalStatus = "pending" | "allowed" | "denied" | "cancelled";
+
+export interface ApprovalRequest {
+  id: number;
+  session_id: string;
+  slot_id: number;
+  tool: string;
+  title: string;
+  /** JSON of the tool input */
+  input: string | null;
+  status: ApprovalStatus;
+  /** Allow this tool for the rest of the agent's session */
+  always: number;
+  note: string | null;
+  decided_by: string | null;
+  created_at: number;
+  decided_at: number | null;
 }
 
 export interface TeamConfig {
