@@ -1340,6 +1340,13 @@ function renderChat(force) {
   const firstRender = !lastChatSignature;
   lastChatSignature = sig;
 
+  const curSid = currentSid();
+  if (curSid && !$("composer-text").value) {
+    try {
+      const saved = localStorage.getItem(`multiagents:draft:composer:${curSid}`);
+      if (saved) { $("composer-text").value = saved; autosize(); }
+    } catch {}
+  }
   if (!state.session) {
     feed.innerHTML = `<div class="chat-empty">${state.brokerAlive ? `${tr("No session selected.")}<br><button class="btn primary" data-action="new-team" style="margin-top:12px">${tr("+ New Team")}</button>` : tr("Broker is not running.")}</div>`;
     $("chat-count").textContent = "";
@@ -1567,13 +1574,24 @@ async function sendComposer() {
   if (r) {
     ta.value = "";
     autosize();
+    try { localStorage.removeItem(`multiagents:draft:composer:${sid}`); } catch {}
     const f = $("msg-feed");
     f.scrollTop = f.scrollHeight;
   }
 }
 
 $("composer-send").addEventListener("click", sendComposer);
-$("composer-text").addEventListener("input", autosize);
+$("composer-text").addEventListener("input", () => {
+  autosize();
+  const sid = currentSid();
+  if (sid) {
+    try {
+      const val = $("composer-text").value;
+      if (val) localStorage.setItem(`multiagents:draft:composer:${sid}`, val);
+      else localStorage.removeItem(`multiagents:draft:composer:${sid}`);
+    } catch {}
+  }
+});
 $("composer-text").addEventListener("keydown", (e) => {
   // Enter sends; Shift+Enter is a new line; an IME composition (Chinese/Japanese input) is never cut off
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); sendComposer(); }
@@ -1677,6 +1695,13 @@ function slotSummary(slot) {
 function renderAgents() {
   const el = $("panel-agents");
   if (busyRegion(el)) return;
+  const curSid = currentSid();
+  if (curSid && !$("composer-text").value) {
+    try {
+      const saved = localStorage.getItem(`multiagents:draft:composer:${curSid}`);
+      if (saved) { $("composer-text").value = saved; autosize(); }
+    } catch {}
+  }
   if (!state.session) {
     el.innerHTML = `<div class="empty">${state.brokerAlive ? tr("No session selected.") : tr("Broker is not running.")}<br><button class="btn primary" data-action="new-team">${tr("+ New Team")}</button></div>`;
     return;
@@ -1729,6 +1754,13 @@ function renderAgents() {
 function renderRoster() {
   const el = $("rpanel-team");
   if ($("rpanel-team").classList.contains("hidden") || busyRegion(el)) return;
+  const curSid = currentSid();
+  if (curSid && !$("composer-text").value) {
+    try {
+      const saved = localStorage.getItem(`multiagents:draft:composer:${curSid}`);
+      if (saved) { $("composer-text").value = saved; autosize(); }
+    } catch {}
+  }
   if (!state.session) { el.innerHTML = `<div class="empty">${tr("No session selected")}</div>`; return; }
   if (!state.slots.length) { el.innerHTML = `<div class="empty">${tr("No agents yet")}<br><button class="btn primary" data-action="add-agent">${tr("+ Add Agent")}</button></div>`; return; }
   const order = (s) => (s.task_state === "released" ? 2 : s.status === "connected" ? 0 : 1);
@@ -2060,6 +2092,13 @@ $("ownership-form").addEventListener("submit", async (e) => {
 function renderStats() {
   const el = $("panel-stats");
   if (busyRegion(el)) return;
+  const curSid = currentSid();
+  if (curSid && !$("composer-text").value) {
+    try {
+      const saved = localStorage.getItem(`multiagents:draft:composer:${curSid}`);
+      if (saved) { $("composer-text").value = saved; autosize(); }
+    } catch {}
+  }
   if (!state.session) { el.innerHTML = `<div class="empty">${tr("No session selected")}</div>`; return; }
   const limits = state.limits ?? {};
   const totalIn = state.slots.reduce((a, s) => a + (s.input_tokens ?? 0), 0);
@@ -3091,6 +3130,17 @@ async function newTeamModal() {
   const fallback = ["claude", "codex", "gemini", "api"].find((t) => avail[t] !== false) ?? "claude";
   const pick = (t) => (avail[t] === false ? fallback : t);
   providersReturn = () => newTeamModal();
+
+  const DRAFT_KEY = "multiagents:draft:new-team";
+  let draft = null;
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY);
+    if (raw) draft = JSON.parse(raw);
+  } catch {}
+
+  const hasDraft = !!(draft && (draft.dir || draft.name || draft.goal || draft.plan || (draft.agents && draft.agents.length)));
+  const initialAgents = (hasDraft && draft.agents?.length) ? draft.agents : TEAM_PRESETS["Worker + Reviewer"];
+
   const providerSelect = (a) => `<select data-f="provider" class="api-only" ${pick(a.agent_type) === "api" ? "" : "hidden"} title="${esc(tr("Provider"))}">${apiProviders.map((p) => `<option value="${esc(p.id)}" ${p.id === a.provider ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>`;
   const agentRow = (a) => `<div class="team-agent">
     <div class="team-agent-row">
@@ -3104,32 +3154,84 @@ async function newTeamModal() {
       <input type="text" data-f="model" list="models-all" placeholder="model (default)" value="${esc(a.model ?? "")}">
       <select data-f="approval_mode" title="Who approves this agent's steps">${APPROVAL_MODES.map(([v, l]) => `<option value="${v}" ${v === (a.approval_mode ?? "bypass") ? "selected" : ""}>${tr(l)}</option>`).join("")}</select>
     </div>
-    <textarea data-f="initial_task" rows="2" placeholder="Agent-specific task (optional — the team goal is shared with everyone)">${esc(a.initial_task)}</textarea>
+    <textarea data-f="initial_task" rows="2" placeholder="Agent-specific task (optional — the team goal is shared with everyone)">${esc(a.initial_task ?? "")}</textarea>
   </div>`;
   openModal({
     title: "New team", submitLabel: "Start Team", wide: true,
-    body: `<div class="section-label">Project</div>
+    body: `<div id="new-team-draft-banner" class="draft-banner" style="display:${hasDraft ? "flex" : "none"};align-items:center;justify-content:space-between;background:var(--accent-dim,#2563eb18);border:1px solid var(--accent,#2563eb40);border-radius:6px;padding:7px 12px;margin-bottom:12px;font-size:12.5px;color:var(--text)">
+        <span>💾 ${tr("Draft restored from cache")}</span>
+        <button type="button" class="btn small" data-reset-draft style="margin:0;padding:2px 8px;font-size:11.5px">${tr("Clear draft")}</button>
+      </div>
+      <div class="section-label">Project</div>
       <div class="form-grid">
-        <label>Working directory</label><input type="text" name="dir" placeholder="/absolute/path/to/project (created if missing)" autofocus>
-        <label>Session name</label><input type="text" name="name" placeholder="e.g. 食物过敏论文 / Manuscript Revision">
-        <label>Team goal / prompt</label><textarea name="goal" rows="4" placeholder="What should the team achieve?"></textarea>
+        <label>Working directory</label><input type="text" name="dir" value="${esc(draft?.dir ?? "")}" placeholder="/absolute/path/to/project (created if missing)" autofocus>
+        <label>Session name</label><input type="text" name="name" value="${esc(draft?.name ?? "")}" placeholder="e.g. 食物过敏论文 / Manuscript Revision">
+        <label>Team goal / prompt</label><textarea name="goal" rows="4" placeholder="What should the team achieve?">${esc(draft?.goal ?? "")}</textarea>
       </div>
       <div class="section-label">Agents ${Object.keys(TEAM_PRESETS).map((p) => `<button type="button" class="btn small" data-preset="${esc(p)}">${esc(tr(p))}</button>`).join("")}</div>
-      <div data-agents>${TEAM_PRESETS["Worker + Reviewer"].map(agentRow).join("")}</div>
+      <div data-agents>${initialAgents.map(agentRow).join("")}</div>
       <button type="button" class="btn small" data-add-agent>+ Add agent</button>
       <button type="button" class="btn small" data-manage-providers>${tr("Manage providers…")}</button>
       <div class="section-label">Plan (optional)</div>
-      <textarea name="plan" rows="3" style="width:100%" placeholder="${esc(tr("One task per line. Prefix with an agent name and a colon to assign it, e.g. \"Claude Reviewer: Review the API\""))}"></textarea>
+      <textarea name="plan" rows="3" style="width:100%" placeholder="${esc(tr("One task per line. Prefix with an agent name and a colon to assign it, e.g. \"Claude Reviewer: Review the API\""))}">${esc(draft?.plan ?? "")}</textarea>
       <div class="section-label">Workflow</div>
-      <label class="checkbox"><input type="checkbox" name="wf_approval" checked><span>${tr("Require reviewer approval")}<small>${tr("Work counts as finished only after an explicit approve.")}</small></span></label>
-      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_feedback" checked><span>${tr("Require actionable feedback before revision")}<small>${tr("Reviewers must say concretely what to change.")}</small></span></label>
-      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_human" checked><span>${tr("Pause for human approval before release")}<small>${tr("Human gate: once everything is approved the session waits for you (Approve & Release / Send back) instead of ending itself.")}</small></span></label>
+      <label class="checkbox"><input type="checkbox" name="wf_approval" ${draft ? (draft.wf_approval ? "checked" : "") : "checked"}><span>${tr("Require reviewer approval")}<small>${tr("Work counts as finished only after an explicit approve.")}</small></span></label>
+      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_feedback" ${draft ? (draft.wf_feedback ? "checked" : "") : "checked"}><span>${tr("Require actionable feedback before revision")}<small>${tr("Reviewers must say concretely what to change.")}</small></span></label>
+      <label class="checkbox" style="margin-top:6px"><input type="checkbox" name="wf_human" ${draft ? (draft.wf_human ? "checked" : "") : "checked"}><span>${tr("Pause for human approval before release")}<small>${tr("Human gate: once everything is approved the session waits for you (Approve & Release / Send back) instead of ending itself.")}</small></span></label>
       ${roleDatalist()}
       <datalist id="models-all">${Object.values(MODEL_SUGGESTIONS).flat().map((m) => `<option value="${m}">`).join("")}</datalist>`,
     setup: (form) => {
       const list = form.querySelector("[data-agents]");
-      form.querySelector("[data-add-agent]").addEventListener("click", () => list.insertAdjacentHTML("beforeend", agentRow({ agent_type: fallback, name: "", role: "", initial_task: "" })));
-      list.addEventListener("click", (e) => { if (e.target.closest("[data-remove-agent]")) e.target.closest(".team-agent").remove(); });
+
+      const collectDraft = () => {
+        const agents = [...form.querySelectorAll(".team-agent")].map((row) => ({
+          agent_type: row.querySelector("[data-f=agent_type]")?.value || "",
+          provider: row.querySelector("[data-f=provider]")?.value || "",
+          name: row.querySelector("[data-f=name]")?.value || "",
+          role: row.querySelector("[data-f=role]")?.value || "",
+          model: row.querySelector("[data-f=model]")?.value || "",
+          approval_mode: row.querySelector("[data-f=approval_mode]")?.value || "bypass",
+          initial_task: row.querySelector("[data-f=initial_task]")?.value || "",
+        }));
+        return {
+          dir: form.dir?.value || "",
+          name: form.name?.value || "",
+          goal: form.goal?.value || "",
+          plan: form.plan?.value || "",
+          wf_approval: form.wf_approval?.checked ?? true,
+          wf_feedback: form.wf_feedback?.checked ?? true,
+          wf_human: form.wf_human?.checked ?? true,
+          agents,
+        };
+      };
+
+      const saveDraft = () => {
+        try {
+          const d = collectDraft();
+          const hasContent = d.dir || d.name || d.goal || d.plan || d.agents.some((a) => a.name || a.role || a.initial_task);
+          if (hasContent) {
+            localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...d, updated_at: Date.now() }));
+            const banner = form.querySelector("#new-team-draft-banner");
+            if (banner) banner.style.display = "flex";
+          }
+        } catch {}
+      };
+
+      form.addEventListener("input", saveDraft);
+      form.addEventListener("change", saveDraft);
+
+      form.querySelector("[data-add-agent]").addEventListener("click", () => {
+        list.insertAdjacentHTML("beforeend", agentRow({ agent_type: fallback, name: "", role: "", initial_task: "" }));
+        saveDraft();
+      });
+
+      list.addEventListener("click", (e) => {
+        if (e.target.closest("[data-remove-agent]")) {
+          e.target.closest(".team-agent").remove();
+          saveDraft();
+        }
+      });
+
       list.addEventListener("change", (e) => {
         const type = e.target.closest("[data-f=agent_type]");
         if (!type) return;
@@ -3138,7 +3240,26 @@ async function newTeamModal() {
         const model = row.querySelector("[data-f=model]");
         model.placeholder = type.value === "api" ? (providerById(row.querySelector("[data-f=provider]").value)?.default_model || tr("model name")) : tr("model (default)");
       });
-      form.querySelectorAll("[data-preset]").forEach((b) => b.addEventListener("click", () => { list.innerHTML = TEAM_PRESETS[b.dataset.preset].map(agentRow).join(""); }));
+
+      form.querySelectorAll("[data-preset]").forEach((b) => b.addEventListener("click", () => {
+        list.innerHTML = TEAM_PRESETS[b.dataset.preset].map(agentRow).join("");
+        saveDraft();
+      }));
+
+      form.querySelector("[data-reset-draft]")?.addEventListener("click", () => {
+        try { localStorage.removeItem(DRAFT_KEY); } catch {}
+        form.dir.value = "";
+        form.name.value = "";
+        form.goal.value = "";
+        form.plan.value = "";
+        form.wf_approval.checked = true;
+        form.wf_feedback.checked = true;
+        form.wf_human.checked = true;
+        list.innerHTML = TEAM_PRESETS["Worker + Reviewer"].map(agentRow).join("");
+        const banner = form.querySelector("#new-team-draft-banner");
+        if (banner) banner.style.display = "none";
+        toast(tr("Draft cleared"), "info");
+      });
     },
     onSubmit: async (form) => {
       const agents = [...form.querySelectorAll(".team-agent")].map((row) => {
@@ -3168,6 +3289,7 @@ async function newTeamModal() {
       if (!body.project_dir || !body.session_name) throw new Error("Working directory and session name are required");
       toast(tr("Starting team — agents take 15–60s to connect…"), "info");
       const r = await api("team/create", body);
+      try { localStorage.removeItem(DRAFT_KEY); } catch {}
       toast(tr("Team started: {id}", { id: r?.data?.session_id ?? body.session_name }), "ok");
     },
   });
@@ -3284,7 +3406,13 @@ async function selectSession(id) {
 
 $("session-name").addEventListener("click", openPicker);
 $("picker-overlay").addEventListener("click", (e) => { if (e.target.id === "picker-overlay") closePicker(); });
-$("modal-overlay").addEventListener("mousedown", (e) => { if (e.target.id === "modal-overlay") closeModal(); });
+$("modal-overlay").addEventListener("mousedown", (e) => {
+  if (e.target.id === "modal-overlay") {
+    const modal = $("modal-overlay").querySelector(".modal");
+    if (modal && modal.classList.contains("wide")) return;
+    closeModal();
+  }
+});
 $("picker-search").addEventListener("input", () => { pickerFocusIdx = 0; renderPicker(); });
 $("picker-list").addEventListener("click", (e) => {
   const item = e.target.closest(".picker-item");
