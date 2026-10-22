@@ -492,6 +492,20 @@ export interface ActivityAddRequest {
   entries: Array<{ kind: ActivityKind; title: string; detail?: string | null; data?: unknown; ts?: number }>;
 }
 
+/** What an agent is doing right now (in memory on the broker, not stored). */
+export interface LiveActivity {
+  busy: boolean;
+  /** waiting = between steps (the model is deciding what to do next) */
+  phase: "idle" | "waiting" | "thinking" | "writing" | "tool";
+  /** The thinking or reply being written, tail only */
+  text: string;
+  /** The tool step running (phase "tool") */
+  tool: string | null;
+  /** When the turn started (epoch ms) */
+  since: number | null;
+  updatedAt: number;
+}
+
 export type ApprovalStatus = "pending" | "allowed" | "denied" | "cancelled";
 
 export interface ApprovalRequest {

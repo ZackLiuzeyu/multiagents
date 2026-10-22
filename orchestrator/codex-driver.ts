@@ -64,6 +64,8 @@ export interface CodexTurnSettings {
   model?: string;
   /** Reasoning effort: minimal | low | medium | high */
   effort?: string;
+  /** Overrides the thread's sandbox for the next turns (Q&A mode: read-only) */
+  sandbox?: "read-only";
 }
 
 /** A command or file change waiting for approval (item/*\/requestApproval). */
@@ -378,6 +380,11 @@ export class CodexDriver {
     }
   }
 
+  /** Send any app-server request (account reads and the like) and wait for its result. */
+  request(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
+    return this.sendRequest(method, params, timeoutMs);
+  }
+
   async kill(): Promise<void> {
     if (!this._alive) return;
     this.stopHeartbeat();
@@ -397,6 +404,7 @@ export class CodexDriver {
     params = { ...params, approvalPolicy: this.settings.approvalPolicy };
     if (this.settings.model) params.model = this.settings.model;
     if (this.settings.effort) params.effort = this.settings.effort;
+    if (this.settings.sandbox) params.sandboxPolicy = sandboxPolicyObject(this.settings.sandbox);
     const turnMeta = await this.sendRequest("turn/start", params, 30_000) as {
       turn?: { id: string; status: string };
     };

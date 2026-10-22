@@ -28,6 +28,7 @@ log({ argv: args });
 const resumeIdx = args.indexOf("--resume");
 const sessionId = resumeIdx !== -1 ? args[resumeIdx + 1]! : `fake-session-${Math.random().toString(36).slice(2, 8)}`;
 const replay = args.includes("--replay-user-messages");
+const partial = args.includes("--include-partial-messages");
 const modelIdx = args.indexOf("--model");
 let model = modelIdx !== -1 ? args[modelIdx + 1]! : "fake-haiku";
 const modeIdx = args.indexOf("--permission-mode");
@@ -88,6 +89,16 @@ async function runTurn(msg: any): Promise<void> {
   }
 
   const think = text.match(/THINK:([^|]+)/);
+  if (think && partial) {
+    // Like the real host with --include-partial-messages: the block streams in word by word first
+    const stream = (event: unknown) => out({ type: "stream_event", event, session_id: sessionId, parent_tool_use_id: null });
+    stream({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } });
+    for (const word of think[1]!.trim().split(/(?<= )/)) {
+      stream({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: word } });
+      await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CLAUDE_DELTA_MS ?? 0)));
+    }
+    stream({ type: "content_block_stop", index: 0 });
+  }
   if (think) out({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: think[1]!.trim() }] } });
 
   for (const m of text.matchAll(/TOOL:(\w+):([^\s|]+)/g)) {
@@ -171,6 +182,21 @@ process.stdin.on("data", (chunk) => {
         interrupted = inTurn;
         for (const [id, w] of controlWaiters) { controlWaiters.delete(id); w({ behavior: "deny", message: "interrupted" }); }
         ok();
+      } else if (req.subtype === "get_usage") {
+        // FAKE_CLAUDE_USAGE=none: a login without claude.ai plan limits (API key)
+        const none = process.env.FAKE_CLAUDE_USAGE === "none";
+        ok({
+          session: { total_cost_usd: 0 },
+          subscription_type: none ? null : "max",
+          rate_limits_available: !none,
+          rate_limits: none ? null : {
+            five_hour: { utilization: 42, resets_at: "2030-01-01T05:00:00Z" },
+            seven_day: { utilization: 18.5, resets_at: "2030-01-06T00:00:00Z" },
+            seven_day_opus: { utilization: 7, resets_at: "2030-01-06T00:00:00Z" },
+            seven_day_sonnet: null,
+          },
+          behaviors: null,
+        });
       } else fail(`unsupported ${req.subtype}`);
       continue;
     }

@@ -242,6 +242,12 @@ A step that needs you shows up as a card with the exact command or diff: **Allow
 
 **Models, usage and limit locks.** The same Settings dialog switches an agent's model (an alias such as `opus`/`sonnet`, or a full name) and its effort. Claude switches live via `set_model`; Codex switches at its next turn; Gemini and Claude's effort switch at the agent's next start. The **Usage** tab shows tokens (input, output, cache reads) and Claude's reported cost per agent. There you can set limits per agent or for the whole session, in tokens or USD. An agent that reaches a limit is paused and its running turn is interrupted; raise the limit, then resume it.
 
+**Plan limits (5-hour / weekly).** The **Usage** tab starts with each CLI's subscription quota, read the way the CLIs' own `/usage` screens read it and without starting a model turn; the fullest window of each also shows in the top bar. Claude: the claude.ai plan's 5-hour window and weekly windows (all models, Opus, Sonnet, per-model ones), via Claude Code's `get_usage` control request. Codex: the ChatGPT plan's 5-hour (primary) and weekly (secondary) windows, via `account/rateLimits/read`. Gemini has no 5-hour or weekly windows; with a Google login it shows the daily per-model quota (Code Assist `retrieveUserQuota`, using the token Gemini CLI stored, only while it is valid). API-key logins have no plan windows and say so. Answers are cached for two minutes; **Refresh** asks again.
+
+**Talking to agents while they work.** Pick one agent under **To** and ask it anything: agents reply to you with `send_message(to_id="human")` and the answer lands in the chat. Tick **Interrupt** to stop what that agent is doing first, so it answers you right away. **Q&A mode** (session toolbar) puts the whole team on hold: every running turn stops, agents are told to wait and only answer you, edits and commands are refused (reading files stays allowed, so they can check before answering), and teammates' messages wait. Ask one agent, then another; **End Q&A** resumes everyone where they stopped, with the messages that waited.
+
+**Seeing an agent think.** While an agent works, the chat shows it under the last message: typing dots, what it is doing (thinking, writing a reply, running `$ bun test`…) and how long, and its thinking as it forms, token by token (Claude with `--include-partial-messages`, Codex reasoning summaries, Gemini replies). **Collapse** keeps it to a few lines.
+
 The tabs in the center hold everything else:
 
 - **Sessions** (sidebar): New Team, empty session, open, pause/resume, relaunch disconnected agents, export JSON, archive, end, delete (typed confirmation)
@@ -250,7 +256,7 @@ The tabs in the center hold everything else:
 - **Knowledge**: add, edit, delete entries by category
 - **Locks**: locks with holder and expiry, force unlock, reserve a file for an agent, assign ownership zones
 - **Activity**: the step-by-step timeline and pending approvals (see above)
-- **Usage**: tokens and cost per agent, limit locks, and guardrail steppers (changes logged as "Adjusted via web dashboard")
+- **Usage**: plan limits, tokens and cost per agent, limit locks, and guardrail steppers (changes logged as "Adjusted via web dashboard")
 
 **Human gate.** A team started from the browser can wait for you once every agent is approved: instead of ending itself, the session shows *Waiting for human approval* with **Approve & Release** and **Send back for revision** (actionable feedback to a worker, which restarts the review loop). Toggle it per session with the `human gate` chip; MCP's `create_team` takes `human_gate: true`.
 
@@ -321,6 +327,8 @@ multiagents/
 │   ├── orchestrator-server.ts  Orchestrator MCP server (stdio host of runtime.ts)
 │   ├── runtime.ts          Orchestrator runtime: tools, agent processes, supervision loops (shared with the web dashboard)
 │   ├── activity.ts         Activity timeline from each CLI's stream; tool approvals through the broker
+│   ├── live.ts             What each agent is doing right now (streamed thinking, typing indicator)
+│   ├── plan-usage.ts       Subscription plan limits of the CLIs (5-hour / weekly / daily)
 │   ├── claude-driver.ts    ClaudeDriver: long-lived `claude -p --input-format stream-json` session
 │   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
 │   ├── delivery.ts         Hands unacked messages to drivers, acks on confirmed hand-off

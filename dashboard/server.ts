@@ -15,10 +15,11 @@
 import { BrokerClient } from "../shared/broker-client.ts";
 import { DASHBOARD_REFRESH } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
-import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership, ApprovalRequest } from "../shared/types.ts";
+import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership, ApprovalRequest, LiveActivity } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
 import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds } from "../orchestrator/runtime.ts";
 import { handleFs } from "./files.ts";
+import { getPlanUsage } from "../orchestrator/plan-usage.ts";
 import { handleControl, exportSession, listActivity, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
 
 // --- Configuration ---
@@ -81,6 +82,10 @@ interface DashboardState {
   managedSlots: number[];
   managed: boolean;
   humanGate: boolean;
+  /** Q&A mode: the team's work is on hold while the person asks questions */
+  qaMode: boolean;
+  /** What each busy agent is doing right now, by slot id */
+  live: Record<string, LiveActivity>;
   awaitingHuman: boolean;
   /** Tool calls waiting for a person */
   approvals: ApprovalRequest[];
@@ -108,6 +113,8 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     managedSlots: [],
     managed: false,
     humanGate: false,
+    qaMode: false,
+    live: {},
     awaitingHuman: false,
     approvals: [],
     limits: {},
@@ -126,7 +133,7 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
   if (!sessionId) return state;
 
   try {
-    const [session, slots, messages, guardrails, fileLocks, fileOwnership, plan, knowledge, approvals] = await Promise.all([
+    const [session, slots, messages, guardrails, fileLocks, fileOwnership, plan, knowledge, approvals, live] = await Promise.all([
       broker.getSession(sessionId).catch(() => null),
       broker.listSlots(sessionId).catch(() => []),
       broker.getMessageLog(sessionId, { limit: 200 }).catch(() => []),
@@ -136,6 +143,7 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
       broker.getPlan(sessionId).catch(() => null),
       broker.listKnowledge(sessionId).catch(() => []),
       broker.listApprovals(sessionId, "pending").catch(() => []),
+      broker.listLiveActivity(sessionId).catch(() => ({})),
     ]);
 
     // Get peers for slot enrichment
@@ -158,9 +166,11 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     state.managedSlots = managedSlotIds(sessionId);
     state.managed = isManagedSession(sessionId);
     state.approvals = approvals;
+    state.live = live;
     try {
       const config = JSON.parse(session?.config ?? "{}");
       state.humanGate = config.human_gate === true;
+      state.qaMode = !!config.qa_mode;
       state.limits = config.limits && typeof config.limits === "object" ? config.limits : {};
     } catch { /* malformed config */ }
     state.awaitingHuman = awaitingHuman(session, slots);
@@ -359,6 +369,22 @@ const server = Bun.serve({
     if (url.pathname === "/api/activity" && req.method === "GET") {
       try {
         return Response.json({ ok: true, result: await listActivity(controlCtx, url) });
+      } catch (e) {
+        return apiError(e);
+      }
+    }
+
+    // API: what each agent is doing right now (polled fast while the chat is open)
+    if (url.pathname === "/api/live" && req.method === "GET") {
+      const id = url.searchParams.get("session_id");
+      if (!id) return Response.json({ ok: false, error: "session_id required" }, { status: 400 });
+      return Response.json({ ok: true, result: await broker.listLiveActivity(id).catch(() => ({})) });
+    }
+
+    // API: subscription plan limits of the CLIs (5-hour / weekly / daily windows)
+    if (url.pathname === "/api/plan-usage" && req.method === "GET") {
+      try {
+        return Response.json({ ok: true, result: await getPlanUsage({ refresh: url.searchParams.get("refresh") === "1" }) });
       } catch (e) {
         return apiError(e);
       }

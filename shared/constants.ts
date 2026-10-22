@@ -148,3 +148,10 @@ export const FLAP_WINDOW_MS = 5 * 60 * 1000; // 5 min window for flap detection
 export const FLAP_THRESHOLD = 3; // crashes in window before declaring flapping
 export const GUARDRAIL_CHECK_INTERVAL = 30_000; // 30s
 export const CONFLICT_CHECK_INTERVAL = 10_000; // 10s
+
+// --- The person at the dashboard ---
+
+/** Sender / recipient id of the person using the web dashboard. */
+export const HUMAN_SENDER = "human";
+/** How agents see that sender, with the id to reply to. */
+export const HUMAN_SENDER_LABEL = 'The human user (reply with send_message to_id="human")';

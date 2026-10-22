@@ -231,4 +231,13 @@ describe("CodexDriver approvals and turn settings", () => {
     expect(turns[0].approvalPolicy).toBe("never");
     expect(turns[1]).toMatchObject({ approvalPolicy: "untrusted", model: "gpt-5", effort: "high" });
   });
+
+  test("a read-only sandbox override (Q&A mode) reaches the next turn", async () => {
+    const { driver, dir, entries } = await spawnFake();
+    const first = await driver.startSession({ prompt: "warm up", cwd: dir });
+    driver.settings = { approvalPolicy: "untrusted", sandbox: "read-only" };
+    await driver.reply(first.threadId, "what is left?");
+    const turns = entries().filter((e) => e.request === "turn/start").map((e) => e.params);
+    expect(turns[1].sandboxPolicy).toMatchObject({ type: "readOnly" });
+  });
 });

@@ -45,6 +45,7 @@ import type {
   EditPlanItemRequest,
   ActivityAddRequest,
   ActivityEntry,
+  LiveActivity,
   ApprovalRequest,
 } from "./types.ts";
 
@@ -286,6 +287,15 @@ export class BrokerClient {
 
   listActivity(req: { session_id: string; slot_id?: number; after_id?: number; limit?: number }): Promise<ActivityEntry[]> {
     return this.post("/activity/list", req);
+  }
+
+  setLiveActivity(req: { session_id: string; slot_id: number; live: LiveActivity }): Promise<{ ok: boolean }> {
+    return this.post("/activity/live/set", req);
+  }
+
+  /** Live state per slot id of a session (stale entries from dead hosts read as idle). */
+  listLiveActivity(sessionId: string): Promise<Record<string, LiveActivity>> {
+    return this.post("/activity/live/list", { session_id: sessionId });
   }
 
   createApproval(req: { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }): Promise<ApprovalRequest> {

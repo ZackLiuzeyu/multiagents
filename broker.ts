@@ -20,7 +20,7 @@ import {
   DEFAULT_GUARDRAILS,
   CLEANUP_INTERVAL,
 } from "./shared/constants.ts";
-import { generatePeerId } from "./shared/utils.ts";
+import { generatePeerId, safeJsonParse } from "./shared/utils.ts";
 import { resolveBrokerPort } from "./shared/broker-url.ts";
 import type {
   RegisterRequest,
@@ -64,6 +64,7 @@ import type {
   KnowledgeDeleteRequest,
   ActivityAddRequest,
   ActivityEntry,
+  LiveActivity,
   ApprovalRequest,
   AddPlanItemRequest,
   EditPlanItemRequest,
@@ -674,7 +675,8 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResult {
   if (!toId) return { ok: false, error: "No target specified" };
 
   // Allow messages to "orchestrator" and driver-managed slots (no real peer_id)
-  const isSpecialTarget = toId === "orchestrator" || toId === "__orchestrator__" || toId.startsWith("__slot_");
+  // "human" is the person at the dashboard: its messages are read there, never polled
+  const isSpecialTarget = toId === "orchestrator" || toId === "__orchestrator__" || toId === "human" || toId.startsWith("__slot_");
 
   // Verify target exists (unless targeting orchestrator or driver-managed slot)
   if (!isSpecialTarget) {
@@ -719,7 +721,23 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   }
 
   const rows = (body.unclaimed_only ? selectUnclaimed : selectUnacked).all(body.id, peer?.slot_id ?? null) as Message[];
-  return { messages: handOff(rows, body.retain !== true) };
+  return { messages: handOff(qaFilter(peer?.slot_id ?? null, rows), body.retain !== true) };
+}
+
+const selectSlotSessionConfig = db.prepare(
+  "SELECT s.config AS config FROM slots sl JOIN sessions s ON s.id = sl.session_id WHERE sl.id = ?"
+);
+
+/**
+ * Q&A mode (session config `qa_mode`): the team's work is on hold and agents
+ * only hear the person and the orchestrator; teammates' messages wait (stay
+ * unclaimed) until the mode ends.
+ */
+function qaFilter(slotId: number | null, rows: Message[]): Message[] {
+  if (slotId === null || rows.length === 0) return rows;
+  const row = selectSlotSessionConfig.get(slotId) as { config: string | null } | null;
+  if (!safeJsonParse<Record<string, unknown>>(row?.config ?? "{}", {}).qa_mode) return rows;
+  return rows.filter((m) => m.from_id === "human" || m.from_id === "orchestrator" || m.from_id === "__orchestrator__");
 }
 
 /** Poll a slot's messages (driver-managed agents have no peer id). */
@@ -727,7 +745,7 @@ function handlePollBySlot(body: { slot_id: number; session_id?: string; retain?:
   const slot = db.query("SELECT paused FROM slots WHERE id = ?").get(body.slot_id) as { paused: number } | null;
   if (slot?.paused) return { messages: [], paused: true };
 
-  return { messages: handOff(selectUnackedBySlot.all(body.slot_id) as Message[], body.retain !== true) };
+  return { messages: handOff(qaFilter(body.slot_id, selectUnackedBySlot.all(body.slot_id) as Message[]), body.retain !== true) };
 }
 
 /**
@@ -1480,6 +1498,39 @@ function handleActivityAdd(body: ActivityAddRequest): { ok: boolean; added: numb
 }
 
 /** Oldest first; `after_id` pages forward, otherwise the latest `limit` entries. */
+// --- Live activity: what each agent is doing right now (memory only) ---
+
+/** A busy entry not refreshed this long ago belongs to a host that went away */
+const LIVE_STALE_MS = 60_000;
+const liveActivity = new Map<string, Map<number, LiveActivity>>();
+
+function handleLiveSet(body: { session_id: string; slot_id: number; live: LiveActivity }): { ok: boolean } {
+  if (!body.session_id || !Number.isInteger(body.slot_id) || !body.live || typeof body.live !== "object") throw new Error("session_id, slot_id and live required");
+  const live = body.live;
+  const entry: LiveActivity = {
+    busy: live.busy === true,
+    phase: ["idle", "waiting", "thinking", "writing", "tool"].includes(live.phase) ? live.phase : "waiting",
+    text: typeof live.text === "string" ? live.text.slice(-8_000) : "",
+    tool: typeof live.tool === "string" ? live.tool.slice(0, 500) : null,
+    since: typeof live.since === "number" ? live.since : null,
+    updatedAt: Date.now(),
+  };
+  let session = liveActivity.get(body.session_id);
+  if (!session) liveActivity.set(body.session_id, (session = new Map()));
+  if (entry.busy) session.set(body.slot_id, entry);
+  else session.delete(body.slot_id);
+  return { ok: true };
+}
+
+function handleLiveList(body: { session_id: string }): Record<string, LiveActivity> {
+  const out: Record<string, LiveActivity> = {};
+  const now = Date.now();
+  for (const [slotId, live] of liveActivity.get(body.session_id) ?? []) {
+    if (now - live.updatedAt < LIVE_STALE_MS) out[slotId] = live;
+  }
+  return out;
+}
+
 function handleActivityList(body: { session_id: string; slot_id?: number; after_id?: number; limit?: number }): ActivityEntry[] {
   const limit = Math.min(Math.max(body.limit ?? 300, 1), 2000);
   const cond = ["session_id = ?"];
@@ -1669,6 +1720,10 @@ Bun.serve({
           return Response.json(handleActivityAdd(body as ActivityAddRequest));
         case "/activity/list":
           return Response.json(handleActivityList(body as { session_id: string; slot_id?: number; after_id?: number; limit?: number }));
+        case "/activity/live/set":
+          return Response.json(handleLiveSet(body as { session_id: string; slot_id: number; live: LiveActivity }));
+        case "/activity/live/list":
+          return Response.json(handleLiveList(body as { session_id: string }));
         case "/approvals/create":
           return Response.json(handleApprovalCreate(body as { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }));
         case "/approvals/get": {

@@ -96,6 +96,8 @@ export function buildClaudeArgs(opts: ClaudeLaunchOptions): string[] {
     "--output-format", "stream-json",
     "--verbose",
     "--replay-user-messages",
+    // Thinking and replies stream token by token (stream_event), for the live view
+    "--include-partial-messages",
     "--permission-prompt-tool", "stdio",
     ...permissionArgs(opts.permissionMode ?? "bypassPermissions"),
     "--strict-mcp-config",
@@ -441,7 +443,8 @@ export class ClaudeDriver {
 
   private handleEvent(event: ClaudeEvent): void {
     this._lastActivity = Date.now();
-    if (this._history.length < 500) this._history.push(event);
+    // Token deltas are only of interest live; replaying them would crowd out the first turn's steps
+    if (this._history.length < 500 && event.type !== "stream_event") this._history.push(event);
     for (const listener of this._listeners) {
       try { listener(event); } catch { /* listener errors must not break the reader */ }
     }

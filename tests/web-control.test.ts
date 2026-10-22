@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { awaitingHuman, workflowInstructions } from "../dashboard/control.ts";
+import { formatForwardedMessages } from "../orchestrator/delivery.ts";
 import type { Session, Slot } from "../shared/types.ts";
 
 const BROKER_PORT = 17911;
@@ -70,6 +71,7 @@ beforeAll(async () => {
       MULTIAGENTS_NO_DASHBOARD: "1",
       MULTIAGENTS_CLAUDE_COMMAND: `bun ${FAKE_CLAUDE}`,
       MULTIAGENTS_LIMIT_CHECK_MS: "300",
+      FAKE_CLAUDE_DELTA_MS: "150",
       FAKE_CLAUDE_LOG: path.join(tmpDir, "fake-claude.log"),
     },
     stdout: "ignore",
@@ -436,5 +438,105 @@ describe("approvals, activity, settings and limits", () => {
     const session = await broker("/sessions/get", { id: SESSION });
     expect(JSON.parse(session.config).limits).toEqual({ session_tokens: 100000, agent_cost_usd: 2.5 });
     await api("session/limits", { session_id: SESSION, limits: {} });
+  });
+});
+
+describe("talking to agents: replies, interrupting, Q&A mode", () => {
+  test("an agent can reply to the person, and sees how to", async () => {
+    const r = await broker("/send-message", { from_id: "orchestrator", to_id: "human", text: "Progress: 3 of 5 done", session_id: SESSION });
+    expect(r.ok).toBe(true);
+    const text = formatForwardedMessages([{ id: 1, from_id: "human", from_slot_id: null, msg_type: "chat", text: "How far are you?" } as any], new Map());
+    expect(text).toContain('to_id="human"');
+  });
+
+  test("interrupt-and-ask marks the agent's turn to be stopped", async () => {
+    const before = Date.now();
+    const r = await api("messages/send", { session_id: SESSION, slot_id: slotB, text: "Stop and tell me what you're doing", interrupt: true });
+    expect(r.ok).toBe(true);
+    expect(JSON.parse((await broker("/slots/get", { id: slotB })).context_snapshot).interrupt_at).toBeGreaterThanOrEqual(before);
+  });
+
+  test("in Q&A mode agents only hear the person; teammates' messages wait", async () => {
+    await broker("/send-message", { from_id: "peer-teammate", to_slot_id: slotB, text: "teammate: please review", session_id: SESSION });
+    const on = await api("session/qa", { session_id: SESSION, enabled: true });
+    expect(on.ok).toBe(true);
+    expect(JSON.parse((await broker("/sessions/get", { id: SESSION })).config).qa_mode).toBeTruthy();
+    await api("messages/send", { session_id: SESSION, slot_id: slotB, text: "person: what is left?" });
+
+    const during = (await broker("/poll-by-slot", { slot_id: slotB, retain: true })).messages.map((m: any) => m.text);
+    expect(during.some((t: string) => t.startsWith("[HOLD — Q&A MODE]"))).toBe(true);
+    expect(during).toContain("person: what is left?");
+    expect(during).not.toContain("teammate: please review");
+
+    expect((await api("session/qa", { session_id: SESSION, enabled: false })).ok).toBe(true);
+    const after = (await broker("/poll-by-slot", { slot_id: slotB, retain: true })).messages.map((m: any) => m.text);
+    expect(after).toContain("teammate: please review");
+    expect(after.some((t: string) => t.startsWith("[RESUME]"))).toBe(true);
+    // Leave the inbox empty for later tests
+    await broker("/poll-by-slot", { slot_id: slotB });
+  });
+
+  test("Q&A mode stops a running turn and refuses edits and commands, not reads", async () => {
+    const r = await api("team/create", {
+      project_dir: path.join(tmpDir, "qa-team"),
+      session_name: "QA Team",
+      goal: "Work slowly",
+      agents: [{ agent_type: "claude", name: "Busy", role: "Software Engineer", initial_task: "SLEEP:6000" }],
+      workflow: {},
+    });
+    expect(r.ok).toBe(true);
+    const sid = r.result.data.session_id;
+    const [slot] = await broker("/slots/list", { session_id: sid });
+    const activity = async () => ((await (await fetch(`${DASHBOARD_URL}/api/activity?session_id=${encodeURIComponent(sid)}`)).json()) as any).result as any[];
+    await waitFor(async () => (await activity()).some((e) => e.title === "$ sleep 6000"), 15_000);
+
+    expect((await api("session/qa", { session_id: sid, enabled: true })).ok).toBe(true);
+    await waitFor(async () => (await activity()).some((e) => e.title === "Q&A mode — the running turn was interrupted"), 10_000);
+    // The interrupted turn ends (the fake finishes its sleep first), then the question starts a new one
+    await waitFor(async () => (await activity()).some((e) => e.kind === "turn_end"), 15_000);
+
+    await api("messages/send", { session_id: sid, slot_id: slot.id, text: "TOOL:Bash:rm-rf TOOL:Read:notes.md" });
+    const steps = await waitFor(async () => {
+      const list = await activity();
+      return list.some((e) => e.kind === "tool_result" && /notes\.md/.test(e.detail ?? "")) ? list : null;
+    }, 15_000);
+    expect(steps.some((e) => e.title === "Refused in Q&A mode · $ rm-rf")).toBe(true);
+    expect(steps.find((e) => e.kind === "tool_result" && /^denied:/.test(e.detail ?? ""))?.detail).toContain("Q&A mode");
+    expect(steps.find((e) => e.kind === "tool_result" && /notes\.md/.test(e.detail ?? ""))?.detail).toBe("ran Read notes.md");
+
+    expect((await api("session/qa", { session_id: sid, enabled: false })).ok).toBe(true);
+    expect((await api("session/end", { session_id: sid })).ok).toBe(true);
+  }, 60_000);
+});
+
+describe("live activity", () => {
+  test("an agent's thinking shows while it forms, and clears when the turn ends", async () => {
+    const r = await api("team/create", {
+      project_dir: path.join(tmpDir, "live-team"),
+      session_name: "Live Team",
+      goal: "Think out loud",
+      agents: [{ agent_type: "claude", name: "Thinker", role: "Researcher", initial_task: "THINK:first check the cohort size then compare the two filters carefully before editing |" }],
+      workflow: {},
+    });
+    expect(r.ok).toBe(true);
+    const sid = r.result.data.session_id;
+    const [slot] = await broker("/slots/list", { session_id: sid });
+    const live = async () => ((await (await fetch(`${DASHBOARD_URL}/api/live?session_id=${encodeURIComponent(sid)}`)).json()) as any).result;
+    const partial = await waitFor(async () => {
+      const l = (await live())[slot.id];
+      // Words streamed before the dashboard attached to the agent (its first turn starts at launch) may be missing
+      return l?.phase === "thinking" && l.text.includes("the cohort size") && !l.text.includes("before editing") ? l : null;
+    }, 20_000);
+    expect(partial.busy).toBe(true);
+    await waitFor(async () => !(await live())[slot.id], 20_000);
+    expect((await api("session/end", { session_id: sid })).ok).toBe(true);
+  }, 60_000);
+
+  test("a busy entry from a host that stopped refreshing it expires", async () => {
+    await broker("/activity/live/set", { session_id: SESSION, slot_id: slotA, live: { busy: true, phase: "thinking", text: "hm", tool: null, since: Date.now(), updatedAt: 0 } });
+    const list = await broker("/activity/live/list", { session_id: SESSION });
+    expect(list[slotA]).toMatchObject({ busy: true, text: "hm" });
+    await broker("/activity/live/set", { session_id: SESSION, slot_id: slotA, live: { busy: false, phase: "idle", text: "", tool: null, since: null, updatedAt: 0 } });
+    expect((await broker("/activity/live/list", { session_id: SESSION }))[slotA]).toBeUndefined();
   });
 });
