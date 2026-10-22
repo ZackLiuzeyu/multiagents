@@ -10,6 +10,17 @@
 
 "use strict";
 
+// A dashboard server started before an update serves the new page but not
+// files it doesn't know yet (i18n.js): run in English instead of stopping here.
+const STALE_SERVER = typeof tr !== "function";
+if (STALE_SERVER) {
+  const en = (s, vars) => String(s ?? "").replace(/\{(\w+)\}/g, (all, k) => (vars && k in vars ? String(vars[k] ?? "") : all));
+  Object.assign(window, {
+    tr: en, LANGS: { en: "English" }, getLang: () => "en", setLang: () => {}, locale: () => "en-US",
+    translateStatic: () => {}, translateTree: () => {},
+  });
+}
+
 let state = null;
 let activeTab = "chat";
 let ws = null;
@@ -2873,3 +2884,4 @@ switchRightTab(store.get("ma-rtab", "preview"));
 closePreview();
 renderTree();
 connectWs();
+if (STALE_SERVER) toast("This dashboard server is older than the page: stop the old dashboard process and start it again. / 网页服务是旧版本：请结束旧的 dashboard 进程后重新启动。", "error");
