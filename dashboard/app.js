@@ -2908,7 +2908,7 @@ document.addEventListener("click", (e) => {
 let modalClose = null;
 
 /** Open a modal. `onSubmit(form)` may throw to keep it open with the error shown; returning closes it. */
-function openModal({ title, sub, body, submitLabel = "OK", danger = false, wide = false, onSubmit, onCancel, setup }) {
+function openModal({ title, sub, body, submitLabel = "OK", cancelLabel = "Cancel", danger = false, wide = false, onSubmit, onCancel, setup }) {
   closeModal();
   const overlay = $("modal-overlay");
   overlay.innerHTML = `<form class="modal${wide ? " wide" : ""}" novalidate>
@@ -2916,7 +2916,7 @@ function openModal({ title, sub, body, submitLabel = "OK", danger = false, wide 
       <button type="button" class="icon-btn" data-close>&#10005;</button></div>
     <div class="modal-body">${body}</div>
     <div class="modal-footer"><span class="modal-error"></span>
-      <button type="button" class="btn" data-close>${tr("Cancel")}</button>
+      <button type="button" class="btn" data-close>${esc(tr(cancelLabel))}</button>
       <button type="submit" class="btn ${danger ? "solid-danger" : "primary"}">${esc(tr(submitLabel))}</button></div>
   </form>`;
   // Static labels, hints and placeholders of the body are translated in place
@@ -2963,10 +2963,10 @@ function sessionSub(sid) {
   return tr("Session: {name}", { name: s?.name && s.name !== sid ? `${s.name} (${sid})` : sid });
 }
 
-function confirmDialog({ title, message, confirmLabel = "Confirm", danger = false, sid, typeToConfirm }) {
+function confirmDialog({ title, message, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, sid, typeToConfirm }) {
   return new Promise((resolve) => {
     openModal({
-      title, sub: sid != null ? sessionSub(sid) : undefined, submitLabel: confirmLabel, danger,
+      title, sub: sid != null ? sessionSub(sid) : undefined, submitLabel: confirmLabel, cancelLabel, danger,
       body: `${message ?? ""}${typeToConfirm ? `<p class="dim" style="margin-top:10px">${tr("Type <b class=\"mono\">{text}</b> to confirm:", { text: esc(typeToConfirm) })}</p><input type="text" name="confirm" style="width:100%" autocomplete="off">` : ""}`,
       onSubmit: (form) => {
         if (typeToConfirm && form.confirm.value.trim() !== typeToConfirm) throw new Error(tr("The text does not match"));
@@ -3211,11 +3211,35 @@ async function newTeamModal() {
           const hasContent = d.dir || d.name || d.goal || d.plan || d.agents.some((a) => a.name || a.role || a.initial_task);
           if (hasContent) {
             localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...d, updated_at: Date.now() }));
-            const banner = form.querySelector("#new-team-draft-banner");
-            if (banner) banner.style.display = "flex";
           }
         } catch {}
       };
+
+      // 点叉叉或取消时询问是否保存草稿
+      form.querySelectorAll("[data-close]").forEach((b) => {
+        b.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          const d = collectDraft();
+          const hasContent = !!(d.dir || d.name || d.goal || d.plan || d.agents.some((a) => a.name || a.role || a.initial_task));
+          if (hasContent) {
+            const keep = await confirmDialog({
+              title: "Save draft?",
+              message: `<p>${tr("Would you like to keep your changes as a draft for next time?")}</p>`,
+              confirmLabel: "Save draft",
+              cancelLabel: "Discard",
+            });
+            if (keep) {
+              try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...d, updated_at: Date.now() })); } catch {}
+              toast(tr("Draft saved"), "info");
+            } else {
+              try { localStorage.removeItem(DRAFT_KEY); } catch {}
+            }
+          } else {
+            closeModal();
+          }
+        }, true);
+      });
 
       form.addEventListener("input", saveDraft);
       form.addEventListener("change", saveDraft);
