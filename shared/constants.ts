@@ -155,3 +155,11 @@ export const CONFLICT_CHECK_INTERVAL = 10_000; // 10s
 export const HUMAN_SENDER = "human";
 /** How agents see that sender, with the id to reply to. */
 export const HUMAN_SENDER_LABEL = 'The human user (reply with send_message to_id="human")';
+
+/**
+ * What this broker build can do, reported on /health. The broker is a daemon
+ * that keeps running old code across updates; a dashboard that misses a
+ * feature here offers to restart it. Add an entry with each new endpoint or
+ * behavior the dashboard depends on.
+ */
+export const BROKER_FEATURES = ["human-target", "qa-mode", "live-activity", "graceful-restart"] as const;

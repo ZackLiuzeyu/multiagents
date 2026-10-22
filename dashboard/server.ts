@@ -17,7 +17,7 @@ import { DASHBOARD_REFRESH } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership, ApprovalRequest, LiveActivity } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
-import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds } from "../orchestrator/runtime.ts";
+import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds, missingBrokerFeatures, restartBroker, brokerIsIdle } from "../orchestrator/runtime.ts";
 import { handleFs } from "./files.ts";
 import { getPlanUsage } from "../orchestrator/plan-usage.ts";
 import { handleControl, exportSession, listActivity, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
@@ -73,6 +73,8 @@ interface DashboardState {
   plan: PlanState | null;
   knowledge: Array<{ key: string; value: string; category: string; created_by_name: string | null; updated_at: number }>;
   brokerAlive: boolean;
+  /** Features the running broker lacks: it runs code from before an update */
+  brokerMissing: string[];
   brokerUrl: string;
   /** Every session on the broker, for the sidebar */
   sessions: Session[];
@@ -94,6 +96,13 @@ interface DashboardState {
   timestamp: number;
 }
 
+/** The broker's missing features: checked every 30s, and on every build while some are missing (a restart clears them). */
+let brokerCheck: { at: number; missing: string[] } = { at: 0, missing: [] };
+async function brokerMissingCached(): Promise<string[]> {
+  if (brokerCheck.missing.length || Date.now() - brokerCheck.at > 30_000) brokerCheck = { at: Date.now(), missing: await missingBrokerFeatures().catch(() => []) };
+  return brokerCheck.missing;
+}
+
 async function fetchState(sessionId: string | null): Promise<DashboardState> {
   const state: DashboardState = {
     sessionId,
@@ -107,6 +116,7 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
     plan: null,
     knowledge: [],
     brokerAlive: false,
+    brokerMissing: [],
     brokerUrl: BROKER_URL,
     sessions: [],
     peerCount: 0,
@@ -126,6 +136,7 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
   } catch {
     return state;
   }
+  state.brokerMissing = state.brokerAlive ? await brokerMissingCached() : [];
 
   if (!state.brokerAlive) return state;
 
@@ -481,6 +492,13 @@ const server = Bun.serve({
 // loops for the agents this dashboard launches
 try {
   await ensureBroker(broker);
+  // A broker left running from before an update lacks what this dashboard needs;
+  // with nobody connected it is restarted right away, otherwise the page offers it
+  const missing = await missingBrokerFeatures();
+  if (missing.length && await brokerIsIdle(broker)) {
+    console.error(`[web-dashboard] The broker runs older code (missing: ${missing.join(", ")}) and has no agents — restarting it`);
+    await restartBroker(broker);
+  }
 } catch (e) {
   console.error(`[web-dashboard] Broker unavailable: ${e instanceof Error ? e.message : e}`);
 }

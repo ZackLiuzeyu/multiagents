@@ -20,8 +20,10 @@ import {
   CONFLICT_CHECK_INTERVAL,
   FLAP_WINDOW_MS,
   STUCK_THRESHOLD_MS,
+  BROKER_FEATURES,
 } from "../shared/constants.ts";
-import { brokerUrl } from "../shared/broker-url.ts";
+import { brokerUrl, resolveBrokerPort } from "../shared/broker-url.ts";
+import { probeBrokerHealth, stopBrokerProcess } from "../cli/update.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, slotSettings } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
@@ -34,7 +36,7 @@ import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget, pauseAgent } from "./session-control.ts";
-import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox, limitVerdict, type UsageLimits } from "./supervision.ts";
+import { DriverRegistry, nonOverlapping, releaseVerdict, watchdogInbox, limitVerdict, deadSlotVerdict, type UsageLimits } from "./supervision.ts";
 import { LiveTracker } from "./live.ts";
 import { ActivityRecorder, awaitApproval, claudeActivity, codexActivity, geminiActivity, describeTool, isTeamTool, CLAUDE_PERMISSION_MODE, CODEX_APPROVAL_POLICY } from "./activity.ts";
 
@@ -470,6 +472,57 @@ function launchWebDashboard(sessionId: string, projectDir: string): void {
 }
 
 // --- Broker lifecycle ---
+
+/** Features this code relies on that the running broker lacks (it runs older code); [] when none or unknown. */
+export async function missingBrokerFeatures(): Promise<string[]> {
+  const health = await probeBrokerHealth(BROKER_URL);
+  if (!health) return [];
+  const have = new Set(health.features ?? []);
+  return BROKER_FEATURES.filter((f) => !have.has(f));
+}
+
+/**
+ * No agent uses the broker: no registered peer and no connected slot (driver-run
+ * Codex agents have a connected slot but no peer row). Unknown counts as busy.
+ */
+export async function brokerIsIdle(brokerClient: BrokerClient): Promise<boolean> {
+  try {
+    const peers = await brokerClient.listPeers({ scope: "machine", cwd: process.cwd(), git_root: null });
+    if (peers.length) return false;
+    for (const s of await brokerClient.listSessions()) {
+      if (s.status === "archived") continue;
+      if ((await brokerClient.listSlots(s.id)).some((slot) => slot.status === "connected")) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restart the broker on the code next to this file, leaving agents running.
+ * A normal stop (SIGTERM) makes the broker kill every registered agent; a
+ * restart instead asks it to just exit (SIGUSR2), or — for builds without that
+ * — ends it outright (SIGKILL; SQLite in WAL mode loses nothing committed).
+ * Agents' registrations, sessions and messages are in the database, so agents
+ * carry on with the new broker on the same port after a moment.
+ */
+export async function restartBroker(brokerClient: BrokerClient): Promise<void> {
+  const health = await probeBrokerHealth(BROKER_URL);
+  if (health) {
+    log(LOG_PREFIX, `Restarting the broker (pid ${health.pid ?? "?"}, ${health.peers} peer(s))`);
+    if (health.pid !== undefined) {
+      const graceful = process.platform !== "win32" && (health.features ?? []).includes("graceful-restart");
+      process.kill(health.pid, graceful ? "SIGUSR2" : "SIGKILL");
+    } else if (health.peers === 0) {
+      stopBrokerProcess(health, resolveBrokerPort());
+    } else {
+      throw new Error("The broker does not report its pid; stop it with `multiagents broker stop` once its agents are done");
+    }
+    for (let i = 0; i < 50 && await brokerClient.isAlive(); i++) await Bun.sleep(100);
+  }
+  await ensureBroker(brokerClient);
+}
 
 export async function ensureBroker(brokerClient: BrokerClient): Promise<void> {
   if (await brokerClient.isAlive()) {
@@ -1816,32 +1869,36 @@ export function startBackgroundLoops(brokerClient: BrokerClient): void {
     }
   }, GUARDRAIL_CHECK_INTERVAL);
 
-  // Dead slot auto-cleanup loop — every 60s, remove slots disconnected for >5 min
+  // Orphan slot cleanup — every 60s. Only slots whose agent connected but never
+  // worked are deleted (deadSlotVerdict): a finished agent (e.g. Gemini exits 0
+  // after approval) stays listed as offline until a person removes it.
   setInterval(async () => {
     const now = Date.now();
     for (const sessionId of activeProcesses.keys()) {
       try {
         const slots = await brokerClient.listSlots(sessionId);
+        if (!slots.some((s) => s.status === "disconnected")) continue;
+        const session = await brokerClient.getSession(sessionId);
+        const config = safeJsonParse<Record<string, unknown>>(session.config, {});
+        const sessionOnHold = session.status !== "active" || !!config.qa_mode
+          || (config.human_gate === true && slots.some((s) => s.task_state === "approved"));
+        const [messages, plan] = await Promise.all([
+          brokerClient.getMessageLog(sessionId, { limit: 1000 }).catch(() => null),
+          brokerClient.getPlan(sessionId).catch(() => null),
+        ]);
+        // Without the history, every slot counts as having taken part
+        if (!messages) continue;
+        const tookPart = new Set<number>([
+          ...messages.map((m) => m.from_slot_id).filter((id): id is number => id != null),
+          ...(plan?.items ?? []).map((i) => i.assigned_to_slot).filter((id): id is number => id != null),
+        ]);
         for (const slot of slots) {
-          if (slot.status !== "disconnected") continue;
-
-          // CRITICAL: Skip slots that have NEVER connected — they're still starting up.
-          // Without this check, last_disconnected is null → defaults to 0 → deadFor = now
-          // (billions of ms) → the slot looks dead for "54 years" → gets deleted immediately.
-          // This was THE bug that caused all starting agents to vanish from the dashboard.
-          if (!slot.last_connected) continue;
-
-          const disconnectedAt = slot.last_disconnected ?? slot.last_connected ?? now;
-          const deadFor = now - disconnectedAt;
-          if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
-
-          // Skip driver-managed slots — orchestrator controls their lifecycle
-          if (activeDrivers.has(sessionId, slot.id)) continue;
-
-          // Auto-cleanup: delete the dead slot
+          const verdict = deadSlotVerdict({ slot, driven: activeDrivers.has(sessionId, slot.id), tookPart: tookPart.has(slot.id), sessionOnHold, now });
+          if (verdict !== "delete") continue;
           try {
             await brokerClient.deleteSlot(slot.id);
-            log(LOG_PREFIX, `Auto-deleted dead slot ${slot.id} (${slot.display_name || slot.role}) — disconnected for ${Math.round(deadFor / 60000)}m`);
+            const deadFor = now - (slot.last_disconnected ?? slot.last_connected ?? now);
+            log(LOG_PREFIX, `Auto-deleted orphan slot ${slot.id} (${slot.display_name || slot.role}) — never worked, disconnected for ${Math.round(deadFor / 60000)}m`);
           } catch { /* best effort */ }
         }
       } catch { /* ok */ }

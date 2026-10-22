@@ -163,3 +163,37 @@ export function watchdogInbox(slot: { status: string; paused: boolean }, peek: P
   }
   return { count: peek.count, msg_types: peek.msg_types, oldest_at: peek.oldest_at };
 }
+
+// --- Dead slot cleanup ---
+
+/** A slot that has been disconnected this long may be an orphan */
+export const DEAD_SLOT_AFTER_MS = 5 * 60 * 1000;
+
+export interface DeadSlotInput {
+  slot: { status: string; task_state: string; last_connected: number | null; last_disconnected: number | null; paused?: boolean | number };
+  /** The slot's process is driven by this host (it controls the lifecycle) */
+  driven: boolean;
+  /** The slot ever sent a message or is assigned a plan item: it took part in the work */
+  tookPart: boolean;
+  /** The session is paused, waits on a person (human gate, Q&A) or is archived */
+  sessionOnHold: boolean;
+  now: number;
+}
+
+/**
+ * Whether the background loop may delete a disconnected slot. Only orphans go:
+ * an agent that connected, never started working and never took part. A slot
+ * whose agent worked — approved, done, released, or just in the middle of it —
+ * stays (shown as offline) until a person removes it, and nothing is deleted
+ * while the session is paused or waits on a person.
+ */
+export function deadSlotVerdict(input: DeadSlotInput): "keep" | "delete" {
+  const { slot } = input;
+  if (slot.status !== "disconnected") return "keep";
+  // Never connected: still starting up
+  if (!slot.last_connected) return "keep";
+  if (input.driven || input.sessionOnHold || slot.paused === true || slot.paused === 1) return "keep";
+  if (slot.task_state !== "idle" || input.tookPart) return "keep";
+  const disconnectedAt = slot.last_disconnected ?? slot.last_connected;
+  return input.now - disconnectedAt >= DEAD_SLOT_AFTER_MS ? "delete" : "keep";
+}

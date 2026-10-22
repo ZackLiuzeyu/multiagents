@@ -19,6 +19,7 @@ import {
   RECONNECT_RECAP_LIMIT,
   DEFAULT_GUARDRAILS,
   CLEANUP_INTERVAL,
+  BROKER_FEATURES,
 } from "./shared/constants.ts";
 import { generatePeerId, safeJsonParse } from "./shared/utils.ts";
 import { resolveBrokerPort } from "./shared/broker-url.ts";
@@ -1604,7 +1605,7 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, pid: process.pid, version: BROKER_VERSION });
+        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, pid: process.pid, version: BROKER_VERSION, features: BROKER_FEATURES });
       }
       return new Response("multiagents broker", { status: 200 });
     }
@@ -1951,3 +1952,13 @@ function shutdownBroker() {
 
 process.on("SIGINT", shutdownBroker);
 process.on("SIGTERM", shutdownBroker);
+
+// Restart (a newer build takes over): leave the agents running, they keep their
+// registrations in the database and talk to the next broker on the same port
+try {
+  process.on("SIGUSR2", () => {
+    console.error("[multiagents broker] exiting for a restart; agents stay up");
+    try { db.close(); } catch {}
+    process.exit(0);
+  });
+} catch { /* no SIGUSR2 on this platform */ }

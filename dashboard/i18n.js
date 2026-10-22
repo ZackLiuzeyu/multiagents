@@ -243,6 +243,13 @@ const ZH = {
 
   // --- Q&A mode and interrupting ---
   "Working": "处理中",
+  "Has not answered yet": "还没回复，正在处理",
+  "The broker runs older code": "broker 还在运行旧版本",
+  "It was started before an update, so replies to you, Q&A mode and the live thinking view do not work yet. Restarting it keeps sessions, messages and running agents.": "它是在更新之前启动的，所以 agent 回复你、问答模式和实时思考显示暂时都用不了。重启不会丢失会话和消息，正在运行的 agent 也不会被关掉。",
+  "Restart broker": "重启 broker",
+  "Restart the broker?": "重启 broker？",
+  "Sessions, messages and plans are stored on disk and stay. Running agents keep running; for a few seconds their requests to the broker fail and are retried.": "会话、消息和计划都保存在磁盘上，不会丢失。正在运行的 agent 会继续运行，只是有几秒钟连不上 broker，之后会自动重试。",
+  "Broker restarted": "broker 已重启",
   "Writing a reply": "正在写回复",
   "Running a tool": "正在执行工具",
   "Running {tool}": "正在执行 {tool}",
@@ -712,6 +719,8 @@ const RULES_ZH = [
   [/^Session "(.+)" permanently deleted\. Removed: (\d+) slot\(s\), (\d+) message\(s\), (\d+) plan\(s\)\.$/, (m) => `会话“${m[1]}”已永久删除。共删除 ${m[2]} 个席位、${m[3]} 条消息、${m[4]} 个计划。`],
   [/^Extended session duration to (.+)$/, (m) => `会话时长已延长至 ${m[1]}`],
   [/^Nothing to change$/, () => "没有需要修改的内容"],
+  [/^The broker still lacks: (.+)$/, (m) => `broker 仍缺少：${m[1]}`],
+  [/^JSON-RPC error: (.+)$/s, (m) => `JSON-RPC 错误：${m[1]}`],
   [/^A person denied this tool call\.?(?:: (.+))?$/s, (m) => `有人拒绝了此工具调用${m[1] ? `：${m[1]}` : "。"}`],
   [/^Paused by orchestrator$/, () => "已被调度器暂停"],
   [/^HTTP (\d+)$/, (m) => `HTTP ${m[1]}`],
