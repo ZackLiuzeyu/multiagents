@@ -20,8 +20,10 @@ import {
   CONFLICT_CHECK_INTERVAL,
   FLAP_WINDOW_MS,
   STUCK_THRESHOLD_MS,
+  BROKER_FEATURES,
 } from "../shared/constants.ts";
-import { brokerUrl } from "../shared/broker-url.ts";
+import { brokerUrl, resolveBrokerPort } from "../shared/broker-url.ts";
+import { probeBrokerHealth, stopBrokerProcess } from "../cli/update.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, slotSettings } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
@@ -470,6 +472,39 @@ function launchWebDashboard(sessionId: string, projectDir: string): void {
 }
 
 // --- Broker lifecycle ---
+
+/** Features this code relies on that the running broker lacks (it runs older code); [] when none or unknown. */
+export async function missingBrokerFeatures(): Promise<string[]> {
+  const health = await probeBrokerHealth(BROKER_URL);
+  if (!health) return [];
+  const have = new Set(health.features ?? []);
+  return BROKER_FEATURES.filter((f) => !have.has(f));
+}
+
+/**
+ * Restart the broker on the code next to this file, leaving agents running.
+ * A normal stop (SIGTERM) makes the broker kill every registered agent; a
+ * restart instead asks it to just exit (SIGUSR2), or — for builds without that
+ * — ends it outright (SIGKILL; SQLite in WAL mode loses nothing committed).
+ * Agents' registrations, sessions and messages are in the database, so agents
+ * carry on with the new broker on the same port after a moment.
+ */
+export async function restartBroker(brokerClient: BrokerClient): Promise<void> {
+  const health = await probeBrokerHealth(BROKER_URL);
+  if (health) {
+    log(LOG_PREFIX, `Restarting the broker (pid ${health.pid ?? "?"}, ${health.peers} peer(s))`);
+    if (health.pid !== undefined) {
+      const graceful = process.platform !== "win32" && (health.features ?? []).includes("graceful-restart");
+      process.kill(health.pid, graceful ? "SIGUSR2" : "SIGKILL");
+    } else if (health.peers === 0) {
+      stopBrokerProcess(health, resolveBrokerPort());
+    } else {
+      throw new Error("The broker does not report its pid; stop it with `multiagents broker stop` once its agents are done");
+    }
+    for (let i = 0; i < 50 && await brokerClient.isAlive(); i++) await Bun.sleep(100);
+  }
+  await ensureBroker(brokerClient);
+}
 
 export async function ensureBroker(brokerClient: BrokerClient): Promise<void> {
   if (await brokerClient.isAlive()) {

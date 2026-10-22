@@ -338,6 +338,7 @@ function render(force = false) {
   renderSessionBar();
   renderGateBanner();
   renderQaBanner();
+  renderBrokerBanner();
   renderApprovals();
   renderBadges();
   refreshAgentSelects();
@@ -1415,6 +1416,10 @@ function renderLive() {
   const busy = Object.entries(liveView.sid === state.sessionId ? liveView.data : {})
     .map(([id, l]) => ({ slot: slotById(Number(id)), l }))
     .filter(({ slot, l }) => slot && l.busy);
+  // Agents with no live report (another host, an older broker, an interactive CLI) still show
+  // they were asked something and have not answered yet
+  const reported = new Set(busy.map(({ slot }) => slot.id));
+  for (const w of awaitingReply()) if (!reported.has(w.slot.id)) busy.push(w);
   const keep = new Set(busy.map(({ slot }) => String(slot.id)));
   for (const row of [...el.children]) if (!keep.has(row.dataset.slot)) row.remove();
   for (const { slot, l } of busy) {
@@ -1432,7 +1437,7 @@ function renderLive() {
     }
     row.querySelector(".msg-name").textContent = slotName(slot);
     row.querySelector(".msg-role").textContent = slot.role ?? "";
-    const label = l.phase === "tool" && l.tool ? tr("Running {tool}", { tool: tr(l.tool) }) : tr(LIVE_PHASE[l.phase] ?? "Working");
+    const label = l.awaiting ? tr("Has not answered yet") : l.phase === "tool" && l.tool ? tr("Running {tool}", { tool: tr(l.tool) }) : tr(LIVE_PHASE[l.phase] ?? "Working");
     row.querySelector(".live-label").textContent = label;
     row.querySelector(".live-time").textContent = l.since ? fmtDuration(Date.now() - l.since) : "";
     const wrap = row.querySelector(".live-text-wrap");
@@ -1457,6 +1462,31 @@ liveView.el.addEventListener("click", (e) => {
   store.set("ma-live-expanded", liveView.expanded);
   renderLive();
 });
+
+const AWAIT_REPLY_MS = 20 * 60_000;
+const NOT_A_QUESTION = new Set(["system", "control", "rename", "role_assignment", "team_change", "approval", "release"]);
+
+/** Agents that got a message from you or a teammate after their own last message. */
+function awaitingReply() {
+  const lastIn = new Map(), lastOut = new Map();
+  for (const m of state.messages) {
+    const t = Date.parse(m.sent_at);
+    if (m.from_slot_id != null) lastOut.set(m.from_slot_id, Math.max(lastOut.get(m.from_slot_id) ?? 0, t));
+    const fromPerson = m.from_id === "human";
+    const fromTeammate = m.from_slot_id != null && m.from_slot_id !== m.to_slot_id;
+    if (m.to_slot_id != null && (fromPerson || fromTeammate) && !NOT_A_QUESTION.has(m.msg_type)) {
+      lastIn.set(m.to_slot_id, Math.max(lastIn.get(m.to_slot_id) ?? 0, t));
+    }
+  }
+  const out = [];
+  for (const [slotId, t] of lastIn) {
+    const slot = slotById(slotId);
+    if (!slot || slot.task_state === "released" || isPaused(slot) || slot.status !== "connected" && !(state.managedSlots ?? []).includes(slot.id)) continue;
+    if ((lastOut.get(slotId) ?? 0) >= t || Date.now() - t > AWAIT_REPLY_MS) continue;
+    out.push({ slot, l: { busy: true, phase: "waiting", text: "", tool: null, since: t, awaiting: true } });
+  }
+  return out;
+}
 
 /** Fast poll while the chat is open and someone is working (state pushes cover the rest). */
 async function pollLive() {
@@ -1581,6 +1611,15 @@ function renderSessionBar() {
   tb.querySelector('[data-action="add-agent"]').disabled = !has || archived;
   tb.querySelector('[data-action="release-menu"]').disabled = !has;
   tb.querySelector('[data-action="session-menu"]').disabled = !has;
+}
+
+function renderBrokerBanner() {
+  const el = $("broker-banner");
+  if (!state.brokerMissing?.length) { el.className = "hidden"; el.innerHTML = ""; return; }
+  el.className = "banner";
+  el.innerHTML = `<span class="banner-title">&#9888; ${tr("The broker runs older code")}</span>
+    <span class="dim">${tr("It was started before an update, so replies to you, Q&A mode and the live thinking view do not work yet. Restarting it keeps sessions, messages and running agents.")}</span>
+    <span class="toolbar"><button class="btn primary" data-action="broker-restart">${tr("Restart broker")}</button></span>`;
 }
 
 function renderQaBanner() {
@@ -2543,6 +2582,14 @@ document.addEventListener("click", (e) => {
 async function globalAction(action, btn) {
   if (action === "new-team") return newTeamModal();
   if (action === "new-session") return newSessionModal();
+  if (action === "broker-restart") {
+    const ok = await confirmDialog({
+      title: "Restart the broker?", confirmLabel: "Restart broker",
+      message: `<p>${tr("Sessions, messages and plans are stored on disk and stay. Running agents keep running; for a few seconds their requests to the broker fail and are retried.")}</p>`,
+    });
+    if (ok) await run(btn, "Restart broker", () => api("broker/restart", {}));
+    return;
+  }
   const sid = currentSid();
   if (sid == null) return;
   switch (action) {

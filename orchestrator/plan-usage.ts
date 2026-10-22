@@ -229,10 +229,13 @@ async function probeCodex(): Promise<PlanUsage> {
   let driver: CodexDriver | null = null;
   try {
     driver = await CodexDriver.spawn(tmpdir(), process.env, { command, timeoutMs: 15_000 });
-    const account = await driver.request("account/read", { refreshToken: false }, 15_000).catch(() => null) as { account?: { planType?: string; type?: string } | null } | null;
+    const account = await driver.request("account/read", { refreshToken: false }, 15_000)
+      .catch(() => driver!.request("account/read", null, 15_000))
+      .catch(() => null) as { account?: { planType?: string; type?: string } | null } | null;
     let answer: Record<string, any>;
     try {
-      answer = await driver.request("account/rateLimits/read", { excludeResetCreditDetails: true }, 20_000) as Record<string, any>;
+      // Older app-servers take no params here ("invalid type: map, expected unit"); null suits every version
+      answer = await driver.request("account/rateLimits/read", null, 20_000) as Record<string, any>;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (/auth/i.test(msg)) return result("codex", { note: "Sign in to Codex with ChatGPT to see its limits (an API key has none)." });

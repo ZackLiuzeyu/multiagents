@@ -12,7 +12,7 @@ import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentLaunchConfig, AgentType, ApprovalMode, KnowledgeCategory, Session, Slot } from "../shared/types.ts";
 import { safeJsonParse } from "../shared/utils.ts";
 import { createSessionRecord, exportSessionData } from "../shared/session-ops.ts";
-import { callOrchestratorTool, type ToolResult } from "../orchestrator/runtime.ts";
+import { callOrchestratorTool, restartBroker, missingBrokerFeatures, type ToolResult } from "../orchestrator/runtime.ts";
 import { controlSession, broadcastToTeam } from "../orchestrator/session-control.ts";
 import { detectAgent } from "../orchestrator/launcher.ts";
 import { HUMAN_SENDER } from "../shared/constants.ts";
@@ -214,6 +214,14 @@ const handlers: Record<string, Handler> = {
       availability = { at: Date.now(), result: Object.fromEntries(entries) };
     }
     return availability.result;
+  },
+
+  /** Restart a broker that runs code from before an update (data is in SQLite and survives). */
+  async "broker/restart"(ctx) {
+    await restartBroker(ctx.broker);
+    const missing = await missingBrokerFeatures();
+    if (missing.length) throw new ApiError(`The broker still lacks: ${missing.join(", ")}`, 500);
+    return { message: "Broker restarted" };
   },
 
   // ---- Sessions ----
