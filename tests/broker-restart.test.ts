@@ -72,3 +72,24 @@ test("restarting a current broker leaves its agents running and registered", asy
   expect(agent.killed || agent.exitCode !== null).toBe(false);
   agent.kill();
 }, 30_000);
+
+test("a broker counts as busy while a driver-run agent's slot is connected, even with no peer", async () => {
+  const runtime = new URL("../orchestrator/runtime.ts", import.meta.url).pathname;
+  const client = new URL("../shared/broker-client.ts", import.meta.url).pathname;
+  const post = (p: string, body: unknown) => fetch(`${URL_}${p}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json()) as Promise<any>;
+  // Drop the peer of the previous test so only the slot can make the broker busy
+  for (const p of await post("/list-peers", { scope: "machine", cwd: dir, git_root: null })) await post("/unregister", { id: p.id });
+  const idle = async () => {
+    const child = Bun.spawn(["bun", "-e", `
+      import { brokerIsIdle } from ${JSON.stringify(runtime)};
+      import { BrokerClient } from ${JSON.stringify(client)};
+      console.log(await brokerIsIdle(new BrokerClient(${JSON.stringify(URL_)})));
+      process.exit(0);`], { env, stdout: "pipe", stderr: "ignore" });
+    return (await new Response(child.stdout).text()).trim().split("\n").at(-1) === "true";
+  };
+  await post("/sessions/create", { id: "idle-check", name: "Idle check", project_dir: dir });
+  const slot = await post("/slots/create", { session_id: "idle-check", agent_type: "codex", display_name: "Codex" });
+  expect(await idle()).toBe(true);
+  await post("/slots/update", { id: slot.id, status: "connected" });
+  expect(await idle()).toBe(false);
+}, 30_000);

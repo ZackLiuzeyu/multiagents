@@ -17,7 +17,7 @@ import { DASHBOARD_REFRESH } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership, ApprovalRequest, LiveActivity } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
-import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds, missingBrokerFeatures, restartBroker } from "../orchestrator/runtime.ts";
+import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds, missingBrokerFeatures, restartBroker, brokerIsIdle } from "../orchestrator/runtime.ts";
 import { handleFs } from "./files.ts";
 import { getPlanUsage } from "../orchestrator/plan-usage.ts";
 import { handleControl, exportSession, listActivity, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
@@ -495,7 +495,7 @@ try {
   // A broker left running from before an update lacks what this dashboard needs;
   // with nobody connected it is restarted right away, otherwise the page offers it
   const missing = await missingBrokerFeatures();
-  if (missing.length && (await broker.listPeers({ scope: "machine", cwd: process.cwd(), git_root: null }).catch(() => [1])).length === 0) {
+  if (missing.length && await brokerIsIdle(broker)) {
     console.error(`[web-dashboard] The broker runs older code (missing: ${missing.join(", ")}) and has no agents — restarting it`);
     await restartBroker(broker);
   }

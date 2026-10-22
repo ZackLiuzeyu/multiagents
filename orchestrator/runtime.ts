@@ -482,6 +482,24 @@ export async function missingBrokerFeatures(): Promise<string[]> {
 }
 
 /**
+ * No agent uses the broker: no registered peer and no connected slot (driver-run
+ * Codex agents have a connected slot but no peer row). Unknown counts as busy.
+ */
+export async function brokerIsIdle(brokerClient: BrokerClient): Promise<boolean> {
+  try {
+    const peers = await brokerClient.listPeers({ scope: "machine", cwd: process.cwd(), git_root: null });
+    if (peers.length) return false;
+    for (const s of await brokerClient.listSessions()) {
+      if (s.status === "archived") continue;
+      if ((await brokerClient.listSlots(s.id)).some((slot) => slot.status === "connected")) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Restart the broker on the code next to this file, leaving agents running.
  * A normal stop (SIGTERM) makes the broker kill every registered agent; a
  * restart instead asks it to just exit (SIGUSR2), or — for builds without that
