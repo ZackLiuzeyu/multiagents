@@ -18,6 +18,7 @@ import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
 import { configureRuntime, ensureBroker, startBackgroundLoops, shutdownRuntime, isManagedSession, managedSlotIds } from "../orchestrator/runtime.ts";
+import { handleFs } from "./files.ts";
 import { handleControl, exportSession, awaitingHuman, ApiError, CONTROL_ACTIONS, HUMAN_ID, type ControlContext } from "./control.ts";
 
 // --- Configuration ---
@@ -273,6 +274,11 @@ function apiError(e: unknown): Response {
 
 const DASHBOARD_DIR = new URL(".", import.meta.url).pathname;
 const indexHtml = Bun.file(`${DASHBOARD_DIR}index.html`);
+// The UI's own assets (a fixed list: nothing else in the directory is served)
+const ASSETS: Record<string, string> = {
+  "/app.js": "text/javascript; charset=utf-8",
+  "/styles.css": "text/css; charset=utf-8",
+};
 
 const server = Bun.serve({
   port: WEB_DASHBOARD_PORT,
@@ -325,6 +331,15 @@ const server = Bun.serve({
         peers: peers.length,
         current_session: sessionId,
       });
+    }
+
+    // API: project files for the explorer and preview (read-only, inside the project dir)
+    if (url.pathname.startsWith("/api/fs/") && req.method === "GET") {
+      try {
+        return await handleFs(broker, url.pathname.slice("/api/fs/".length), url);
+      } catch (e) {
+        return apiError(e);
+      }
     }
 
     // API: session export (download)
@@ -381,7 +396,13 @@ const server = Bun.serve({
     // Serve index.html for root
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(indexHtml, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" },
+      });
+    }
+    const assetType = ASSETS[url.pathname];
+    if (assetType) {
+      return new Response(Bun.file(`${DASHBOARD_DIR}${url.pathname.slice(1)}`), {
+        headers: { "Content-Type": assetType, "Cache-Control": "no-cache" },
       });
     }
 

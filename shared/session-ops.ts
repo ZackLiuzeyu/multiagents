@@ -6,7 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { BrokerClient, type PlanState } from "./broker-client.ts";
 import { SESSION_DIR, SESSION_FILE } from "./constants.ts";
-import { getGitRoot, slugify } from "./utils.ts";
+import { getGitRoot, uniqueSessionId } from "./utils.ts";
 import type { Session, SessionFile } from "./types.ts";
 
 /**
@@ -21,13 +21,8 @@ export async function createSessionRecord(
   brokerPort: number,
 ): Promise<Session> {
   const gitRoot = await getGitRoot(projectDir);
-  let id = slugify(name);
-  const existing = new Set((await client.listSessions().catch(() => [] as Session[])).map((s) => s.id));
-  if (existing.has(id)) {
-    let i = 2;
-    while (existing.has(`${id}-${i}`)) i++;
-    id = `${id}-${i}`;
-  }
+  const existing = (await client.listSessions().catch(() => [] as Session[])).map((s) => s.id);
+  const id = uniqueSessionId(name, existing);
 
   const session = await client.createSession({ id, name, project_dir: projectDir, git_root: gitRoot });
 

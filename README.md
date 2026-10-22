@@ -219,21 +219,28 @@ Adjustable from the TUI dashboard (+/- keys), the web dashboard's Stats tab, or 
 multiagents web [session-id]
 ```
 
-Web control center on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator, and starts the broker itself when it is not running. Besides watching, you can run a team from the browser:
+Web control center on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator, and starts the broker itself when it is not running. Besides watching, you can run a team from the browser. The layout has three panes, and both side panes can be collapsed (`Ctrl+B` / `Ctrl+J`) and resized:
+
+- **Left: sessions and an explorer** of the session's project directory (read-only, refreshed while agents work; locked files show a lock).
+- **Center: the team chat.** Your messages sit on the right, the agents' on the left with avatar, role and message type (feedback, task complete, approval…). System notices are folded into small centered lines. Send to one agent or the whole team (Enter sends, Shift+Enter starts a new line, IME-safe). File names that agents mention become links once the file is found in the project.
+- **Right: file preview** (Markdown, code with line numbers, images, PDF, Word `.docx`, CSV, HTML in a sandbox, audio/video). It follows the open file as agents edit it. The **Team** tab lists every agent with quick actions.
+
+Light, dark, or follow the system: pick it from the theme button in the top bar.
+
+The tabs in the center hold everything else:
 
 - **Sessions** (sidebar): New Team, empty session, open, pause/resume, relaunch disconnected agents, export JSON, archive, end, delete (typed confirmation)
 - **Agents**: message, pause/resume, change role, rename, send back for revision, release, remove; Add Agent; Release all approved / Release all
-- **Messages**: live feed (`Human → agent` for what you send) with a composer for one agent or a broadcast to the team
 - **Plan**: add, edit, reassign, change status (pending / in progress / blocked / done), delete
 - **Knowledge**: add, edit, delete entries by category
-- **Files**: locks with holder and expiry, force unlock, reserve a file for an agent, assign ownership zones
+- **Locks**: locks with holder and expiry, force unlock, reserve a file for an agent, assign ownership zones
 - **Stats**: session metrics and guardrail steppers (changes logged as "Adjusted via web dashboard")
 
 **Human gate.** A team started from the browser can wait for you once every agent is approved: instead of ending itself, the session shows *Waiting for human approval* with **Approve & Release** and **Send back for revision** (actionable feedback to a worker, which restarts the review loop). Toggle it per session with the `human gate` chip; MCP's `create_team` takes `human_gate: true`.
 
 Teams and agents launched from the browser are supervised by the dashboard process (the same orchestrator runtime the MCP server runs), so keep `multiagents web` running while they work; stopping it stops them. Agents another orchestrator launched stay under that orchestrator. See [docs/web-control-center.md](docs/web-control-center.md) for the API.
 
-Responsive layout, keyboard shortcuts (`1-6` to switch tabs).
+On narrow screens the side panes become drawers. Keyboard shortcuts: `1-6` switch tabs.
 
 ## TUI Dashboard
 
@@ -319,7 +326,10 @@ multiagents/
 ├── dashboard/
 │   ├── server.ts           Web dashboard (Bun.serve + WebSocket, localhost:7900)
 │   ├── control.ts          Web control API (POST /api/*)
-│   └── index.html          Web dashboard UI
+│   ├── files.ts            Read-only project files for the explorer and preview (GET /api/fs/*)
+│   ├── index.html          Web dashboard layout
+│   ├── app.js              Web dashboard UI logic
+│   └── styles.css          Web dashboard themes and layout
 └── scripts/
     ├── version.ts          Version bump + release commit/tag
     ├── postinstall.ts      Configures MCP servers after install

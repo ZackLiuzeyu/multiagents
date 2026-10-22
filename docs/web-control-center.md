@@ -60,6 +60,21 @@ belongs to the named session. Human actions are sent as `human`.
 | Broker status | `GET /api/broker` | `BrokerClient` | `multiagents status` |
 | CLI availability | `GET /api/agents/available` | `detectAgent` (cached 5 min) | — |
 
+## Project files (explorer and preview)
+
+Read-only, scoped to the session's `project_dir`, all `GET` with `session_id`:
+
+| Endpoint | Returns |
+|---|---|
+| `/api/fs/list?path=` | Directory entries (folders first, `.git` hidden) |
+| `/api/fs/raw?path=[&download=1]` | The file, inline or as a download. HTML, SVG and XML get `Content-Security-Policy: sandbox` |
+| `/api/fs/resolve?path=` | The project path for a reference (`parser.ts` → `src/lib/parser.ts`), with size and mtime |
+| `/api/fs/check?ref=…&ref=…` | A batch of references from chat messages → project path or `null` |
+| `/api/fs/docx?path=` | A `.docx` rendered to HTML (headings, emphasis, lists, tables) |
+
+Paths are resolved with `realpath`, so neither `..` nor a symlink can reach outside the
+project. A file name only becomes a link in the chat once `check` has found it.
+
 ## Lifecycle and the human gate
 
 `idle → working → done_pending_review → addressing_feedback → approved → released`
