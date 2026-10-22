@@ -1066,6 +1066,8 @@ function avatar(name, color, extra = "", me = false) {
 const AGENT_ICONS = {
   claude: { bg: "#D97757", svg: '<svg viewBox="0 0 24 24" fill="#fff"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>' },
   gemini: { bg: "linear-gradient(135deg, #4285F4 0%, #8E75B2 60%, #D96570 100%)", svg: '<svg viewBox="0 0 24 24" fill="#fff"><path d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/></svg>' },
+  // Other (OpenAI-compatible API): a neutral plug; upload the provider's logo as an image if you like
+  api: { bg: "linear-gradient(135deg, #475569, #0e7f86)", svg: '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v5M15 3v5M6.5 8h11v3a5.5 5.5 0 0 1-11 0zM12 16.5V21"/></svg>' },
   codex: { bg: "#1f2328", svg: '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7l5 5-5 5M12.5 17H19"/></svg>' },
 };
 const AVATAR_COLORS = ["#2f6fde", "#8250df", "#1a7f37", "#bc4c00", "#cf222e", "#0e7f86", "#d4a72c", "#6e7781", "#D97757", "#1f2328"];
@@ -1706,7 +1708,7 @@ function renderAgents() {
     return `<div class="agent-card${slot.task_state === "approved" ? " approved" : ""}">
       <div class="agent-head">
         ${slotAvatar(slot, "", true)}
-        <div class="agent-title"><div class="agent-name">${esc(slotName(slot))}</div><div class="agent-role">${esc(slot.role ?? tr("no role"))} · ${esc(slot.agent_type)}</div></div>
+        <div class="agent-title"><div class="agent-name">${esc(slotName(slot))}</div><div class="agent-role">${esc(slot.role ?? tr("no role"))} · ${esc(agentTypeLabel(slot))}</div></div>
         ${connBadge(slot.status)}
       </div>
       <div class="agent-badges">
@@ -2076,7 +2078,7 @@ function renderStats() {
     const used = (slot.input_tokens ?? 0) + (slot.output_tokens ?? 0);
     const limit = set.token_limit || limits.agent_tokens;
     return `<tr>
-      <td><div class="flex items-center gap-2">${slotAvatar(slot)}<div><b>${esc(slotName(slot))}</b><div class="muted" style="font-size:11.5px">${esc(slot.agent_type)} · ${esc(set.model || tr("default model"))}${set.effort ? ` · ${esc(set.effort)}` : ""}</div></div></div></td>
+      <td><div class="flex items-center gap-2">${slotAvatar(slot)}<div><b>${esc(slotName(slot))}</b><div class="muted" style="font-size:11.5px">${esc(agentTypeLabel(slot))} · ${esc(set.model || tr("default model"))}${set.effort ? ` · ${esc(set.effort)}` : ""}</div></div></div></td>
       <td class="num">${fmtTokens(slot.input_tokens ?? 0)}</td>
       <td class="num">${fmtTokens(slot.output_tokens ?? 0)}</td>
       <td class="num muted">${fmtTokens(slot.cache_read_tokens ?? 0)}</td>
@@ -2235,7 +2237,155 @@ const MODEL_SUGGESTIONS = {
   codex: ["gpt-5-codex", "gpt-5", "gpt-5-mini", "o3"],
   gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 };
-const EFFORT_OPTIONS = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["minimal", "low", "medium", "high"], gemini: [] };
+const EFFORT_OPTIONS = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["minimal", "low", "medium", "high"], gemini: [], api: ["minimal", "low", "medium", "high"] };
+
+// --- API providers ("Other": any OpenAI-compatible API) ---
+
+let apiProviders = [];
+async function loadApiProviders() {
+  try { apiProviders = (await api("providers/list")) ?? []; } catch { apiProviders = []; }
+  return apiProviders;
+}
+function providerById(id) { return apiProviders.find((p) => p.id === id) ?? null; }
+
+/** Base URLs of well-known OpenAI-compatible services; anything else goes under Custom. */
+const PROVIDER_PRESETS = [
+  ["OpenAI", "https://api.openai.com/v1"],
+  ["DeepSeek", "https://api.deepseek.com"],
+  ["Qwen (DashScope)", "https://dashscope.aliyuncs.com/compatible-mode/v1"],
+  ["Kimi (Moonshot)", "https://api.moonshot.cn/v1"],
+  ["GLM (Zhipu)", "https://open.bigmodel.cn/api/paas/v4"],
+  ["OpenRouter", "https://openrouter.ai/api/v1"],
+  ["SiliconFlow", "https://api.siliconflow.cn/v1"],
+  ["Ollama (local)", "http://localhost:11434/v1"],
+];
+
+function providerModelsDatalist(p) {
+  return `<datalist id="models-api">${(p?.models ?? []).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>`;
+}
+
+/** Provider, model and effort fields of an API agent. */
+function apiModelFields(values = {}) {
+  const current = values.provider_id || apiProviders[0]?.id || "";
+  const p = providerById(current);
+  const options = apiProviders.map((x) => `<option value="${esc(x.id)}" ${x.id === current ? "selected" : ""}>${esc(x.name)}</option>`).join("");
+  return `<label>${tr("Provider")}</label><div class="flex gap-2 items-center">
+      ${apiProviders.length ? `<select name="provider" ${values.lockProvider ? "disabled" : ""}>${options}</select>` : `<span class="muted" style="font-size:12px">${tr("No API provider yet")}</span>`}
+      ${values.lockProvider ? "" : `<button type="button" class="btn small" data-manage-providers>${tr("Manage providers…")}</button>`}</div>
+    <label>${tr("Model")}</label><div><input type="text" name="model" list="models-api" value="${esc(values.model ?? "")}" placeholder="${esc(p?.default_model || tr("model name"))}">
+      ${providerModelsDatalist(p)}
+      <div class="field-hint">${tr("Applies to a running agent from its next step.")}</div></div>
+    <label>${tr("Effort")}</label><div><select name="effort"><option value="">${tr("default")}</option>${EFFORT_OPTIONS.api.map((x) => `<option value="${x}" ${x === values.effort ? "selected" : ""}>${tr(x)}</option>`).join("")}</select>
+      <div class="field-hint">${tr("Sent as reasoning_effort; keep the default if the provider does not support it.")}</div></div>`;
+}
+
+// Switching the provider in a form refreshes its model suggestions
+document.addEventListener("change", (e) => {
+  const sel = e.target.closest?.("select[name=provider], select[data-f=provider]");
+  if (!sel) return;
+  const p = providerById(sel.value);
+  const scope = sel.closest(".team-agent, form");
+  const model = scope?.querySelector("[name=model], [data-f=model]");
+  if (model) model.placeholder = p?.default_model || tr("model name");
+  const dl = scope?.querySelector("#models-api");
+  if (dl) dl.outerHTML = providerModelsDatalist(p);
+});
+
+/** Where "Manage providers…" returns to once the providers dialog closes */
+let providersReturn = null;
+document.addEventListener("click", (e) => {
+  if (!e.target.closest?.("[data-manage-providers]")) return;
+  e.preventDefault();
+  providersModal(providersReturn);
+});
+
+async function providersModal(onBack) {
+  await loadApiProviders();
+  const list = apiProviders.length
+    ? apiProviders.map((p) => `<div class="provider-row" data-provider="${esc(p.id)}">
+        <div class="provider-info"><b>${esc(p.name)}</b> <span class="mono muted">${esc(p.base_url)}</span>
+          <div class="field-hint">${tr("Key")}: ${esc(p.api_key_hint || tr("none"))}${p.default_model ? ` · ${tr("default model")}: ${esc(p.default_model)}` : ""}${p.models?.length ? ` · ${tr("{n} models", { n: p.models.length })}` : ""}</div></div>
+        <button type="button" class="btn small" data-edit-provider>${tr("Edit")}</button>
+        <button type="button" class="btn small danger" data-delete-provider>${tr("Delete")}</button>
+      </div>`).join("")
+    : `<div class="muted" style="padding:6px 0 10px">${tr("No API provider yet. Pick a preset or fill in any OpenAI-compatible endpoint.")}</div>`;
+  let back = true;
+  openModal({
+    title: "API providers", submitLabel: "Save provider", wide: true,
+    body: `<div class="field-hint" style="margin-bottom:8px">${tr("Any service with an OpenAI-compatible chat API can run an agent: DeepSeek, Qwen, Kimi, GLM, OpenRouter, a local Ollama… Keys stay on this computer (~/.multiagents/providers.json) and are never sent to the page.")}</div>
+      <div class="provider-list">${list}</div>
+      <div class="section-label">${tr("Add or edit")} <span style="text-transform:none;letter-spacing:0;font-weight:400">${PROVIDER_PRESETS.map(([n, u]) => `<button type="button" class="btn small" data-preset-provider="${esc(u)}" data-name="${esc(n)}">${esc(n)}</button>`).join(" ")}</span></div>
+      <input type="hidden" name="pid">
+      <div class="form-grid">
+        <label>Name</label><input type="text" name="pname" placeholder="DeepSeek">
+        <label>Base URL</label><div><input type="text" name="base_url" placeholder="https://api.example.com/v1"><div class="field-hint">${tr("The address before /chat/completions.")}</div></div>
+        <label>API key</label><div><input type="password" name="api_key" autocomplete="off" placeholder="sk-…"><div class="field-hint">${tr("Or $NAME to read it from an environment variable. Leave empty to keep the saved key; local servers need none.")}</div></div>
+        <label>Default model</label><div class="flex gap-2"><input type="text" name="default_model" list="models-api" placeholder="${esc(tr("model name"))}" style="flex:1"><button type="button" class="btn small" data-fetch-models>${tr("Fetch models")}</button></div>
+        <label>Price (USD / 1M tokens)</label><div class="flex gap-2"><input type="number" name="input_price" min="0" step="0.01" placeholder="${esc(tr("input"))}"><input type="number" name="output_price" min="0" step="0.01" placeholder="${esc(tr("output"))}"></div>
+        <label>Context window</label><input type="number" name="context_tokens" min="1000" step="1000" placeholder="64000">
+        <label>Extra request fields</label><div><textarea name="extra_body" rows="2" placeholder='{"enable_search": true}'></textarea><div class="field-hint">${tr("JSON merged into every request, for provider options such as Qwen's built-in web search.")}</div></div>
+      </div>
+      <datalist id="models-api"></datalist>`,
+    setup: (form) => {
+      const fill = (p) => {
+        form.pid.value = p.id ?? "";
+        form.pname.value = p.name ?? "";
+        form.base_url.value = p.base_url ?? "";
+        form.api_key.value = "";
+        form.api_key.placeholder = p.api_key_hint ? tr("saved: {hint}", { hint: p.api_key_hint }) : "sk-…";
+        form.default_model.value = p.default_model ?? "";
+        form.input_price.value = p.input_price ?? "";
+        form.output_price.value = p.output_price ?? "";
+        form.context_tokens.value = p.context_tokens ?? "";
+        form.extra_body.value = p.extra_body ? JSON.stringify(p.extra_body) : "";
+        form.querySelector("#models-api").outerHTML = providerModelsDatalist(p);
+        form.pname.focus();
+      };
+      form.addEventListener("click", async (e) => {
+        const preset = e.target.closest("[data-preset-provider]");
+        if (preset) return fill({ name: preset.dataset.name, base_url: preset.dataset.presetProvider });
+        const row = e.target.closest("[data-provider]");
+        if (row && e.target.closest("[data-edit-provider]")) return fill(providerById(row.dataset.provider) ?? {});
+        if (row && e.target.closest("[data-delete-provider]")) {
+          const p = providerById(row.dataset.provider);
+          back = false;
+          if (await confirmDialog({ title: tr("Delete {name}?", { name: p?.name ?? "" }), message: `<p>${tr("Agents already running on it keep running until they restart.")}</p>`, confirmLabel: "Delete", danger: true })) {
+            await run(null, "Delete", () => api("providers/delete", { id: row.dataset.provider }));
+            agentAvailability = null;
+          }
+          return providersModal(onBack);
+        }
+        const fetchBtn = e.target.closest("[data-fetch-models]");
+        if (fetchBtn) {
+          fetchBtn.classList.add("busy");
+          try {
+            const r = await api("providers/models", { id: form.pid.value, name: form.pname.value, base_url: form.base_url.value, api_key: form.api_key.value });
+            form.querySelector("#models-api").outerHTML = providerModelsDatalist({ models: r.models });
+            toast(tr(r.message), "ok");
+            if (!form.default_model.value && r.models?.length) form.default_model.focus();
+          } catch (err) {
+            toast(tr(err.message), "error");
+          } finally {
+            fetchBtn.classList.remove("busy");
+          }
+        }
+      });
+    },
+    onSubmit: async (form) => {
+      if (!form.pname.value.trim() || !form.base_url.value.trim()) throw new Error("Name and base URL are required");
+      const r = await api("providers/save", {
+        id: form.pid.value, name: form.pname.value.trim(), base_url: form.base_url.value.trim(), api_key: form.api_key.value,
+        default_model: form.default_model.value.trim(), extra_body: form.extra_body.value,
+        input_price: form.input_price.value, output_price: form.output_price.value, context_tokens: form.context_tokens.value,
+      });
+      agentAvailability = null;
+      toast(tr(r.message), "ok");
+      back = false;
+      setTimeout(() => providersModal(onBack), 0);
+    },
+    onCancel: () => { if (back) onBack?.(); },
+  });
+}
 const APPROVAL_MODES = [
   ["bypass", "Fully autonomous", "Never asks. The agent reads, edits and runs commands on its own."],
   ["auto", "Auto review", "The CLI's own reviewer approves safe steps; risky ones come to you. (Claude: auto mode · Codex: on-request)"],
@@ -2254,7 +2404,16 @@ function slotSettingsOf(slot) {
     approval_mode: snap.approval_mode || "bypass",
     token_limit: Number(snap.token_limit) > 0 ? Number(snap.token_limit) : 0,
     limit_hit: typeof snap.limit_hit === "string" ? snap.limit_hit : "",
+    provider_id: typeof snap.provider_id === "string" ? snap.provider_id : "",
+    provider_name: typeof snap.provider_name === "string" ? snap.provider_name : "",
   };
+}
+
+/** "claude", "codex", "gemini", or the API provider's name */
+function agentTypeLabel(slot) {
+  if (slot.agent_type !== "api") return slot.agent_type;
+  const set = slotSettingsOf(slot);
+  return set.provider_name || providerById(set.provider_id)?.name || "API";
 }
 
 function settingsBadges(slot) {
@@ -2274,6 +2433,7 @@ function usageLine(slot) {
 }
 
 function modelFields(type, values = {}) {
+  if (type === "api") return apiModelFields(values);
   const efforts = EFFORT_OPTIONS[type] ?? [];
   return `<label>${tr("Model")}</label><div><input type="text" name="model" list="models-${type}" value="${esc(values.model ?? "")}" placeholder="${tr("default")}">
       <datalist id="models-${type}">${(MODEL_SUGGESTIONS[type] ?? []).map((m) => `<option value="${m}">`).join("")}</datalist>
@@ -2293,10 +2453,10 @@ function approvalFields(type, current = "bypass") {
 function settingsModal(sid, slot) {
   const set = slotSettingsOf(slot);
   openModal({
-    title: tr("Settings · {name}", { name: slotName(slot) }), sub: `${sessionSub(sid)} · ${slot.agent_type}`, submitLabel: "Save",
+    title: tr("Settings · {name}", { name: slotName(slot) }), sub: `${sessionSub(sid)} · ${agentTypeLabel(slot)}`, submitLabel: "Save",
     body: `<div class="form-grid">
         <label>${tr("Avatar")}</label><div class="flex items-center gap-2">${slotAvatar(slot, "", true)}<span class="field-hint">${tr("Click the avatar to change it.")}</span></div>
-        ${modelFields(slot.agent_type, set)}
+        ${modelFields(slot.agent_type, { ...set, lockProvider: true })}
         <label>${tr("Token limit")}</label><div><input type="number" name="token_limit" min="0" step="1000" value="${set.token_limit || ""}" placeholder="${state.limits?.agent_tokens ? tr("session default {value}", { value: state.limits.agent_tokens }) : tr("no limit")}">
           <div class="field-hint">${tr("Input + output tokens. When reached the agent is paused and its turn stops. Used so far: {used}.", { used: fmtTokens((slot.input_tokens ?? 0) + (slot.output_tokens ?? 0)) })}</div></div>
       </div>
@@ -2658,6 +2818,7 @@ function sessionMenuItems(s) {
       } },
     { sep: true },
     { label: "Export JSON", onClick: () => { location.href = `/api/session/export?session_id=${encodeURIComponent(sid)}`; } },
+    { label: "API providers…", onClick: () => { providersReturn = null; providersModal(null); } },
     { label: "Archive", disabled: archived, onClick: async () => {
         if (await confirmDialog({ title: tr("Archive \"{name}\"?", { name: s.name }), sid, message: `<p>${tr("Marks the session archived (like <span class=\"mono\">multiagents session archive</span>). Running agents are not stopped — use <b>End session</b> for that.")}</p>`, confirmLabel: "Archive" }))
           run(null, "Archive", () => api("session/archive", { session_id: sid }));
@@ -2839,14 +3000,20 @@ async function loadAvailability() {
   return agentAvailability;
 }
 
+const AGENT_TYPE_CHOICES = ["claude", "codex", "gemini", "api"];
+
 function typeOptions(selected, avail) {
-  return ["claude", "codex", "gemini"].map((t) =>
-    `<option value="${t}" ${t === selected ? "selected" : ""}>${t}${avail && avail[t] === false ? tr(" (not installed)") : ""}</option>`).join("");
+  return AGENT_TYPE_CHOICES.map((t) => {
+    const label = t === "api" ? tr("Other (OpenAI-compatible API)") : t;
+    const missing = avail && avail[t] === false ? tr(t === "api" ? " (add a provider)" : " (not installed)") : "";
+    return `<option value="${t}" ${t === selected ? "selected" : ""}>${label}${missing}</option>`;
+  }).join("");
 }
 
-async function addAgentModal(sid) {
-  const avail = await loadAvailability();
-  const def = ["claude", "codex", "gemini"].find((t) => avail[t] !== false) ?? "claude";
+async function addAgentModal(sid, preset = {}) {
+  const [avail] = await Promise.all([loadAvailability(), loadApiProviders()]);
+  const def = preset.type ?? ["claude", "codex", "gemini", "api"].find((t) => avail[t] !== false) ?? "claude";
+  providersReturn = () => addAgentModal(sid, { type: "api" });
   openModal({
     title: "Add agent", sub: sessionSub(sid), submitLabel: "Launch Agent",
     body: `<div class="form-grid">
@@ -2874,7 +3041,10 @@ async function addAgentModal(sid) {
       };
       if (form.effort?.value) body.effort = form.effort.value;
       if (!body.name || !body.role || !body.initial_task) throw new Error("Name, role and task are required");
-      if (avail[body.agent_type] === false) throw new Error(tr("{type} CLI is not installed on this machine", { type: body.agent_type }));
+      if (body.agent_type === "api") {
+        body.provider = form.provider?.value ?? "";
+        if (!body.provider) throw new Error("Add an API provider first (Manage providers…)");
+      } else if (avail[body.agent_type] === false) throw new Error(tr("{type} CLI is not installed on this machine", { type: body.agent_type }));
       const r = await api("agents/add", body);
       toast(tr(r?.message ?? "Agent launched"), "ok");
     },
@@ -2908,12 +3078,15 @@ const TEAM_PRESETS = {
 };
 
 async function newTeamModal() {
-  const avail = await loadAvailability();
-  const fallback = ["claude", "codex", "gemini"].find((t) => avail[t] !== false) ?? "claude";
+  const [avail] = await Promise.all([loadAvailability(), loadApiProviders()]);
+  const fallback = ["claude", "codex", "gemini", "api"].find((t) => avail[t] !== false) ?? "claude";
   const pick = (t) => (avail[t] === false ? fallback : t);
+  providersReturn = () => newTeamModal();
+  const providerSelect = (a) => `<select data-f="provider" class="api-only" ${pick(a.agent_type) === "api" ? "" : "hidden"} title="${esc(tr("Provider"))}">${apiProviders.map((p) => `<option value="${esc(p.id)}" ${p.id === a.provider ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>`;
   const agentRow = (a) => `<div class="team-agent">
     <div class="team-agent-row">
       <select data-f="agent_type">${typeOptions(pick(a.agent_type), avail)}</select>
+      ${providerSelect(a)}
       <input type="text" data-f="name" placeholder="Name" value="${esc(a.name)}">
       <input type="text" data-f="role" list="role-suggestions" placeholder="Role" value="${esc(a.role)}">
       <button type="button" class="icon-btn" data-remove-agent title="Remove">&#10005;</button>
@@ -2935,6 +3108,7 @@ async function newTeamModal() {
       <div class="section-label">Agents ${Object.keys(TEAM_PRESETS).map((p) => `<button type="button" class="btn small" data-preset="${esc(p)}">${esc(tr(p))}</button>`).join("")}</div>
       <div data-agents>${TEAM_PRESETS["Worker + Reviewer"].map(agentRow).join("")}</div>
       <button type="button" class="btn small" data-add-agent>+ Add agent</button>
+      <button type="button" class="btn small" data-manage-providers>${tr("Manage providers…")}</button>
       <div class="section-label">Plan (optional)</div>
       <textarea name="plan" rows="3" style="width:100%" placeholder="${esc(tr("One task per line. Prefix with an agent name and a colon to assign it, e.g. \"Claude Reviewer: Review the API\""))}"></textarea>
       <div class="section-label">Workflow</div>
@@ -2947,6 +3121,14 @@ async function newTeamModal() {
       const list = form.querySelector("[data-agents]");
       form.querySelector("[data-add-agent]").addEventListener("click", () => list.insertAdjacentHTML("beforeend", agentRow({ agent_type: fallback, name: "", role: "", initial_task: "" })));
       list.addEventListener("click", (e) => { if (e.target.closest("[data-remove-agent]")) e.target.closest(".team-agent").remove(); });
+      list.addEventListener("change", (e) => {
+        const type = e.target.closest("[data-f=agent_type]");
+        if (!type) return;
+        const row = type.closest(".team-agent");
+        row.querySelector("[data-f=provider]").hidden = type.value !== "api";
+        const model = row.querySelector("[data-f=model]");
+        model.placeholder = type.value === "api" ? (providerById(row.querySelector("[data-f=provider]").value)?.default_model || tr("model name")) : tr("model (default)");
+      });
       form.querySelectorAll("[data-preset]").forEach((b) => b.addEventListener("click", () => { list.innerHTML = TEAM_PRESETS[b.dataset.preset].map(agentRow).join(""); }));
     },
     onSubmit: async (form) => {
@@ -2955,11 +3137,13 @@ async function newTeamModal() {
         row.querySelectorAll("[data-f]").forEach((f) => { a[f.dataset.f] = f.value.trim(); });
         if (!a.model) delete a.model;
         if (a.agent_type === "gemini") a.approval_mode = "bypass";
+        if (a.agent_type !== "api") delete a.provider;
         return a;
       });
+      if (agents.some((a) => a.agent_type === "api" && !a.provider)) throw new Error("Add an API provider first (Manage providers…)");
       if (!agents.length) throw new Error("Add at least one agent");
       if (agents.some((a) => !a.name || !a.role)) throw new Error("Every agent needs a name and a role");
-      const unavailable = agents.filter((a) => avail[a.agent_type] === false).map((a) => `${a.name} (${a.agent_type})`);
+      const unavailable = agents.filter((a) => a.agent_type !== "api" && avail[a.agent_type] === false).map((a) => `${a.name} (${a.agent_type})`);
       if (unavailable.length) throw new Error(tr("Not installed on this machine: {list}", { list: unavailable.join(", ") }));
       const names = agents.map((a) => a.name.toLowerCase());
       const plan = form.plan.value.split("\n").map((l) => l.trim()).filter(Boolean).map((line) => {

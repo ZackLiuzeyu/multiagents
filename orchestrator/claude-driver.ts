@@ -29,7 +29,7 @@
 import type { Subprocess } from "bun";
 import { log } from "../shared/utils.ts";
 
-type PipedSubprocess = Subprocess<"pipe", "pipe", "pipe">;
+export type PipedSubprocess = Subprocess<"pipe", "pipe", "pipe">;
 
 const LOG_PREFIX = "claude-driver";
 
@@ -73,6 +73,31 @@ export interface ClaudeTurnResult {
 
 export type ClaudeEvent = { type: string; [key: string]: unknown };
 export type ClaudeEventListener = (event: ClaudeEvent) => void;
+
+/**
+ * A session that speaks Claude's stream-json dialect: the Claude CLI itself,
+ * and the API driver for OpenAI-compatible providers, which emits the same
+ * events so the timeline, live view, token accounting and approvals treat
+ * both alike.
+ */
+export interface ClaudeSession {
+  readonly alive: boolean;
+  readonly busy: boolean;
+  readonly pid: number;
+  readonly process: PipedSubprocess;
+  readonly sessionId: string | null;
+  readonly lastActivity: number;
+  onExit(cb: (code: number) => void): void;
+  onEvent(cb: ClaudeEventListener, opts?: { replay?: boolean }): void;
+  onPermissionRequest(handler: ClaudePermissionHandler): void;
+  /** Resolves true once the model has read the message, false if the session ended first. */
+  send(text: string, opts?: { echoTimeoutMs?: number }): Promise<boolean>;
+  interrupt(): Promise<void>;
+  setModel(model: string | undefined): Promise<void>;
+  setPermissionMode(mode: string): Promise<void>;
+  close(timeoutMs?: number): Promise<number>;
+  kill(): Promise<void>;
+}
 
 /** A tool call the CLI wants approved (control_request subtype can_use_tool). */
 export interface ClaudePermissionRequest {
@@ -139,7 +164,7 @@ function hasToolResult(message: unknown): boolean {
   return Array.isArray(content) && content.some((block) => (block as { type?: string }).type === "tool_result");
 }
 
-export class ClaudeDriver {
+export class ClaudeDriver implements ClaudeSession {
   private proc: PipedSubprocess;
   private readonly initTimeoutMs: number;
   private buffer = "";

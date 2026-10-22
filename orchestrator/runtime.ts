@@ -31,7 +31,7 @@ import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearSlotTrack
 import { deliverPendingMessages, launchedSettings, type DriverSlot } from "./delivery.ts";
 import { RespawnGuard } from "./respawn-guard.ts";
 import type { CodexDriver } from "./codex-driver.ts";
-import type { ClaudeDriver } from "./claude-driver.ts";
+import type { ClaudeSession } from "./claude-driver.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
@@ -75,7 +75,7 @@ interface LaunchedAgent {
   pid: number;
   process: Subprocess;
   codexDriver?: CodexDriver;
-  claudeDriver?: ClaudeDriver;
+  claudeDriver?: ClaudeSession;
   settings?: { model?: string; effort?: string; approvalMode?: string };
 }
 
@@ -773,7 +773,8 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
           items: {
             type: "object",
             properties: {
-              agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+              agent_type: { type: "string", enum: ["claude", "codex", "gemini", "api"], description: "api = an OpenAI-compatible provider configured in the dashboard (DeepSeek, Qwen, …); set provider." },
+              provider: { type: "string", description: "For agent_type api: the provider id (see the dashboard's API providers)." },
               name: { type: "string", description: "Display name for the agent, e.g., 'Alice' or 'Backend Engineer'" },
               role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity: 'Android Software Engineer', 'Web QA Engineer'." },
               role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
@@ -847,7 +848,8 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
       type: "object" as const,
       properties: {
         session_id: { type: "string" },
-        agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+        agent_type: { type: "string", enum: ["claude", "codex", "gemini", "api"], description: "api = an OpenAI-compatible provider configured in the dashboard (DeepSeek, Qwen, …); set provider." },
+        provider: { type: "string", description: "For agent_type api: the provider id (see the dashboard's API providers)." },
         name: { type: "string", description: "Display name for the agent" },
         role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity." },
         role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
@@ -1038,7 +1040,7 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
         }
         if (unavailable.length > 0) {
           // Check what IS available on this machine
-          const allTypes: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
+          const allTypes: Array<"claude" | "codex" | "gemini" | "api"> = ["claude", "codex", "gemini", "api"];
           for (const t of allTypes) {
             const d = await detectAgent(t);
             if (d.available) availableTypes.add(t);
@@ -1270,9 +1272,10 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
 
       // ---- add_agent ----
       case "add_agent": {
-        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership, model, effort, approval_mode } = args as {
+        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership, model, effort, approval_mode, provider } = args as {
           session_id: string;
-          agent_type: "claude" | "codex" | "gemini";
+          agent_type: "claude" | "codex" | "gemini" | "api";
+          provider?: string;
           name: string;
           role: string;
           role_description: string;
@@ -1285,7 +1288,7 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
 
         const detection = await detectAgent(agent_type);
         if (!detection.available) {
-          return fail(`Error: ${agent_type} CLI not found.`);
+          return fail(agent_type === "api" ? "Error: no API provider is configured — add one in the dashboard (API providers)." : `Error: ${agent_type} CLI not found.`);
         }
 
         const session = await brokerClient.getSession(session_id);
@@ -1299,6 +1302,7 @@ export async function callOrchestratorTool(name: string, args: Record<string, un
           model,
           effort,
           approval_mode,
+          provider,
         };
 
         const result = await launchAgent(session_id, session.project_dir, config, brokerClient);

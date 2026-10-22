@@ -726,3 +726,12 @@ html.has-bg.bg-blur .topbar, html.has-bg.bg-blur .pane { backdrop-filter: blur(1
 .live-text-head { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--text-muted); }
 .live-text { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.5; color: var(--text-dim); font-style: italic; max-height: 4.6em; overflow: hidden; }
 .live-text-wrap.expanded .live-text { max-height: 40vh; overflow-y: auto; }
+
+/* --- API providers ("Other" agents) --- */
+.team-agent > .team-agent-row:first-child { grid-template-columns: 170px auto 1fr 1fr auto; }
+.team-agent-row select[hidden] { display: none; }
+.provider-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.provider-row { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.provider-info { flex: 1; min-width: 0; }
+.provider-info .mono { font-size: 11.5px; margin-left: 6px; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .team-agent > .team-agent-row:first-child { grid-template-columns: 1fr 1fr; } }
