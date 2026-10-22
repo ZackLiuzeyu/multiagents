@@ -478,7 +478,7 @@ const ZH = {
   "Sign in to Codex with ChatGPT to see its limits (an API key has none).": "用 ChatGPT 账号登录 Codex 后才能看到限额（API key 没有这类限额）。",
   "Codex reported no usage windows for this account.": "Codex 没有返回此账号的用量窗口。",
   "Gemini runs on an API key; Google does not report its quota.": "Gemini 使用 API key 运行，Google 不提供其额度信息。",
-  "Sign in to Gemini CLI with Google to see its quota.": "用 Google 账号登录 Gemini CLI 后才能看到额度。",
+  "Sign in to Gemini CLI with Google to see its quota (an Antigravity login is separate): run `npx @google/gemini-cli` once and choose Login with Google.": "需要用 Google 账号登录 Gemini CLI 才能看到额度（Antigravity 的登录和它是分开的）：在终端运行一次 `npx @google/gemini-cli`，选择 Login with Google。",
   "The Gemini login has expired; it refreshes the next time Gemini CLI runs.": "Gemini 登录凭据已过期，下次运行 Gemini CLI 时会自动刷新。",
   "Gemini did not report a Code Assist project for this login.": "Gemini 没有返回此登录对应的 Code Assist 项目。",
   "Gemini reported no quota buckets for this login.": "Gemini 没有返回此登录的额度信息。",
